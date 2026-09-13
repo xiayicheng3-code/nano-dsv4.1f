@@ -35,13 +35,14 @@ class LayerSpec:
 def build_layer_specs(config: ModelConfig) -> tuple[LayerSpec, ...]:
     """Build the explicit nano CED/CSA2 schedule from hyperparameters.
 
-    Default schedule mirrors the released 5-layer runnable V4.1 reference at nano scale:
+    DeepSeek's released code includes a useful five-layer tiny default. Our seven-layer
+    default keeps that anchor but extends the decoder by one retrieval-sharing group:
 
-        context/encoder:   L0 SWA | L1 Full(r=2) -> L2 Reuse
-        generation/decoder:L3 Full(r=1) -> L4 Reuse
+        context:    L0 SWA | L1 Full(r=2) -> L2 Reuse
+        generation: L3 Full(r=1) -> L4 Reuse -> L5 Reindex -> L6 Reuse
 
-    Increasing `generation_layers` automatically introduces `Reindex` groups without
-    changing code, e.g. four generation layers produce Full, Reuse, Reindex, Reuse.
+    Deeper generation settings continue the same Reindex/Reuse cadence without changing
+    block code.
     """
     specs: list[LayerSpec] = []
     cc = config.csa2
@@ -91,14 +92,20 @@ def build_layer_specs(config: ModelConfig) -> tuple[LayerSpec, ...]:
     return tuple(specs)
 
 
-def _init_block(key: jax.Array, config: ModelConfig, spec: LayerSpec) -> dict[str, object]:
+def _init_block(
+    key: jax.Array, config: ModelConfig, spec: LayerSpec
+) -> dict[str, object]:
     keys = iter(jax.random.split(key, 10))
     ac = config.attention
     block: dict[str, object] = {
         "attn_norm": init_rms_norm(config.d_model),
         "ffn_norm": init_rms_norm(config.d_model),
-        "mhc_attn": init_mhc_generator(next(keys), config.mhc_streams, config.d_model),
-        "mhc_ffn": init_mhc_generator(next(keys), config.mhc_streams, config.d_model),
+        "mhc_attn": init_mhc_generator(
+            next(keys), config.mhc_streams, config.d_model
+        ),
+        "mhc_ffn": init_mhc_generator(
+            next(keys), config.mhc_streams, config.d_model
+        ),
         "attn": init_csa2_attention(
             next(keys),
             dim=config.d_model,
@@ -115,10 +122,14 @@ def _init_block(key: jax.Array, config: ModelConfig, spec: LayerSpec) -> dict[st
             index_n_heads=config.indexer.n_heads,
             index_head_dim=config.indexer.head_dim,
         ),
-        "moe": init_moe(next(keys), config.d_model, config.d_ff, config.n_experts),
+        "moe": init_moe(
+            next(keys), config.d_model, config.d_ff, config.n_experts
+        ),
     }
     if config.engram.enabled and spec.has_engram:
-        n_cols = (config.engram.max_ngram_size - 1) * config.engram.n_hash_heads
+        n_cols = (
+            config.engram.max_ngram_size - 1
+        ) * config.engram.n_hash_heads
         block["engram"] = init_engram(
             next(keys),
             table_size=config.engram.table_size,
@@ -135,9 +146,14 @@ def init_model(key: jax.Array, config: ModelConfig) -> dict[str, object]:
     keys = jax.random.split(key, len(specs) + 5)
     model: dict[str, object] = {
         "embed": init_embedding(keys[0], config.vocab_size, config.d_model),
-        "blocks": tuple(_init_block(keys[i + 1], config, spec) for i, spec in enumerate(specs)),
+        "blocks": tuple(
+            _init_block(keys[i + 1], config, spec)
+            for i, spec in enumerate(specs)
+        ),
         "final_norm": init_rms_norm(config.d_model),
-        "lm_head": init_embedding(keys[-2], config.vocab_size, config.d_model).T,
+        "lm_head": init_embedding(
+            keys[-2], config.vocab_size, config.d_model
+        ).T,
     }
     if config.dspark.enabled:
         model["dspark"] = init_dspark(keys[-1], config)
@@ -155,7 +171,7 @@ def _apply_block(
     *,
     global_source: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, SharedCSA2State | None, dict[str, object]]:
-    """One Single-Pass-mHC block with cross-sublayer pre-mix timing."""
+    """One Single-Pass-mHC block with optional attention-only rematerialization."""
     residual = streams
     attn_pre, attn_post, attn_comb = mhc_mixes(
         streams,
@@ -164,19 +180,33 @@ def _apply_block(
         eps=config.mhc_eps,
     )
     attn_input = rms_norm(
-        pre_mix(streams, incoming_pre_mix), params["attn_norm"], eps=config.norm_eps
+        pre_mix(streams, incoming_pre_mix),
+        params["attn_norm"],
+        eps=config.norm_eps,
     )
-    attn_out, state, attn_aux = apply_csa2_attention(
-        attn_input,
-        segment_ids,
-        params["attn"],
-        state,
-        layer_id=spec.layer_id,
-        mode=spec.mode,
-        owns_global_kv=spec.owns_global_kv,
-        compression_ratio=spec.compression_ratio,
-        config=config,
-        global_source=global_source,
+
+    # Capture architecture/config metadata in the closure so remat only sees array pytrees.
+    # This replays CSA2/indexer forward math during backward, but not the separate teacher-
+    # distillation pass, which intentionally lives outside this model forward.
+    def attention_forward(attn_x, attn_params, shared_state, ced_source):
+        return apply_csa2_attention(
+            attn_x,
+            segment_ids,
+            attn_params,
+            shared_state,
+            layer_id=spec.layer_id,
+            mode=spec.mode,
+            owns_global_kv=spec.owns_global_kv,
+            compression_ratio=spec.compression_ratio,
+            config=config,
+            global_source=ced_source,
+        )
+
+    if config.remat.policy == "attention":
+        attention_forward = jax.checkpoint(attention_forward)
+
+    attn_out, state, attn_aux = attention_forward(
+        attn_input, params["attn"], state, global_source
     )
     streams = post_mix(residual, attn_out, attn_comb, attn_post)
 
@@ -188,7 +218,9 @@ def _apply_block(
         eps=config.mhc_eps,
     )
     ffn_input = rms_norm(
-        pre_mix(streams, attn_pre), params["ffn_norm"], eps=config.norm_eps
+        pre_mix(streams, attn_pre),
+        params["ffn_norm"],
+        eps=config.norm_eps,
     )
     ffn_out, moe_aux = apply_moe(
         ffn_input,
@@ -210,7 +242,17 @@ def apply_model(
     segment_ids: jax.Array | None = None,
     token_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, object]]:
-    """Run the dense semantic backbone reference and expose DSpark context features."""
+    """Run the dense semantic backbone reference and expose DSpark context features.
+
+    Rematerialization policy is architectural plumbing, not model semantics:
+
+    - ``none``: retain normal autodiff intermediates;
+    - ``attention``: replay CSA2 attention/indexer math but retain MoE forward activations;
+    - ``block``: replay the attention + MoE Transformer block from its mHC block boundary.
+
+    Engram injection remains outside the block remat boundary because its table lookup is
+    cheap relative to attention/MoE and its memory concern is parameter/table sharding.
+    """
     if input_ids.ndim != 2:
         raise ValueError("input_ids must have shape [batch,tokens]")
     if segment_ids is None:
@@ -220,13 +262,17 @@ def apply_model(
 
     specs = build_layer_specs(config)
     streams = params["embed"][input_ids]
-    streams = jnp.repeat(streams[..., None, :], config.mhc_streams, axis=-2)
+    streams = jnp.repeat(
+        streams[..., None, :], config.mhc_streams, axis=-2
+    )
     incoming_pre = make_identity_pre_mix(streams)
     state: SharedCSA2State | None = None
     layer_aux: list[dict[str, object]] = []
     context_final = None
     dspark_targets: list[jax.Array] = []
-    target_ids = set(config.dspark.target_layer_ids) if config.dspark.enabled else set()
+    target_ids = (
+        set(config.dspark.target_layer_ids) if config.dspark.enabled else set()
+    )
 
     for spec, block in zip(specs, params["blocks"]):
         generation_global_source = None
@@ -257,29 +303,47 @@ def apply_model(
         if spec.layer_id in target_ids:
             dspark_targets.append(jnp.mean(streams, axis=-2))
 
-        streams, incoming_pre, state, aux = _apply_block(
+        def block_forward(s, pre, block_params, shared_state, ced_source):
+            return _apply_block(
+                s,
+                pre,
+                segment_ids,
+                block_params,
+                shared_state,
+                config,
+                spec,
+                global_source=ced_source,
+            )
+
+        if config.remat.policy == "block":
+            block_forward = jax.checkpoint(block_forward)
+
+        streams, incoming_pre, state, aux = block_forward(
             streams,
             incoming_pre,
-            segment_ids,
             block,
             state,
-            config,
-            spec,
-            global_source=generation_global_source,
+            generation_global_source,
         )
         layer_aux.append(aux)
 
     hidden = rms_norm(
-        pre_mix(streams, incoming_pre), params["final_norm"], eps=config.norm_eps
+        pre_mix(streams, incoming_pre),
+        params["final_norm"],
+        eps=config.norm_eps,
     )
     logits = jnp.einsum("btd,dv->btv", hidden, params["lm_head"])
     dspark_context = (
-        jnp.concatenate(dspark_targets, axis=-1) if dspark_targets else None
+        jnp.concatenate(dspark_targets, axis=-1)
+        if dspark_targets
+        else None
     )
     return logits, {
         "context_final": context_final,
         "final_hidden": hidden,
-        "final_global_source_layer": None if state is None else state.source_layer,
+        "final_global_source_layer": None
+        if state is None
+        else state.source_layer,
         "layers": tuple(layer_aux),
         "dspark_context_features": dspark_context,
     }
@@ -298,7 +362,9 @@ def apply_model_dspark(
     """Convenience reference forward: backbone first, then the one-stage DSpark head."""
     if not config.dspark.enabled or "dspark" not in params:
         raise ValueError("DSpark is disabled or uninitialized")
-    logits, aux = apply_model(params, config, input_ids, segment_ids=segment_ids)
+    logits, aux = apply_model(
+        params, config, input_ids, segment_ids=segment_ids
+    )
     context = aux["dspark_context_features"]
     if context is None:
         raise ValueError("backbone produced no DSpark target features")
