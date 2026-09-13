@@ -30,7 +30,9 @@ class IndexerTrainingConfig:
     start_fraction: float = 0.55
     end_fraction: float = 0.90
     teacher_queries: Literal["latest_eligible", "all_eligible"] = "latest_eligible"
-    teacher_layers: Literal["full_only", "full_last", "all_served"] = "full_last"
+    # Nano groups are intentionally small (typically 2-3 served layers per retriever),
+    # so supervising from every served layer is affordable and easiest to reason about.
+    teacher_layers: Literal["full_only", "full_last", "all_served"] = "all_served"
     loss_weight: float = 0.05
 
     def __post_init__(self) -> None:
