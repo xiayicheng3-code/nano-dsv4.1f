@@ -11,7 +11,13 @@ The canonical source is normal JAX/Python. Generated Kaggle notebooks are artifa
 
 ## Default nano topology
 
-The default follows the *shape of the released small runnable V4.1 reference* rather than scaling the 40-layer production topology proportionally:
+DeepSeek's released inference code contains a useful five-layer tiny topology anchor:
+
+```text
+L0 SWA | L1 Full(r=2) -> L2 Reuse | L3 Full(r=1) -> L4 Reuse
+```
+
+We deliberately extend that anchor by one decoder retrieval group so the nano model demonstrates `Reindex` as well as `Full` and `Reuse`:
 
 ```text
 context / causal encoder
@@ -23,14 +29,18 @@ CED handoff
   final context representation -> generation compressed-KV source
 
 generation / causal decoder
-  L3  Full, r=1, KV + index source
+  L3  Full, r=1, KV + index source + candidate-block source
   L4  Reuse, r=1
+  L5  Reindex, r=1, same L3 KV/index-K
+  L6  Reuse, r=1
 
 speculation
   DSpark stage 0: one block-parallel Transformer layer + own MoE + Markov + confidence
 ```
 
-Every count/rank/window is a config value. Increasing generation depth automatically creates `Reindex` groups (`Full -> Reuse -> Reindex -> Reuse ...`) without changing block code.
+The extra two layers are not another KV source. L5 projects a fresh index Q / head weighting from its own representation and rescans L3's shared index-K, restricted by the candidate blocks published by L3. L6 then reuses L5's Top-K. This is the smallest default we found that makes the decoder hierarchy visible without introducing long industrial reuse spans.
+
+All counts/ranks/windows remain config values. If topology counts are changed, related explicit layer-id hyperparameters such as `candidate_source_layer` and DSpark `target_layer_ids` should be changed with them; this is intentional so notebook experiments never hide topology choices behind implicit magic.
 
 ## Attention / CSA2 fidelity
 
@@ -42,7 +52,7 @@ Every count/rank/window is a config value. Increasing generation depth automatic
 - Q-LoRA-like `q_a -> RMSNorm -> q_b` bottleneck;
 - compressed-KV source ownership and cross-layer reuse;
 - CED handoff: first generation `Full` projects its global bank from the saved final context representation while querying from its ordinary block input;
-- `SWA`, `Full`, `Reuse`, and configurable `Reindex` states;
+- operational `SWA`, `Full`, `Reindex`, and `Reuse` states;
 - r=1 and r=2 compressed states;
 - per-channel learned softmax compression for r=2;
 - exact shared softmax denominator via local/global log-sum-exp merge;
@@ -68,7 +78,7 @@ The backbone still computes compressed/global attention densely during ordinary 
 
 ### Implemented parameterization
 
-The reference indexer now follows the released V4.1 dataflow:
+The reference indexer follows the released V4.1 dataflow:
 
 - index Q is projected from the main attention Q-LoRA latent `qr`;
 - index K is projected from the **pre-RoPE compressed latent**, not from the main rotated cache;
@@ -77,7 +87,7 @@ The reference indexer now follows the released V4.1 dataflow:
 - per-query head mixture weights are projected from the layer hidden state;
 - score is a weighted sum of `ReLU(q_h dot k)` across index heads;
 - optional FP4 fake-QAT applies independently to index Q/K;
-- source/reuse state lifetimes are explicit.
+- Full/Reindex/Reuse state lifetimes are explicit.
 
 ### Cheap teacher policy (our experiment)
 
@@ -86,22 +96,25 @@ This part is **not claimed as DeepSeek's private training recipe**:
 - indexer distillation is active only during a configurable late pre/mid-training window;
 - only queries with at least `local_window + retrieve_top_k` history are eligible;
 - default selects the latest eligible query per packed segment;
-- all layers served by a nano retriever are teachers (normally only 2-3 layers);
-- teacher probability mass is reconstructed from selected main-attention QK rows plus the complete attention LSE, so local attention and the sink still compete in the denominator.
+- all layers served by a nano retriever are teachers (normally two layers);
+- teacher probability mass is reconstructed from selected main-attention QK rows plus the complete attention LSE, so local attention, compressed/global attention and the sink all compete in the denominator.
 
 Because K is shared across main Q heads, the teacher recomputation is `Q[H,D] x K[K,D]`, not a separate K bank per head.
 
+The new decoder Reindex group does not increase the teacher span of an individual retriever: `L3/L4` are one two-layer teacher group and `L5/L6` are another.
+
 ### Hierarchical decoder reference
 
-`select_candidate_blocks` implements the released hierarchy semantics for deeper decoder experiments:
+The hierarchy is active in the seven-layer default:
 
-- max-pool token scores inside fixed-size candidate blocks;
-- force the newest reachable/partially filled block to survive;
-- Top-K blocks;
-- expand the selected blocks back to token candidates;
-- later Reindex scores can be masked to this candidate set.
+- L3 computes ordinary index scores and max-pools them inside fixed-size candidate blocks;
+- the newest reachable/partially filled block is forced to survive;
+- Top-K candidate blocks are expanded back to token candidates;
+- L5 computes a fresh Reindex score only inside that retained candidate set;
+- L6 reuses L5's new token Top-K;
+- the main compressed KV and index-K continue to be owned by L3 throughout L3-L6.
 
-The default 5-layer nano model has no second decoder Reindex group, so this code is present but inactive unless generation depth is increased.
+This keeps the conceptual distinction very explicit: **KV ownership is slower-changing than retrieval ownership**.
 
 ## RoPE details
 
@@ -122,12 +135,12 @@ Implemented as differentiable software references:
 - E2M1 FP4 value emulation;
 - E4M3 shared-scale emulation;
 - E8M0/power-of-two shared-scale emulation;
-- compressed main-KV FP4 fake-QAT **after RoPE** (default block 16);
-- indexer Q/K FP4 fake-QAT on their own projections;
-- optional block-scaled E4M3 SWA fake-QAT;
+- compressed main-KV FP4 fake-QAT **after RoPE** (default 16-channel groups);
+- indexer Q/K MXFP4 fake-QAT with its own configurable block/scale convention (default 32-value blocks + UE8M0-style scales);
+- optional SWA FP8 fake-QAT;
 - straight-through estimator for training.
 
-Important: these functions emulate quantized values; they do **not** pack nibbles/bytes or provide the final TPU memory-bandwidth saving. The planned Pallas milestone is packed MXFP4 cache storage plus on-chip software dequantization inside attention tiles.
+Important: these functions emulate quantized values; they do **not** reproduce vLLM's specialized serving byte layouts, padding/alignment or cache packing. In particular, the production SWA cache can use mixed/specialized NoPE/RoPE layouts. The planned Pallas milestone is packed low-precision cache storage plus on-chip software dequantization inside attention tiles.
 
 ## Single-Pass mHC
 
@@ -176,11 +189,12 @@ These are documented simplifications because exact huge hash tables add capacity
 
 ## DSpark
 
-The nano repo now includes one released-style DSpark stage rather than generic MTP:
+The nano repo includes one released-style DSpark stage rather than generic MTP:
 
 - concatenates configurable target-layer backbone features and projects/norms them into DSpark context;
+- default targets are the final three backbone layers (`L4/L5/L6`), mirroring the full V4.1 pattern of using its final three target layers;
 - constructs each draft block as `[anchor token, noise, noise, ...]`;
-- Transformer draft queries see target context strictly before their anchor **plus every draft position in their own block**, matching DeepSpec's block-parallel mask;
+- draft attention sees the recent SWA target context **through the anchor** plus every draft position in the same proposal block;
 - one Transformer layer with the project's V4.1 partial-RoPE / grouped-output conventions;
 - a separate DSpark MoE and expert count;
 - vanilla low-rank Markov head `token -> rank -> vocab`;
@@ -189,7 +203,7 @@ The nano repo now includes one released-style DSpark stage rather than generic M
 - confidence/accept-rate scalar head using draft hidden + Markov embedding;
 - target embedding / vocabulary spaces are shared with the backbone rather than maintained as a second canonical vocabulary.
 
-Default `n_layers=1` is intentional. Production V4.1 has more speculative stages; the public small runnable reference also demonstrates a one-stage setup.
+Default `n_layers=1` is intentional. Production V4.1 has more speculative stages; the public tiny inference topology also demonstrates a one-stage draft setup.
 
 Not yet implemented: full speculative verification/scheduler integration, DSpark training anchor sampler/loss weighting, or cache-efficient decode kernels.
 
@@ -204,9 +218,7 @@ Parameter rules:
 - ordinary matrix/batched-matrix weights -> Muon;
 - head-concatenated Q projections -> head-wise Muon.
 
-The Muon implementation exposes hybrid Newton-Schulz iteration counts and coefficients, Nesterov momentum, decoupled weight decay and update-RMS scaling. Sinkhorn exposes its iteration count, momentum, update scaling and near-zero-row mask threshold. AdamW and LR schedule are likewise explicit config fields.
-
-**Caveat:** where the public report/release does not fully specify a low-level training constant (for example a masking threshold or cluster-specific scheduling choice), this repo exposes the chosen value as a hyperparameter rather than claiming checkpoint-identical optimization.
+The Muon implementation exposes hybrid Newton-Schulz iteration counts and coefficients, Nesterov momentum, decoupled weight decay and update-RMS scaling. Sinkhorn uses the disclosed Nesterov form, alternating row/column normalizations, final dimension scaling and gamma multiplier; the near-zero-row mask threshold remains an explicit experiment hyperparameter because the public material does not pin down every low-level constant. AdamW and LR schedule are likewise explicit config fields.
 
 ## Activation rematerialization
 
