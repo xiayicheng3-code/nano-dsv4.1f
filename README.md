@@ -1,104 +1,93 @@
 # nano-dsv4.1f
 
-An educational, TPU-first reimplementation of the *ideas* behind DeepSeek-V4.1-Flash, scaled down so the architecture can be inspected, trained, profiled, and eventually exported as a Kaggle notebook.
+A TPU-first educational reimplementation of the architectural/training ideas in **DeepSeek-V4.1-Flash**, deliberately scaled so they can be read, modified, trained and profiled on a Kaggle TPU.
 
-> This is not a drop-in reproduction of the 552B model. The goal is to preserve the interesting architectural constraints while making deliberate simplifications explicit and measurable.
+> This is not a checkpoint-compatible miniature of the production model. `docs/implementation_scope.md` records which mechanisms are faithful semantic references, which are software approximations, and which production systems pieces are intentionally deferred.
 
-## Design goals
+## Default nano architecture
 
-- Keep the canonical implementation as normal Python modules, **not notebook cells**.
-- Compile the maintained source tree into a Kaggle-friendly notebook later.
-- Reimplement the architectural ideas that teach us something about long-context ML systems: CED, CSA2-style shared compressed KV, fixed-128 SWA + global attention, Single-Pass mHC, Engram conditional memory, MoE, FP4-KV QAT experiments, and explicit sharding.
-- Keep expensive deployment/training machinery optional when it obscures the educational core.
-- Record every deviation from DeepSeek-V4.1-Flash in `docs/implementation_scope.md`.
-
-## Reference architecture
-
-The current default model is deliberately small but structurally nontrivial:
+The default now mirrors the *topology* of DeepSeek's released small runnable reference:
 
 ```text
-context side, r=2:
-  L0 Full  -> L1 Reuse -> L2 Full    -> L3 Reuse
+context / causal encoder
+  L0  SWA only
+  L1  Full(r=2, KV+index source) -> L2 Reuse
 
-generation side, r=1:
-  L4 Full  -> L5 Reuse -> L6 Reindex -> L7 Reuse
+CED handoff
+  final context representation -> generation KV source
+
+generation / causal decoder
+  L3  Full(r=1, KV+index source) -> L4 Reuse
+
+speculation
+  DSpark: 1 block-parallel Transformer layer + separate MoE + Markov + confidence
 ```
 
-The first generation-side `Full` layer replaces the shared compressed/global KV using the final context-side representation. Later `Reuse` and `Reindex` layers consume that same main-KV bank; `Reindex` represents a new retrieval decision without owning a new main-KV source.
+All dimensions, group counts, RoPE settings, compression ratios, expert counts, DSpark rank/block size, optimizer constants and sharding intentions live in configuration dataclasses rather than being buried in kernels.
 
-The readable reference path uses dense global attention so we can validate the architecture before introducing sparse TPU kernels. Local and global branches run separately but are merged with their log-sum-exp values, preserving one shared softmax denominator.
+## Implemented V4.1 details
 
-The local branch stays at a fixed **128-token SWA window**. For `r=2`, a compressed group can overlap the raw local window on the compression boundary. We preserve that representational overlap instead of changing SWA to an alternating 127/128-token window.
+The readable JAX reference includes:
 
-## Indexer training philosophy
+- **CED / CSA2:** SWA / Full / Reuse / configurable Reindex, shared compressed-KV lifetimes, r=1/r=2 learned compression, fixed-128 local overlap and exact local/global shared-softmax LSE merge.
+- **MLA-style attention:** Q low-rank bottleneck, one latent K/V shared by Q heads, learned attention sink, **partial RoPE on the last channels**, compressed positional regime, **inverse RoPE on attention output**, and **grouped low-rank `wo_a`** (`G=2` by default).
+- **Sparse indexer:** Q from main `qr`, K from pre-RoPE compressed latent, partial RoPE, query-dependent head weights, ReLU head scores, cross-layer K reuse and released-style hierarchical candidate-block selection.
+- **Indexer training experiment:** late-stage, latest-eligible-query distillation; all 2–3 layers served by a nano retriever can be teachers without industrial-scale replay.
+- **Single-Pass mHC:** multi-stream residuals, state-conditioned pre/post/combine coefficients, Sinkhorn stream mixing and cross-sublayer timing; mHC epsilon is separate from language RMSNorm epsilon.
+- **MoE:** sqrt-softplus router, selection-only correction bias, routed + shared expert, clipped SwiGLU; DSpark has an independently configured expert count.
+- **Engram:** segment-safe causal n-gram hashing, conditional hashed memory and per-stream gated injection.
+- **Low-precision reference:** software E2M1/E4M3/E8M0 fake quantization, compressed-KV FP4 QAT path, indexer FP4 path and optional SWA FP8 path. Packed MXFP4/Pallas storage is a later kernel milestone.
+- **Hybrid optimizer reference:** inspectable AdamW / Muon / head-wise Muon / Sinkhorn-balanced parameter partitioning and explicit LR schedule.
+- **DSpark:** projected selected-layer target context, `[anchor, noise, ...]` draft blocks, block-parallel attention mask, one draft Transformer layer, separate MoE, vanilla low-rank Markov correction, sequential Markov sampling helper and confidence head.
 
-Sparse retrieval is learned as an auxiliary objective late in pre/mid-training rather than placed on the critical path from step zero.
+## Why the retriever teacher is still cheap
 
-For an indexer configured with `retrieve_top_k = 512` and a local window of `128`, the default educational policy only distills queries whose causal history is at least `640` tokens. To keep the teacher cheap, the initial implementation selects the **latest eligible query per packed segment**. This is our approximation; it is not claimed to be DeepSeek's training recipe.
+Default retrieval is 512 global candidates plus 128 local positions. We only distill a packed sequence once its query has at least 640 causal positions and select the **latest eligible query** by default. Unlike production V4.1's long reuse spans, nano retrievers normally serve only two layers, so `all_served` is effectively the same cost as `Full + last`.
 
-The nano architecture uses only **2 served layers per retriever by default** (configurable to 2–3). The default therefore distills the indexer from **all served layers**. With a 2-layer group, this is identical to a Full+last teacher policy; a 3-layer group adds only one more dense teacher QK row for the selected query.
+This query-subsampling rule is our educational experiment, not a claim about DeepSeek's private training recipe.
 
-The indexer teacher uses dense main-attention logits only for selected queries. The design keeps the dense teacher outside the ordinary SplashAttention forward path so we do not require SplashAttention to materialize a full attention-score matrix.
-
-## Implemented reference pieces
-
-- **CED / CSA2 composition**: explicit context-side and generation-side state ownership, Full / Reindex / Reuse modes, cross-layer compressed-KV reuse.
-- **MLA-like attention**: low-rank Q projection, one latent KV vector per position shared across query heads, fixed SWA + compressed/global branch, exact LSE merge.
-- **Learned KV compression**: `r=1/2`, including per-channel learned pooling for `r=2`.
-- **Single-Pass mHC**: multiple residual streams, state-conditioned pre/post/combination coefficients, Sinkhorn-normalized mixing, cross-sublayer pre-mix timing.
-- **MoE**: routed experts plus one shared expert, sqrt-softplus router scores, selection-only correction bias, top-k normalized routing weights, clipped SwiGLU experts.
-- **Engram**: segment-safe causal n-gram hashing, conditional table lookup, one key per mHC stream plus shared value, normalized signed-sqrt sigmoid gate.
-- **Packed-sequence utilities** and the fixed-shape latest-query indexer teacher selector.
-- **CPU/JIT correctness tests** for the reference composition.
-
-## Repository layout
+## Source layout
 
 ```text
 src/nano_dsv41f/
-  config.py          Nano architecture, training-stage and sharding configuration
-  layers.py          Functional JAX linear / RMSNorm / embedding primitives
-  packing.py         Packed-sequence metadata and teacher-query selection
-  attention.py       Mask algebra + shared-softmax/LSE reference helpers
-  compression.py     Learned ratio-1/2 KV compression
-  csa2.py            Dense CSA2 local/global attention + shared-KV state machine
-  mhc.py             Single-Pass mHC residual mechanics and coefficient generator
-  moe.py             Sparse routed + shared-expert reference MoE
-  engram.py          Educational conditional n-gram memory
-  indexer.py         Late-stage sparse-indexer distillation utilities
-  indexer_scorer.py  Dense reference scorer + retrieval metrics
-  model.py           End-to-end CED/CSA2 + mHC + MoE + Engram composition
+  config.py          Every architecture/training/sharding hyperparameter
+  rope.py            partial/inverse RoPE + compressed/YaRN frequency reference
+  quantization.py    software FP4/FP8 fake-QAT reference
+  layers.py          small JAX primitives
+  packing.py         packed-example/query-selection utilities
+  attention.py       standalone mask/LSE helpers
+  compression.py     learned r=1/r=2 compression
+  csa2.py            SWA + compressed MLA state machine
+  indexer.py         late-stage teacher/distillation utilities
+  indexer_scorer.py  released-style indexer + hierarchy reference
+  mhc.py             Single-Pass mHC mechanics
+  moe.py             routed + shared-expert MoE
+  engram.py          conditional hashed memory
+  dspark.py          one-stage released-style DSpark reference
+  optimizer.py       hybrid optimizer rules and update kernels
+  model.py           end-to-end backbone + DSpark wiring
 scripts/
-  build_notebook.py  Compile maintained Python sources into a Kaggle notebook
-notebooks/
-  README.md          Notebook policy; generated notebooks are artifacts
-docs/
-  implementation_scope.md
-  indexer_training.md
-tests/
-  test_packing_attention.py
-  test_reference_model.py
+  build_notebook.py  compile maintained source into a Kaggle notebook
 ```
 
-## Deliberately deferred
+Normal Python is canonical. Notebook cells are generated views of this codebase, not a second implementation.
 
-The dense reference is the semantic ground truth, not the final TPU implementation. Still pending:
+## Still a systems project
 
-- SplashAttention/Pallas replacement for long-context local/global attention;
-- context/expert/table sharding on an 8-chip TPU mesh;
-- sparse Top-K on the backbone forward path and sparse-aware continuation training;
-- hierarchical generation-side candidate restriction;
-- MXFP4 compressed-KV QAT and on-chip software dequantization;
-- activation-rematerialization wrappers and throughput/memory policy benchmarks;
-- checkpoint-compatible dimensions, tokenizer/data recipe, and production serving kernels.
+The current dense path establishes semantics before TPU specialization. Major next milestones are:
 
-See `docs/implementation_scope.md` for the detailed faithful-vs-simplified contract.
+- SplashAttention/Pallas kernels for long-context local + compressed attention;
+- packed MXFP4 cache storage with software dequantization on-chip;
+- real `NamedSharding`/collectives for context, experts, vocabulary and Engram tables on TPU v5e-8;
+- activation-rematerialization policy benchmarks;
+- training loop/data pipeline + indexer-stage scheduling;
+- sparse-aware GPU continuation only if retriever quality justifies it;
+- notebook compilation and Kaggle profiling.
 
-## Notebook policy
-
-Normal Python modules are canonical. `scripts/build_notebook.py` packages the maintained source into a Kaggle-friendly notebook so notebook ergonomics do not fork the model implementation.
+See `docs/implementation_scope.md` for the detailed fidelity matrix.
 
 ## References
 
-Primary reference: DeepSeek-AI, **DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression** (2026), plus the released configuration and reference inference implementation.
+Primary references are the DeepSeek-V4.1-Flash technical report/released configuration and inference implementation, vLLM's V4.1 implementation for deployment details, and DeepSeek's released DeepSpec DSpark code.
 
 This project is unaffiliated with DeepSeek.
