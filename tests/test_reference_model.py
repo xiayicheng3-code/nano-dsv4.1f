@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import jax
 import jax.numpy as jnp
 
@@ -8,12 +10,19 @@ from nano_dsv41f.config import (
     EngramConfig,
     IndexerConfig,
     ModelConfig,
+    RematConfig,
     RopeConfig,
 )
 from nano_dsv41f.indexer_scorer import select_candidate_blocks
-from nano_dsv41f.model import apply_model, apply_model_dspark, build_layer_specs, init_model
+from nano_dsv41f.model import (
+    apply_model,
+    apply_model_dspark,
+    build_layer_specs,
+    init_model,
+)
 from nano_dsv41f.moe import init_moe, route_tokens
 from nano_dsv41f.optimizer import parameter_rule_map, sinkhorn_balance
+from nano_dsv41f.quantization import fake_e8m0_scale
 from nano_dsv41f.rope import apply_partial_rope
 
 
@@ -112,7 +121,9 @@ def test_partial_rope_inverse_restores_tail_and_leaves_nope_untouched():
     x = jax.random.normal(jax.random.PRNGKey(8), (2, 5, 3, 8))
     positions = jnp.tile(jnp.arange(5)[None, :], (2, 1))
     y = apply_partial_rope(x, positions, rotary_dim=2, base=10_000.0)
-    z = apply_partial_rope(y, positions, rotary_dim=2, base=10_000.0, inverse=True)
+    z = apply_partial_rope(
+        y, positions, rotary_dim=2, base=10_000.0, inverse=True
+    )
     assert jnp.allclose(y[..., :-2], x[..., :-2])
     assert jnp.allclose(z, x, atol=1e-5)
 
@@ -170,11 +181,42 @@ def test_reference_model_can_be_jitted():
     cfg = tiny_config(dspark=False)
     params = init_model(jax.random.PRNGKey(3), cfg)
     ids = jnp.arange(8, dtype=jnp.int32)[None, :] % cfg.vocab_size
-    segments = jnp.array([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=jnp.int32)
-    forward = jax.jit(lambda p, x, s: apply_model(p, cfg, x, segment_ids=s)[0])
+    segments = jnp.array(
+        [[0, 0, 0, 0, 1, 1, 1, 1]], dtype=jnp.int32
+    )
+    forward = jax.jit(
+        lambda p, x, s: apply_model(p, cfg, x, segment_ids=s)[0]
+    )
     logits = forward(params, ids, segments)
     assert logits.shape == (1, 8, cfg.vocab_size)
     assert jnp.all(jnp.isfinite(logits))
+
+
+def test_remat_policies_preserve_loss_and_support_backward():
+    base = tiny_config(dspark=False)
+    params = init_model(jax.random.PRNGKey(13), base)
+    ids = jnp.arange(8, dtype=jnp.int32)[None, :] % base.vocab_size
+    segments = jnp.array(
+        [[0, 0, 0, 0, 1, 1, 1, 1]], dtype=jnp.int32
+    )
+
+    losses = []
+    for policy in ("none", "attention", "block"):
+        cfg = replace(base, remat=RematConfig(policy=policy))
+
+        def loss_fn(p):
+            logits, _ = apply_model(p, cfg, ids, segment_ids=segments)
+            return jnp.mean(jnp.square(logits))
+
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        losses.append(loss)
+        assert jnp.isfinite(loss)
+        assert all(
+            bool(jnp.all(jnp.isfinite(g)))
+            for g in jax.tree_util.tree_leaves(grads)
+        )
+
+    assert jnp.allclose(jnp.stack(losses), losses[0], atol=1e-6)
 
 
 def test_dspark_uses_separate_expert_count_and_returns_block_logits():
@@ -182,7 +224,9 @@ def test_dspark_uses_separate_expert_count_and_returns_block_logits():
     params = init_model(jax.random.PRNGKey(21), cfg)
     ids = jnp.arange(12, dtype=jnp.int32)[None, :] % cfg.vocab_size
     anchors = jnp.array([[6]], dtype=jnp.int32)
-    _, _, draft = apply_model_dspark(params, cfg, ids, anchor_positions=anchors)
+    _, _, draft = apply_model_dspark(
+        params, cfg, ids, anchor_positions=anchors
+    )
     assert draft["draft_logits"].shape == (
         1,
         1,
@@ -194,7 +238,9 @@ def test_dspark_uses_separate_expert_count_and_returns_block_logits():
     assert params["dspark"]["moe"]["router_bias"].shape == (
         cfg.dspark.n_routed_experts,
     )
-    assert params["blocks"][0]["moe"]["router_bias"].shape == (cfg.n_experts,)
+    assert params["blocks"][0]["moe"]["router_bias"].shape == (
+        cfg.n_experts,
+    )
 
 
 def test_optimizer_partition_is_visible_and_uses_headwise_q_muon():
@@ -217,10 +263,21 @@ def test_sinkhorn_runs_exactly_alternating_normalizations():
     assert jnp.allclose(jnp.linalg.norm(two, axis=0), 1.0, atol=1e-5)
 
 
+def test_ue8m0_scale_rounds_required_exponent_up():
+    # 1.01 requires the next power of two. Nearest-log2 rounding would incorrectly
+    # return 1.0 and can cause E2M1 saturation for values near the block maximum.
+    x = jnp.array([1.0, 1.01, 1.9, 2.0, 2.01], dtype=jnp.float32)
+    got = fake_e8m0_scale(x)
+    expected = jnp.array([1.0, 2.0, 2.0, 2.0, 4.0], dtype=jnp.float32)
+    assert jnp.array_equal(got, expected)
+
+
 def test_candidate_blocks_pin_newest_reachable_block():
     logits = jnp.array([[[9.0, 8.0, 1.0, 0.0, -2.0, -3.0]]])
     lens = jnp.array([[6]], dtype=jnp.int32)
-    mask = select_candidate_blocks(logits, lens, topk_blocks=2, block_size=2)
+    mask = select_candidate_blocks(
+        logits, lens, topk_blocks=2, block_size=2
+    )
     assert mask.shape == logits.shape
     assert bool(mask[0, 0, 0])
     assert bool(mask[0, 0, 4])
