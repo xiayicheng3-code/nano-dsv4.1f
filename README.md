@@ -8,7 +8,7 @@ An educational, TPU-first reimplementation of the *ideas* behind DeepSeek-V4.1-F
 
 - Keep the canonical implementation as normal Python modules, **not notebook cells**.
 - Compile the maintained source tree into a Kaggle-friendly notebook later.
-- Reimplement the architectural ideas that teach us something about long-context ML systems: CED, CSA2-style shared compressed KV, SWA + global attention, Single-Pass mHC, Engram-like hashed memory, MoE, FP4-KV QAT experiments, and explicit sharding.
+- Reimplement the architectural ideas that teach us something about long-context ML systems: CED, CSA2-style shared compressed KV, fixed-128 SWA + global attention, Single-Pass mHC, Engram-like hashed memory, MoE, FP4-KV QAT experiments, and explicit sharding.
 - Keep expensive deployment/training machinery optional when it obscures the educational core.
 - Record every deviation from the DeepSeek-V4.1-Flash report in `docs/implementation_scope.md`.
 
@@ -18,7 +18,11 @@ The first runnable target is a dense-training approximation of CSA2 on TPU. Spar
 
 For an indexer configured with `retrieve_top_k = 512` and a local window of `128`, the default educational policy only distills queries whose causal history is at least `640` tokens. To keep the teacher cheap, the initial implementation selects the **latest eligible query per packed segment**. This is our approximation; it is not claimed to be DeepSeek's training recipe.
 
-The indexer teacher uses dense main-attention logits only for those selected queries. The design keeps the dense teacher outside the ordinary SplashAttention forward path so we do not require SplashAttention to materialize a full attention-score matrix.
+Unlike the released model's long reuse groups, the nano architecture is expected to use only **2-3 served layers per retriever**. The default therefore distills the indexer from **all served layers**. With a 2-layer group, this is identical to a Full+last teacher policy; a 3-layer group adds only one more dense teacher QK evaluation.
+
+The local branch stays at a fixed **128-token SWA window**. For `r=2`, the compressed/global representation can overlap the local branch on the compression boundary. We preserve that behavior instead of changing SWA to an alternating 127/128-token window.
+
+The indexer teacher uses dense main-attention logits only for selected queries. The design keeps the dense teacher outside the ordinary SplashAttention forward path so we do not require SplashAttention to materialize a full attention-score matrix.
 
 ## Repository layout
 
@@ -27,7 +31,9 @@ src/nano_dsv41f/
   config.py          Small-model and training-stage configuration
   packing.py         Packed-sequence metadata and query selection
   attention.py       Mask algebra + streaming softmax merge helpers
+  compression.py     Learned ratio-1/2 KV compression reference
   indexer.py         Late-stage sparse-indexer distillation
+  indexer_scorer.py  Dense reference scorer + retrieval metrics
   mhc.py             Educational Single-Pass mHC implementation
   model.py           Small composable model skeleton
 scripts/
@@ -42,7 +48,7 @@ tests/
 
 ## Status
 
-The repository is being built bottom-up. The first commit establishes the architecture contracts and the pieces that are easiest to test without a TPU: packing, causal-compression mask algebra, indexer query selection, streaming softmax merge, and mHC math. TPU Splash/Pallas kernels and full distributed sharding come after the reference path is numerically stable.
+The repository is being built bottom-up. The current scaffold establishes the architecture contracts and the pieces that are easiest to test without a TPU: packing, causal-compression mask algebra, fixed-128 SWA overlap semantics, indexer query selection, streaming softmax merge, KV compression, dense indexer scoring, and mHC math. TPU Splash/Pallas kernels and full distributed sharding come after the reference path is numerically stable.
 
 ## References
 
