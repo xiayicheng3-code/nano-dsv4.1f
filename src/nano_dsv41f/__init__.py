@@ -1,23 +1,45 @@
-"""nano-dsv4.1f educational reference package."""
+"""nano-dsv4.1f educational DeepSeek-V4.1-Flash reference package."""
 
 from .config import (
     AttentionConfig,
     CSA2Config,
+    DSparkConfig,
     EngramConfig,
+    IndexerConfig,
     IndexerTrainingConfig,
     ModelConfig,
+    OptimizerConfig,
+    ParallelismConfig,
+    QuantizationConfig,
+    RematConfig,
+    RopeConfig,
     TrainConfig,
 )
-from .model import apply_model, build_layer_specs, init_model
+from .dspark import apply_dspark, sample_markov_block
+from .model import apply_model, apply_model_dspark, build_layer_specs, init_model
+from .optimizer import init_optimizer_state, optimizer_step, parameter_rule_map
 
 __all__ = [
     "AttentionConfig",
     "CSA2Config",
+    "DSparkConfig",
     "EngramConfig",
+    "IndexerConfig",
     "IndexerTrainingConfig",
     "ModelConfig",
+    "OptimizerConfig",
+    "ParallelismConfig",
+    "QuantizationConfig",
+    "RematConfig",
+    "RopeConfig",
     "TrainConfig",
+    "apply_dspark",
     "apply_model",
+    "apply_model_dspark",
     "build_layer_specs",
     "init_model",
+    "init_optimizer_state",
+    "optimizer_step",
+    "parameter_rule_map",
+    "sample_markov_block",
 ]
