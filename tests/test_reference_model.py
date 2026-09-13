@@ -13,7 +13,7 @@ from nano_dsv41f.config import (
 from nano_dsv41f.indexer_scorer import select_candidate_blocks
 from nano_dsv41f.model import apply_model, apply_model_dspark, build_layer_specs, init_model
 from nano_dsv41f.moe import init_moe, route_tokens
-from nano_dsv41f.optimizer import parameter_rule_map
+from nano_dsv41f.optimizer import parameter_rule_map, sinkhorn_balance
 from nano_dsv41f.rope import apply_partial_rope
 
 
@@ -86,7 +86,7 @@ def test_partial_rope_inverse_restores_tail_and_leaves_nope_untouched():
     assert jnp.allclose(z, x, atol=1e-5)
 
 
-def test_reference_model_forward_is_finite_on_packed_segments():
+def test_reference_model_forward_is_finite_and_index_reuse_is_observable():
     cfg = tiny_config()
     params = init_model(jax.random.PRNGKey(0), cfg)
     ids = jnp.arange(16, dtype=jnp.int32)[None, :] % cfg.vocab_size
@@ -104,6 +104,17 @@ def test_reference_model_forward_is_finite_on_packed_segments():
         16,
         cfg.d_model * len(cfg.dspark.target_layer_ids),
     )
+
+    # Context Full computes an index; following Reuse carries it without rescoring.
+    assert aux["layers"][1]["index_scores"] is not None
+    assert aux["layers"][2]["index_scores"] is None
+    assert jnp.array_equal(
+        aux["layers"][1]["index_topk_indices"],
+        aux["layers"][2]["index_topk_indices"],
+    )
+    # Generation Full replaces the shared bank and publishes its own retrieval selection.
+    assert aux["layers"][3]["index_scores"] is not None
+    assert aux["layers"][4]["index_scores"] is None
 
 
 def test_reference_model_can_be_jitted():
@@ -123,7 +134,12 @@ def test_dspark_uses_separate_expert_count_and_returns_block_logits():
     ids = jnp.arange(12, dtype=jnp.int32)[None, :] % cfg.vocab_size
     anchors = jnp.array([[6]], dtype=jnp.int32)
     _, _, draft = apply_model_dspark(params, cfg, ids, anchor_positions=anchors)
-    assert draft["draft_logits"].shape == (1, 1, cfg.dspark.block_size, cfg.vocab_size)
+    assert draft["draft_logits"].shape == (
+        1,
+        1,
+        cfg.dspark.block_size,
+        cfg.vocab_size,
+    )
     assert draft["confidence"].shape == (1, 1, cfg.dspark.block_size)
     assert draft["router_indices"].shape[-1] == cfg.dspark.experts_per_token
     assert params["dspark"]["moe"]["router_bias"].shape == (
@@ -144,8 +160,15 @@ def test_optimizer_partition_is_visible_and_uses_headwise_q_muon():
     assert rules["blocks/1/engram/table"] == "sinkhorn"
 
 
+def test_sinkhorn_runs_exactly_alternating_normalizations():
+    x = jnp.arange(1, 13, dtype=jnp.float32).reshape(3, 4)
+    one = sinkhorn_balance(x, iters=1, eps=1e-12, row_mask_tau=0.0)
+    two = sinkhorn_balance(x, iters=2, eps=1e-12, row_mask_tau=0.0)
+    assert jnp.allclose(jnp.linalg.norm(one, axis=1), 1.0, atol=1e-5)
+    assert jnp.allclose(jnp.linalg.norm(two, axis=0), 1.0, atol=1e-5)
+
+
 def test_candidate_blocks_pin_newest_reachable_block():
-    # Highest score is in block 0, but partial newest block 2 must also survive.
     logits = jnp.array([[[9.0, 8.0, 1.0, 0.0, -2.0, -3.0]]])
     lens = jnp.array([[6]], dtype=jnp.int32)
     mask = select_candidate_blocks(logits, lens, topk_blocks=2, block_size=2)
@@ -157,6 +180,8 @@ def test_candidate_blocks_pin_newest_reachable_block():
 def test_router_weights_normalize_over_selected_experts():
     params = init_moe(jax.random.PRNGKey(1), 8, 12, 4)
     x = jax.random.normal(jax.random.PRNGKey(2), (2, 3, 8))
-    weights, indices = route_tokens(x, params, top_k=2, route_scale=1.5, eps=1e-20)
+    weights, indices = route_tokens(
+        x, params, top_k=2, route_scale=1.5, eps=1e-20
+    )
     assert indices.shape == (2, 3, 2)
     assert jnp.allclose(jnp.sum(weights, axis=-1), 1.5)
