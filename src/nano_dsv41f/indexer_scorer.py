@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 
@@ -55,12 +56,7 @@ def masked_top_k(
     if k <= 0 or k > scores.shape[-1]:
         raise ValueError("k must be in [1, scores.shape[-1]]")
     masked = jnp.where(valid, scores, -jnp.inf)
-    values, indices = jnp.linalg.eigh(jnp.zeros((1, 1))) if False else (None, None)
-    # lax.top_k is used through jax.lax to keep the operation JIT friendly.
-    import jax
-
-    values, indices = jax.lax.top_k(masked, k)
-    return values, indices
+    return jax.lax.top_k(masked, k)
 
 
 def attention_mass_recall(
