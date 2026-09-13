@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-dsv41f"
+version = "0.0.1"
+description = "Educational TPU-first nano reimplementation of DeepSeek-V4.1-Flash ideas"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "jax>=0.4.30",
+  "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "nbformat>=5.10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
