@@ -235,7 +235,7 @@ class RematConfig:
 class ParallelismConfig:
     # Semantic sharding names: several can reuse the same physical 8-chip TPU mesh axis.
     vocab_shard: int = 8
-    enram_table_shard: int = 8
+    engram_table_shard: int = 8
     expert_shard: int = 8
     dspark_expert_shard: int = 8
     attention_context_shard: int = 8
