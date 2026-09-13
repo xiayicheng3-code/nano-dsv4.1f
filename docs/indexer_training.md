@@ -11,9 +11,17 @@ The default configuration uses:
 - minimum eligible local query position: 640
 - query sampling: latest eligible query per packed segment
 - training interval: configurable late pre/mid-training window
-- default cross-layer teachers: Full layer + last served layer
+- cross-layer teachers: **all layers served by the retriever**
 
 The 640-query rule is **our approximation**. It is not described as DeepSeek's exact recipe.
+
+## Why all served layers is affordable here
+
+DeepSeek's released model can reuse one retrieval decision across substantially longer layer spans. The nano model does not need that many layers to demonstrate the mechanism: we expect only **2-3 served layers per retriever**.
+
+That changes the compute tradeoff. Dense teacher scoring for every served layer is now small enough to remain the clearest educational default. In the 2-layer case, "Full + last" and "all served" are exactly the same teacher set.
+
+We retain `full_only` and `full_last` as ablation modes, but they are no longer the default optimization target.
 
 ## Static-shape query selection
 
@@ -36,7 +44,7 @@ The unnormalized teacher mass for candidate `j` is
 u_j = sum_h exp(z_hj - LSE_h)
 ```
 
-Using the complete LSE matters because it preserves competition with the local/SWA branch.
+Using the complete LSE matters because it preserves competition with the fixed 128-token local/SWA branch, including any representational overlap between local and compressed history.
 
 ## Distillation objective
 
@@ -58,13 +66,13 @@ No normalized teacher matrix has to be retained.
 
 ## Cross-layer teacher policy
 
-An index set can serve several downstream layers. Recomputing dense teacher QK for every served layer is expensive. We expose three policies:
+An index set is shared across a small group of layers. We expose three policies:
 
-- `full_only`: cheapest sanity baseline;
-- `full_last`: default; tests whether the retrieval set remains useful at the end of its reuse span;
-- `all_served`: most expensive reference ablation.
+- `all_served`: **default**; distill against every layer that consumes the shared retrieval decision;
+- `full_last`: ablation that keeps only the first and last teachers;
+- `full_only`: cheapest sanity baseline.
 
-The goal is to measure whether `full_last` captures nearly all of the benefit before paying for every intermediate teacher.
+For the intended 2-layer educational group, `all_served == full_last`. For a 3-layer group, `all_served` adds only one extra teacher QK evaluation, which is acceptable while phrase/context sizes remain modest.
 
 ## Interaction with rematerialization
 
