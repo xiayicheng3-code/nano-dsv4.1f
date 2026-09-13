@@ -45,7 +45,6 @@ def tiny_config(*, dspark=True) -> ModelConfig:
             o_rank=8,
             o_groups=2,
             local_window=4,
-            retrieve_top_k=8,
             rope=RopeConfig(rope_head_dim=2, original_seq_len=0),
         ),
         csa2=CSA2Config(
@@ -137,7 +136,6 @@ def test_dense_lm_forward_skips_full_indexer_scoring_by_default():
     segments = jnp.array([[0] * 8 + [1] * 8], dtype=jnp.int32)
     _, aux = apply_model(params, cfg, ids, segment_ids=segments)
     assert all(layer["index_scores"] is None for layer in aux["layers"])
-    # We also skip the source-side index-K projection in the ordinary dense path.
     assert all(layer["index_k"] is None for layer in aux["layers"])
 
 
@@ -189,7 +187,6 @@ def test_reference_model_diagnostic_indexer_exercises_reindex_state_machine():
 def test_selective_distillation_scores_one_query_slot_per_packed_segment():
     cfg = tiny_config(dspark=False)
     params = init_model(jax.random.PRNGKey(41), cfg)
-    # Two even-length packed segments. local pos 13 exceeds the default 4+8=12 rule.
     ids = jnp.arange(28, dtype=jnp.int32)[None, :] % cfg.vocab_size
     segments = jnp.array([[0] * 14 + [1] * 14], dtype=jnp.int32)
 
@@ -197,11 +194,10 @@ def test_selective_distillation_scores_one_query_slot_per_packed_segment():
         params, cfg, ids, segment_ids=segments, n_segments=2
     )
     assert jnp.isfinite(loss)
-    assert int(aux["active_queries"]) == 6  # 2 slots x L1/L3/L5 index sources
+    assert int(aux["active_queries"]) == 6
     assert tuple(aux["student_score_shapes"]["L1"]) == (1, 2, 14)
     assert tuple(aux["student_score_shapes"]["L3"]) == (1, 2, 28)
     assert tuple(aux["student_score_shapes"]["L5"]) == (1, 2, 28)
-    # The student query axis is the fixed packed-segment count, never the token length.
     assert int(aux["student_score_shapes"]["L3"][1]) == 2
 
 
@@ -232,7 +228,6 @@ def test_ratio_aware_indexer_eligibility_delays_r2_encoder_only():
         params, ratio_cfg, ids, segment_ids=segments, n_segments=2
     )
     assert jnp.isfinite(loss)
-    # L1/r=2 has no eligible queries at local pos 13; decoder L3/L5/r=1 still do.
     assert int(aux["active_queries"]) == 4
 
 
