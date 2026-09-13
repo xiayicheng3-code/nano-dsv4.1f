@@ -1,6 +1,10 @@
 import jax.numpy as jnp
 
-from nano_dsv41f.attention import compressed_global_mask, merge_attention_outputs
+from nano_dsv41f.attention import (
+    compressed_global_mask,
+    fixed_local_window_mask,
+    merge_attention_outputs,
+)
 from nano_dsv41f.indexer import latest_teacher_indices
 from nano_dsv41f.packing import PackedSegments, segment_local_positions
 
@@ -57,7 +61,7 @@ def test_global_packed_mask_needs_only_segment_id_plus_q_ge_rk():
     # Compare against the explicit segment-local predicate.
     expected = jnp.zeros_like(packed)
     q0 = k0 = 0
-    for seg, (ql, kl) in enumerate(zip(q_lengths, k_lengths)):
+    for ql, kl in zip(q_lengths, k_lengths):
         q_local = jnp.arange(ql)
         k_local = jnp.arange(kl)
         local = q_local[:, None] >= r * k_local[None, :]
@@ -65,6 +69,43 @@ def test_global_packed_mask_needs_only_segment_id_plus_q_ge_rk():
         q0 += ql
         k0 += kl
     assert jnp.array_equal(packed, expected)
+
+
+def test_fixed_128_swa_intentionally_overlaps_r2_global_representation():
+    # Original token query t=128 has fixed SWA coverage [1, 128].
+    q = jnp.array([128], dtype=jnp.int32)
+    raw_k = jnp.arange(129, dtype=jnp.int32)
+    seg_q = jnp.array([0], dtype=jnp.int32)
+    seg_raw = jnp.zeros((129,), dtype=jnp.int32)
+    local = fixed_local_window_mask(q, raw_k, seg_q, seg_raw, window=128)
+    assert bool(local[0, 1])
+    assert not bool(local[0, 0])
+
+    # The corresponding cropped global query has q'=0. For r=2 it can attend
+    # compressed group k=0, representing raw tokens {0, 1}. Token 1 is therefore
+    # represented in both the local and compressed/global branches.
+    global_visible = compressed_global_mask(
+        jnp.array([0], dtype=jnp.int32),
+        jnp.array([0], dtype=jnp.int32),
+        jnp.array([0], dtype=jnp.int32),
+        jnp.array([0], dtype=jnp.int32),
+        compression_ratio=2,
+    )
+    assert bool(global_visible[0, 0])
+
+    # One token later, fixed SWA is [2, 129] while the same compressed group still
+    # covers {0, 1}; the overlap alternates with the r=2 compression lattice.
+    q_next = jnp.array([129], dtype=jnp.int32)
+    raw_k_next = jnp.arange(130, dtype=jnp.int32)
+    local_next = fixed_local_window_mask(
+        q_next,
+        raw_k_next,
+        seg_q,
+        jnp.zeros((130,), dtype=jnp.int32),
+        window=128,
+    )
+    assert not bool(local_next[0, 1])
+    assert bool(local_next[0, 2])
 
 
 def test_lse_merge_matches_shared_denominator_weights():
