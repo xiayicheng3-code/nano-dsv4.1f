@@ -2,53 +2,121 @@
 
 ## Goal
 
-Teach a sparse retrieval indexer to approximate the useful mass of dense compressed/global attention without forcing dense teacher scoring for every query at every training step.
+Train the sparse retrieval indexer without paying for a full `T x K` scorer on every LM step.
 
-The default configuration uses:
+The ordinary dense backbone runs with `compute_indexer=False`: compressed/main attention still trains normally, but index-K construction and full retriever scoring are skipped. A separate late-stage auxiliary path scores only selected query rows.
+
+This training policy is **our educational experiment**, not a claim about DeepSeek's private recipe.
+
+## Default policy
 
 - local window: 128
-- target retrieved positions: 512
-- minimum eligible local query position: 640
+- target retrieval size: 512
 - query sampling: latest eligible query per packed segment
+- cross-layer teachers: **all layers served by that retriever**
+- teacher branch: always stop-gradient
+- student backbone inputs: detached by default; indexer-specific projections remain trainable
 - training interval: configurable late pre/mid-training window
-- cross-layer teachers: **all layers served by the retriever**
 
-The 640-query rule is **our approximation**. It is not described as DeepSeek's exact recipe.
+Two eligibility rules are exposed:
 
-## Why all served layers is affordable here
+```text
+local_plus_topk:
+  min query position = local_window + top_k
 
-DeepSeek's released model can reuse one retrieval decision across substantially longer layer spans. The nano model does not need that many layers to demonstrate the mechanism: we expect only **2-3 served layers per retriever**.
+local_plus_ratio_topk:
+  min query position = local_window + compression_ratio * top_k
+```
 
-That changes the compute tradeoff. Dense teacher scoring for every served layer is now small enough to remain the clearest educational default. In the 2-layer case, "Full + last" and "all served" are exactly the same teacher set.
+The first preserves the proposed `128 + 512 = 640` rule. The second distinguishes the decoder (`r=1`, still 640) from the r=2 encoder: 512 compressed entries represent roughly 1024 raw tokens, so actual Top-512 selection pressure starts around `128 + 2*512 = 1152` raw positions.
 
-We retain `full_only` and `full_last` as ablation modes, but they are no longer the default optimization target.
+This is deliberately an ablation knob rather than pretending one threshold is universally correct.
 
 ## Static-shape query selection
 
-A JIT-friendly batch has a fixed maximum number of packed segments. Each segment gets exactly one teacher slot:
+A compiled batch has a fixed maximum number of packed segments. Each segment gets exactly one query slot:
 
 ```text
-teacher_indices: [num_segments]
-teacher_valid:   [num_segments]
+query_indices: [B, num_segments]
+query_valid:   [B, num_segments]
 ```
 
-A short segment maps to a dummy index plus `teacher_valid=False`; a long segment maps to its final token. This avoids dynamic `nonzero()`/variable-sized gathers.
+Short/missing segments map to a dummy physical token with `query_valid=False`. Long segments map to their latest token. No dynamic `nonzero()` or variable-sized gather is required.
+
+Therefore student scores have shape
+
+```text
+[B, num_segments, compressed_K]
+```
+
+rather than
+
+```text
+[B, T, compressed_K].
+```
+
+## Index-K ownership
+
+For each retrieval-sharing group:
+
+- build index K **once** from the owning KV source's pre-RoPE compressed latent;
+- a Full source uses its own index-K;
+- a later Reindex (L5 in the default model) reuses L3's index-K and only has its own Q/head-weight projections.
+
+When `detach_backbone_inputs=True`, `stop_gradient` is applied to the source latent **before** `wk`, and to selected `qr`/hidden inputs **before** the student Q/head-weight projections. Thus `wk`, `k_norm`, `wq_b`, and `weights_proj` still train while the auxiliary loss does not perturb the dense backbone.
+
+Turning detachment off is an explicit ablation.
 
 ## Teacher scores
 
-For a selected query and compressed candidate `j`, main attention provides per-head logits `z_hj`. The normal attention forward already gives the complete local+global log-sum-exp `LSE_h`.
+For one selected query and compressed candidate `j`, main attention provides per-head logits `z_hj`. The backbone already computes the complete shared denominator:
 
-The unnormalized teacher mass for candidate `j` is
+```text
+LSE_h = log(local + compressed/global + sink mass)
+```
+
+The unnormalized teacher mass is
 
 ```text
 u_j = sum_h exp(z_hj - LSE_h)
 ```
 
-Using the complete LSE matters because it preserves competition with the fixed 128-token local/SWA branch, including any representational overlap between local and compressed history.
+The teacher uses the main attention's shared latent K, not the indexer K. Because the complete LSE is used, raw SWA, compressed/global attention, their fixed-window overlap, and the attention sink all remain competitors in the denominator.
+
+Teacher mass is always stop-gradient.
+
+## Cross-layer teacher groups
+
+The seven-layer default derives these groups from the actual layer schedule:
+
+```text
+L1 index source -> teachers L1, L2
+L3 index source -> teachers L3, L4
+L5 Reindex      -> teachers L5, L6
+```
+
+Policies:
+
+- `all_served`: default;
+- `full_last`: first and last served layer;
+- `full_only`: only the index-source layer (name retained for compatibility even when the source is Reindex).
+
+For every default two-layer group, `all_served == full_last` in teacher count.
+
+## Hierarchical Reindex
+
+L3 is the default decoder candidate source. For the selected L3 query rows:
+
+1. compute student index scores over legal compressed history;
+2. max-pool scores inside candidate blocks;
+3. force the newest reachable block to survive;
+4. keep the configured top candidate blocks.
+
+L5's selective student loss is then computed only inside that L3 candidate pool, while L5 still uses its own index-Q/head-weight parameters. No new KV or index-K bank is created.
 
 ## Distillation objective
 
-Let `I_j` be the indexer score and let `p_j = u_j / sum(u)` be the normalized teacher. The indexer cross entropy is
+Let `I_j` be the student indexer score and `p_j = u_j / sum(u)` the normalized teacher over the current legal/candidate pool. The cross entropy is
 
 ```text
 CE(p, softmax(I))
@@ -56,28 +124,14 @@ CE(p, softmax(I))
   = logsumexp(I) - sum_j u_j I_j / sum_j u_j
 ```
 
-Therefore the TPU implementation only needs tile-wise accumulators for:
+The implementation keeps invalid fixed-shape query slots numerically finite before `logsumexp`, avoiding NaN gradients from all-`-inf` dummy rows.
 
-- `logsumexp(I)`
-- `sum(u)`
-- `sum(u * I)`
-
-No normalized teacher matrix has to be retained.
-
-## Cross-layer teacher policy
-
-An index set is shared across a small group of layers. We expose three policies:
-
-- `all_served`: **default**; distill against every layer that consumes the shared retrieval decision;
-- `full_last`: ablation that keeps only the first and last teachers;
-- `full_only`: cheapest sanity baseline.
-
-For the intended 2-layer educational group, `all_served == full_last`. For a 3-layer group, `all_served` adds only one extra teacher QK evaluation, which is acceptable while phrase/context sizes remain modest.
+A future TPU kernel can stream K tiles and retain only the accumulators needed for the same equation; no normalized teacher matrix has to survive.
 
 ## Interaction with rematerialization
 
-Teacher QK scoring is an auxiliary forward computation and should be detached from the LM-gradient rematerialization path. Normal attention projections may be recomputed during backward; dense teacher QK should not accidentally replay because an entire model block was wrapped in `jax.remat`.
+The backbone now supports `none`, `attention`, and `block` remat policies. Selective teacher work is invoked as a separate auxiliary computation rather than being deliberately nested inside the LM remat region. This prevents a coarse checkpoint policy from accidentally replaying dense teacher rows during backward.
 
-## Later GPU experiment
+## Sparse-aware continuation
 
-Hard Top-K sparse-aware continuation training is intentionally deferred. Once retrieval quality is established, a GPU path can test whether sparse-aware training materially improves quality enough to justify dynamic gather/scatter and sparse backward complexity.
+Hard Top-K sparse attention is still intentionally outside the TPU LM-training critical path. Once retrieval quality is measured, a GPU continuation experiment can test whether sparse-aware backward provides enough quality improvement to justify dynamic gather/scatter and custom sparse kernels.
