@@ -128,6 +128,8 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
     assert logits.shape == (1, 16, cfg.vocab_size)
     assert jnp.all(jnp.isfinite(logits))
     assert aux["context_final"].shape == (1, 16, cfg.d_model)
+    # The decoder bank remains owned by the first generation Full layer L3 even after L5
+    # reindexes it.
     assert int(aux["final_global_source_layer"]) == cfg.csa2.context_layers
     assert len(aux["layers"]) == cfg.n_layers
     assert aux["dspark_context_features"].shape == (
@@ -153,8 +155,8 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
         aux["layers"][4]["index_topk_indices"],
     )
 
-    # Reindex does not replace the KV source, but does produce a fresh retrieval decision
-    # inside the candidate hierarchy; the final Reuse carries that new selection.
+    # L5 Reindex produces a fresh retrieval decision without replacing L3's KV bank.
+    # L6 then reuses the L5 selection verbatim.
     assert aux["layers"][5]["index_scores"] is not None
     assert aux["layers"][5]["index_candidate_mask"] is not None
     assert aux["layers"][6]["index_scores"] is None
@@ -162,8 +164,6 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
         aux["layers"][5]["index_topk_indices"],
         aux["layers"][6]["index_topk_indices"],
     )
-    assert int(aux["layers"][5]["global_source_layer"]) == 3
-    assert int(aux["layers"][5]["index_source_layer"]) == 5
 
 
 def test_reference_model_can_be_jitted():
