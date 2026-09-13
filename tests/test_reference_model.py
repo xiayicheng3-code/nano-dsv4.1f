@@ -7,6 +7,7 @@ from nano_dsv41f.config import (
     EngramConfig,
     ModelConfig,
 )
+from nano_dsv41f.csa2 import apply_csa2_attention, init_csa2_attention
 from nano_dsv41f.model import apply_model, build_layer_specs, init_model
 from nano_dsv41f.moe import init_moe, route_tokens
 
@@ -79,6 +80,54 @@ def test_layer_specs_capture_nano_ced_and_csa2_modes():
         1,
         1,
     ]
+
+
+def test_full_layer_can_publish_global_kv_from_explicit_ced_source():
+    params = init_csa2_attention(
+        jax.random.PRNGKey(11),
+        dim=8,
+        n_heads=2,
+        head_dim=4,
+        q_rank=4,
+        o_rank=4,
+        owns_global_kv=True,
+    )
+    x = jnp.zeros((1, 8, 8), dtype=jnp.float32)
+    context_source = jnp.ones((1, 8, 8), dtype=jnp.float32)
+    segments = jnp.zeros((1, 8), dtype=jnp.int32)
+
+    _, state_from_x, _ = apply_csa2_attention(
+        x,
+        segments,
+        params,
+        None,
+        layer_id=4,
+        mode="full",
+        owns_global_kv=True,
+        compression_ratio=1,
+        n_heads=2,
+        head_dim=4,
+        local_window=4,
+        norm_eps=1e-6,
+    )
+    _, state_from_context, _ = apply_csa2_attention(
+        x,
+        segments,
+        params,
+        None,
+        layer_id=4,
+        mode="full",
+        owns_global_kv=True,
+        compression_ratio=1,
+        n_heads=2,
+        head_dim=4,
+        local_window=4,
+        norm_eps=1e-6,
+        global_source=context_source,
+    )
+
+    assert not jnp.allclose(state_from_x.kv, state_from_context.kv)
+    assert int(state_from_context.source_layer) == 4
 
 
 def test_reference_model_forward_is_finite_on_packed_segments():
