@@ -13,6 +13,7 @@ from nano_dsv41f.config import (
     RematConfig,
     RopeConfig,
 )
+from nano_dsv41f.indexer import eligibility_position
 from nano_dsv41f.indexer_scorer import select_candidate_blocks
 from nano_dsv41f.model import (
     apply_model,
@@ -24,6 +25,7 @@ from nano_dsv41f.moe import init_moe, route_tokens
 from nano_dsv41f.optimizer import parameter_rule_map, sinkhorn_balance
 from nano_dsv41f.quantization import fake_e8m0_scale
 from nano_dsv41f.rope import apply_partial_rope
+from nano_dsv41f.training import selective_indexer_distillation_loss
 
 
 def tiny_config(*, dspark=True) -> ModelConfig:
@@ -128,19 +130,30 @@ def test_partial_rope_inverse_restores_tail_and_leaves_nope_untouched():
     assert jnp.allclose(z, x, atol=1e-5)
 
 
-def test_reference_model_forward_is_finite_and_reindex_is_observable():
+def test_dense_lm_forward_skips_full_indexer_scoring_by_default():
+    cfg = tiny_config(dspark=False)
+    params = init_model(jax.random.PRNGKey(4), cfg)
+    ids = jnp.arange(16, dtype=jnp.int32)[None, :] % cfg.vocab_size
+    segments = jnp.array([[0] * 8 + [1] * 8], dtype=jnp.int32)
+    _, aux = apply_model(params, cfg, ids, segment_ids=segments)
+    assert all(layer["index_scores"] is None for layer in aux["layers"])
+    # We also skip the source-side index-K projection in the ordinary dense path.
+    assert all(layer["index_k"] is None for layer in aux["layers"])
+
+
+def test_reference_model_diagnostic_indexer_exercises_reindex_state_machine():
     cfg = tiny_config()
     params = init_model(jax.random.PRNGKey(0), cfg)
     ids = jnp.arange(16, dtype=jnp.int32)[None, :] % cfg.vocab_size
     segments = jnp.array([[0] * 8 + [1] * 8], dtype=jnp.int32)
 
-    logits, aux = apply_model(params, cfg, ids, segment_ids=segments)
+    logits, aux = apply_model(
+        params, cfg, ids, segment_ids=segments, compute_indexer=True
+    )
 
     assert logits.shape == (1, 16, cfg.vocab_size)
     assert jnp.all(jnp.isfinite(logits))
     assert aux["context_final"].shape == (1, 16, cfg.d_model)
-    # The decoder bank remains owned by the first generation Full layer L3 even after L5
-    # reindexes it.
     assert int(aux["final_global_source_layer"]) == cfg.csa2.context_layers
     assert len(aux["layers"]) == cfg.n_layers
     assert aux["dspark_context_features"].shape == (
@@ -149,7 +162,6 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
         cfg.d_model * len(cfg.dspark.target_layer_ids),
     )
 
-    # Context Full computes an index; following Reuse carries it without rescoring.
     assert aux["layers"][1]["index_scores"] is not None
     assert aux["layers"][2]["index_scores"] is None
     assert jnp.array_equal(
@@ -157,7 +169,6 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
         aux["layers"][2]["index_topk_indices"],
     )
 
-    # Decoder Full owns the shared r=1 bank and publishes candidate blocks.
     assert aux["layers"][3]["index_scores"] is not None
     assert aux["layers"][3]["index_candidate_mask"] is not None
     assert aux["layers"][4]["index_scores"] is None
@@ -166,8 +177,6 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
         aux["layers"][4]["index_topk_indices"],
     )
 
-    # L5 Reindex produces a fresh retrieval decision without replacing L3's KV bank.
-    # L6 then reuses the L5 selection verbatim.
     assert aux["layers"][5]["index_scores"] is not None
     assert aux["layers"][5]["index_candidate_mask"] is not None
     assert aux["layers"][6]["index_scores"] is None
@@ -175,6 +184,56 @@ def test_reference_model_forward_is_finite_and_reindex_is_observable():
         aux["layers"][5]["index_topk_indices"],
         aux["layers"][6]["index_topk_indices"],
     )
+
+
+def test_selective_distillation_scores_one_query_slot_per_packed_segment():
+    cfg = tiny_config(dspark=False)
+    params = init_model(jax.random.PRNGKey(41), cfg)
+    # Two even-length packed segments. local pos 13 exceeds the default 4+8=12 rule.
+    ids = jnp.arange(28, dtype=jnp.int32)[None, :] % cfg.vocab_size
+    segments = jnp.array([[0] * 14 + [1] * 14], dtype=jnp.int32)
+
+    loss, aux = selective_indexer_distillation_loss(
+        params, cfg, ids, segment_ids=segments, n_segments=2
+    )
+    assert jnp.isfinite(loss)
+    assert int(aux["active_queries"]) == 6  # 2 slots x L1/L3/L5 index sources
+    assert tuple(aux["student_score_shapes"]["L1"]) == (1, 2, 14)
+    assert tuple(aux["student_score_shapes"]["L3"]) == (1, 2, 28)
+    assert tuple(aux["student_score_shapes"]["L5"]) == (1, 2, 28)
+    # The student query axis is the fixed packed-segment count, never the token length.
+    assert int(aux["student_score_shapes"]["L3"][1]) == 2
+
+
+def test_ratio_aware_indexer_eligibility_delays_r2_encoder_only():
+    cfg = tiny_config(dspark=False)
+    params = init_model(jax.random.PRNGKey(42), cfg)
+    ids = jnp.arange(28, dtype=jnp.int32)[None, :] % cfg.vocab_size
+    segments = jnp.array([[0] * 14 + [1] * 14], dtype=jnp.int32)
+    ratio_cfg = replace(
+        cfg,
+        indexer_training=replace(
+            cfg.indexer_training, eligibility_rule="local_plus_ratio_topk"
+        ),
+    )
+    assert eligibility_position(
+        local_window=4,
+        retrieve_top_k=8,
+        compression_ratio=1,
+        rule="local_plus_ratio_topk",
+    ) == 12
+    assert eligibility_position(
+        local_window=4,
+        retrieve_top_k=8,
+        compression_ratio=2,
+        rule="local_plus_ratio_topk",
+    ) == 20
+    loss, aux = selective_indexer_distillation_loss(
+        params, ratio_cfg, ids, segment_ids=segments, n_segments=2
+    )
+    assert jnp.isfinite(loss)
+    # L1/r=2 has no eligible queries at local pos 13; decoder L3/L5/r=1 still do.
+    assert int(aux["active_queries"]) == 4
 
 
 def test_reference_model_can_be_jitted():
@@ -264,8 +323,6 @@ def test_sinkhorn_runs_exactly_alternating_normalizations():
 
 
 def test_ue8m0_scale_rounds_required_exponent_up():
-    # 1.01 requires the next power of two. Nearest-log2 rounding would incorrectly
-    # return 1.0 and can cause E2M1 saturation for values near the block maximum.
     x = jnp.array([1.0, 1.01, 1.9, 2.0, 2.01], dtype=jnp.float32)
     got = fake_e8m0_scale(x)
     expected = jnp.array([1.0, 2.0, 2.0, 2.0, 4.0], dtype=jnp.float32)
