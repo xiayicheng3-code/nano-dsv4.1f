@@ -24,7 +24,8 @@ class QuantizationConfig:
     main_kv_block_size: int = 16
     main_kv_scale_format: Literal["e4m3"] = "e4m3"
     indexer_fp4_qat: bool = False
-    indexer_block_size: int = 16
+    # Current V4.1 indexer cache uses MXFP4 with 32-value blocks + UE8M0 scales.
+    indexer_block_size: int = 32
     indexer_scale_format: Literal["e8m0"] = "e8m0"
     swa_fp8_qat: bool = False
     swa_fp8_block_size: int = 32
@@ -231,7 +232,8 @@ class ModelConfig:
     experts_per_token: int = 2
     route_scale: float = 1.5
     route_eps: float = 1e-20
-    swiglu_limit: float = 7.0
+    # Production V4.1 clips SwiGLU activations at 10; still fully notebook-configurable.
+    swiglu_limit: float = 10.0
     mhc_streams: int = 4
     mhc_sinkhorn_iters: int = 20
     # V4.1 language RMSNorm and mHC use deliberately different epsilons.
