@@ -170,6 +170,7 @@ def _apply_block(
     spec: LayerSpec,
     *,
     global_source: jax.Array | None = None,
+    compute_indexer: bool = False,
 ) -> tuple[jax.Array, jax.Array, SharedCSA2State | None, dict[str, object]]:
     """One Single-Pass-mHC block with optional attention-only rematerialization."""
     residual = streams
@@ -186,8 +187,7 @@ def _apply_block(
     )
 
     # Capture architecture/config metadata in the closure so remat only sees array pytrees.
-    # This replays CSA2/indexer forward math during backward, but not the separate teacher-
-    # distillation pass, which intentionally lives outside this model forward.
+    # Separate late-stage teacher distillation lives outside this remat boundary.
     def attention_forward(attn_x, attn_params, shared_state, ced_source):
         return apply_csa2_attention(
             attn_x,
@@ -200,6 +200,7 @@ def _apply_block(
             compression_ratio=spec.compression_ratio,
             config=config,
             global_source=ced_source,
+            compute_indexer=compute_indexer,
         )
 
     if config.remat.policy == "attention":
@@ -241,13 +242,19 @@ def apply_model(
     *,
     segment_ids: jax.Array | None = None,
     token_mask: jax.Array | None = None,
+    compute_indexer: bool = False,
 ) -> tuple[jax.Array, dict[str, object]]:
-    """Run the dense semantic backbone reference and expose DSpark context features.
+    """Run the dense semantic backbone reference and expose training intermediates.
+
+    ``compute_indexer=False`` is the normal dense pretraining path. It deliberately skips
+    full-sequence index-K construction and T-by-K index scoring; late-stage distillation can
+    score only selected query rows. Set it to ``True`` for retrieval diagnostics / explicit
+    Full-Reindex-Reuse state-machine tests.
 
     Rematerialization policy is architectural plumbing, not model semantics:
 
     - ``none``: retain normal autodiff intermediates;
-    - ``attention``: replay CSA2 attention/indexer math but retain MoE forward activations;
+    - ``attention``: replay CSA2 attention math but retain MoE forward activations;
     - ``block``: replay the attention + MoE Transformer block from its mHC block boundary.
 
     Engram injection remains outside the block remat boundary because its table lookup is
@@ -313,6 +320,7 @@ def apply_model(
                 config,
                 spec,
                 global_source=ced_source,
+                compute_indexer=compute_indexer,
             )
 
         if config.remat.policy == "block":
@@ -363,7 +371,11 @@ def apply_model_dspark(
     if not config.dspark.enabled or "dspark" not in params:
         raise ValueError("DSpark is disabled or uninitialized")
     logits, aux = apply_model(
-        params, config, input_ids, segment_ids=segment_ids
+        params,
+        config,
+        input_ids,
+        segment_ids=segment_ids,
+        compute_indexer=False,
     )
     context = aux["dspark_context_features"]
     if context is None:
