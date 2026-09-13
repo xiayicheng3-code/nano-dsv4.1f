@@ -39,14 +39,21 @@ def tiny_config(*, dspark=True) -> ModelConfig:
         ),
         csa2=CSA2Config(
             context_layers=3,
-            generation_layers=2,
+            generation_layers=4,
             context_swa_only_layers=1,
             context_retriever_group_size=2,
             generation_retriever_group_size=2,
             context_compression_ratio=2,
             generation_compression_ratio=1,
         ),
-        indexer=IndexerConfig(n_heads=2, head_dim=4, top_k=8),
+        indexer=IndexerConfig(
+            n_heads=2,
+            head_dim=4,
+            top_k=8,
+            candidate_source_layer=3,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+        ),
         engram=EngramConfig(
             enabled=True,
             layer_ids=(1,),
@@ -60,7 +67,7 @@ def tiny_config(*, dspark=True) -> ModelConfig:
             n_layers=1,
             block_size=3,
             noise_token_id=0,
-            target_layer_ids=(3, 4),
+            target_layer_ids=(4, 5, 6),
             markov_rank=8,
             n_routed_experts=2,
             experts_per_token=1,
@@ -69,12 +76,36 @@ def tiny_config(*, dspark=True) -> ModelConfig:
     )
 
 
-def test_layer_specs_capture_swa_ced_and_two_layer_retriever_groups():
+def test_layer_specs_capture_swa_ced_full_reindex_reuse_groups():
     specs = build_layer_specs(tiny_config())
-    assert [s.mode for s in specs] == ["swa", "full", "reuse", "full", "reuse"]
-    assert [s.owns_global_kv for s in specs] == [False, True, False, True, False]
-    assert [s.is_index_source for s in specs] == [False, True, False, True, False]
-    assert [s.compression_ratio for s in specs] == [0, 2, 2, 1, 1]
+    assert [s.mode for s in specs] == [
+        "swa",
+        "full",
+        "reuse",
+        "full",
+        "reuse",
+        "reindex",
+        "reuse",
+    ]
+    assert [s.owns_global_kv for s in specs] == [
+        False,
+        True,
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert [s.is_index_source for s in specs] == [
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert [s.compression_ratio for s in specs] == [0, 2, 2, 1, 1, 1, 1]
 
 
 def test_partial_rope_inverse_restores_tail_and_leaves_nope_untouched():
@@ -86,7 +117,7 @@ def test_partial_rope_inverse_restores_tail_and_leaves_nope_untouched():
     assert jnp.allclose(z, x, atol=1e-5)
 
 
-def test_reference_model_forward_is_finite_and_index_reuse_is_observable():
+def test_reference_model_forward_is_finite_and_reindex_is_observable():
     cfg = tiny_config()
     params = init_model(jax.random.PRNGKey(0), cfg)
     ids = jnp.arange(16, dtype=jnp.int32)[None, :] % cfg.vocab_size
@@ -112,9 +143,27 @@ def test_reference_model_forward_is_finite_and_index_reuse_is_observable():
         aux["layers"][1]["index_topk_indices"],
         aux["layers"][2]["index_topk_indices"],
     )
-    # Generation Full replaces the shared bank and publishes its own retrieval selection.
+
+    # Decoder Full owns the shared r=1 bank and publishes candidate blocks.
     assert aux["layers"][3]["index_scores"] is not None
+    assert aux["layers"][3]["index_candidate_mask"] is not None
     assert aux["layers"][4]["index_scores"] is None
+    assert jnp.array_equal(
+        aux["layers"][3]["index_topk_indices"],
+        aux["layers"][4]["index_topk_indices"],
+    )
+
+    # Reindex does not replace the KV source, but does produce a fresh retrieval decision
+    # inside the candidate hierarchy; the final Reuse carries that new selection.
+    assert aux["layers"][5]["index_scores"] is not None
+    assert aux["layers"][5]["index_candidate_mask"] is not None
+    assert aux["layers"][6]["index_scores"] is None
+    assert jnp.array_equal(
+        aux["layers"][5]["index_topk_indices"],
+        aux["layers"][6]["index_topk_indices"],
+    )
+    assert int(aux["layers"][5]["global_source_layer"]) == 3
+    assert int(aux["layers"][5]["index_source_layer"]) == 5
 
 
 def test_reference_model_can_be_jitted():
