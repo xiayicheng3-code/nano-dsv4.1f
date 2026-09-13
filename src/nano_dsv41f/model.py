@@ -148,6 +148,8 @@ def _apply_block(
     state: SharedCSA2State | None,
     config: ModelConfig,
     spec: LayerSpec,
+    *,
+    global_source: jax.Array | None = None,
 ) -> tuple[
     jax.Array,
     jax.Array,
@@ -185,6 +187,7 @@ def _apply_block(
         head_dim=config.attention.head_dim,
         local_window=config.attention.local_window,
         norm_eps=config.norm_eps,
+        global_source=global_source,
     )
     streams = post_mix(residual, attn_out, attn_comb, attn_post)
 
@@ -243,9 +246,12 @@ def apply_model(
     context_final = None
 
     for spec, block in zip(specs, params["blocks"]):
+        generation_global_source = None
         if spec.half == "generation" and context_final is None:
-            # Snapshot the representation that seeds the generation-side global KV.
+            # Snapshot exactly once at the CED boundary. This is the source consumed by
+            # the first generation-side Full layer's shared global-KV projection.
             context_final = pre_mix(streams, incoming_pre)
+            generation_global_source = context_final
 
         if "engram" in block:
             hashes = ngram_hash_ids(
@@ -273,6 +279,7 @@ def apply_model(
             state,
             config,
             spec,
+            global_source=generation_global_source,
         )
         layer_aux.append(aux)
 
