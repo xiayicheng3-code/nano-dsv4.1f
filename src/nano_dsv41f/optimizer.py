@@ -279,7 +279,23 @@ def learning_rate(step: jax.Array, train_config) -> jax.Array:
     return jnp.where(s < train_config.warmup_steps, warm, cosine)
 
 
-def optimizer_step(params, grads, state, *, step: jax.Array, config, train_config):
+def optimizer_step(
+    params,
+    grads,
+    state,
+    *,
+    step: jax.Array,
+    config,
+    train_config,
+    train_indexer: bool = True,
+    train_dspark: bool = True,
+):
+    """Apply one hybrid optimizer step with explicit training-phase freezes.
+
+    Zero gradient alone is not a freeze because AdamW/Muon may still apply weight decay.
+    The phase flags therefore preserve both parameter value *and optimizer state* for
+    families whose objective is currently inactive.
+    """
     p_items, treedef = jax.tree_util.tree_flatten_with_path(params)
     g_leaves = jax.tree_util.tree_leaves(grads)
     s_leaves = jax.tree_util.tree_leaves(
@@ -293,6 +309,15 @@ def optimizer_step(params, grads, state, *, step: jax.Array, config, train_confi
     new_states = []
     for (path, param), grad, leaf_state in zip(p_items, g_leaves, s_leaves):
         parts = _path_parts(path)
+        frozen = (
+            (not train_indexer and "indexer" in parts)
+            or (not train_dspark and bool(parts) and parts[0] == "dspark")
+        )
+        if frozen:
+            new_params.append(param)
+            new_states.append(leaf_state)
+            continue
+
         rule = classify_parameter(path, param, config)
         if rule == "adamw":
             p, s = _adamw_update(
