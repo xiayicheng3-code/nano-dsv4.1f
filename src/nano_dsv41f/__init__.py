@@ -18,6 +18,7 @@ from .config import (
 from .dspark import apply_dspark, sample_markov_block
 from .model import apply_model, apply_model_dspark, build_layer_specs, init_model
 from .optimizer import init_optimizer_state, optimizer_step, parameter_rule_map
+from .training import build_indexer_groups, selective_indexer_distillation_loss
 
 __all__ = [
     "AttentionConfig",
@@ -36,10 +37,12 @@ __all__ = [
     "apply_dspark",
     "apply_model",
     "apply_model_dspark",
+    "build_indexer_groups",
     "build_layer_specs",
     "init_model",
     "init_optimizer_state",
     "optimizer_step",
     "parameter_rule_map",
     "sample_markov_block",
+    "selective_indexer_distillation_loss",
 ]
