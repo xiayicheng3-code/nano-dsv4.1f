@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
+import jax
 import jax.numpy as jnp
 
 
@@ -46,30 +46,31 @@ def padded_to_multiple(length: int, multiple: int) -> int:
     return ((length + multiple - 1) // multiple) * multiple
 
 
+def segment_local_positions(segment_ids: jnp.ndarray) -> jnp.ndarray:
+    """Return 0-based positions inside contiguous packed segments, JIT safely."""
+    if segment_ids.ndim != 1:
+        raise ValueError("segment_ids must be rank-1")
+    n = segment_ids.shape[0]
+    if n == 0:
+        return jnp.zeros((0,), dtype=jnp.int32)
+
+    starts = jnp.concatenate(
+        [jnp.array([True]), segment_ids[1:] != segment_ids[:-1]]
+    )
+    global_positions = jnp.arange(n, dtype=jnp.int32)
+    start_candidates = jnp.where(starts, global_positions, 0)
+    start_positions = jax.lax.associative_scan(jnp.maximum, start_candidates)
+    return global_positions - start_positions
+
+
 def eligible_query_mask(
     segment_ids: jnp.ndarray,
     *,
     local_window: int,
     retrieve_top_k: int,
 ) -> jnp.ndarray:
-    """Marks token positions whose *segment-local* history reaches local+retrieval size.
-
-    The first eligible query has local position `local_window + retrieve_top_k` when
-    local position zero denotes the first token in the segment. This intentionally
-    requires enough causal history for both the local window and K retrieved items.
-    """
-    if segment_ids.ndim != 1:
-        raise ValueError("segment_ids must be rank-1")
-
-    starts = jnp.concatenate(
-        [
-            jnp.array([True]),
-            segment_ids[1:] != segment_ids[:-1],
-        ]
-    )
-    global_positions = jnp.arange(segment_ids.shape[0], dtype=jnp.int32)
-    start_positions = jnp.maximum.accumulate(jnp.where(starts, global_positions, 0))
-    local_positions = global_positions - start_positions
+    """Marks token positions whose segment-local history reaches local+retrieval size."""
+    local_positions = segment_local_positions(segment_ids)
     return local_positions >= (local_window + retrieve_top_k)
 
 
@@ -89,13 +90,9 @@ def latest_eligible_queries(
         local_window=local_window,
         retrieve_top_k=retrieve_top_k,
     )
-    n = segment_ids.shape[0]
     is_segment_end = jnp.concatenate(
         [segment_ids[:-1] != segment_ids[1:], jnp.array([True])]
     )
-
-    # A segment end is selected iff that segment has reached the eligibility threshold.
-    # Since eligibility is monotonic within a contiguous segment, checking the end is enough.
     return is_segment_end & eligible
 
 
