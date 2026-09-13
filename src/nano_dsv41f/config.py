@@ -112,7 +112,9 @@ class CSA2Config:
 @dataclass(frozen=True)
 class IndexerConfig:
     n_heads: int = 4
-    head_dim: int = 16
+    # 32 keeps the nano default compatible with the released MXFP4 32-value block while
+    # remaining far smaller than production's 128-d index heads.
+    head_dim: int = 32
     # Single source of truth for retrieval width throughout scoring and warmup eligibility.
     top_k: int = 512
     # Default L3 is the first decoder Full/index source. It publishes block candidates;
@@ -289,6 +291,14 @@ class ModelConfig:
             raise ValueError("DSpark target_layer_ids must refer to backbone layers")
         if self.indexer.candidate_source_layer >= self.n_layers:
             raise ValueError("candidate_source_layer must refer to a backbone layer")
+
+        qc = self.quantization
+        if qc.main_kv_fp4_qat and self.attention.head_dim % qc.main_kv_block_size:
+            raise ValueError("attention.head_dim must be divisible by main_kv_block_size when main KV FP4 QAT is enabled")
+        if qc.swa_fp8_qat and self.attention.head_dim % qc.swa_fp8_block_size:
+            raise ValueError("attention.head_dim must be divisible by swa_fp8_block_size when SWA FP8 QAT is enabled")
+        if qc.indexer_fp4_qat and self.indexer.head_dim % qc.indexer_block_size:
+            raise ValueError("indexer.head_dim must be divisible by indexer_block_size when indexer FP4 QAT is enabled")
 
     @property
     def n_layers(self) -> int:
