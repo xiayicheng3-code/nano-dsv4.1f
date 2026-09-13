@@ -4,13 +4,17 @@ import jax
 import jax.numpy as jnp
 
 
-_E2M1_LEVELS = jnp.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=jnp.float32)
+_E2M1_LEVELS = jnp.asarray(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=jnp.float32
+)
 
 
 def _ste(original: jnp.ndarray, quantized: jnp.ndarray, enabled: bool) -> jnp.ndarray:
     if not enabled:
         return quantized.astype(original.dtype)
-    return original + jax.lax.stop_gradient(quantized.astype(original.dtype) - original)
+    return original + jax.lax.stop_gradient(
+        quantized.astype(original.dtype) - original
+    )
 
 
 def fake_e2m1(x: jnp.ndarray) -> jnp.ndarray:
@@ -43,20 +47,33 @@ def fake_e4m3(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def fake_e8m0_scale(x: jnp.ndarray) -> jnp.ndarray:
-    """Power-of-two shared scale used by MX-style E8M0 scaling."""
-    xf = jnp.maximum(x.astype(jnp.float32), jnp.finfo(jnp.float32).tiny)
-    return jnp.exp2(jnp.round(jnp.log2(xf)))
+    """OCP MX-style UE8M0 shared scale.
+
+    The released/vLLM MXFP4 kernels choose a power-of-two scale by rounding the required
+    exponent *up*. Nearest rounding can choose a scale that is too small and spuriously
+    saturate E2M1 values at ±6.
+    """
+    xf = jnp.maximum(x.astype(jnp.float32), jnp.float32(6.0 * 2.0**-126))
+    exponent = jnp.ceil(jnp.log2(xf))
+    exponent = jnp.clip(exponent, -127.0, 127.0)
+    return jnp.exp2(exponent)
 
 
 def fake_e4m3_scale(x: jnp.ndarray) -> jnp.ndarray:
-    return jnp.maximum(jnp.abs(fake_e4m3(jnp.abs(x))), jnp.float32(2.0**-9))
+    return jnp.maximum(
+        jnp.abs(fake_e4m3(jnp.abs(x))), jnp.float32(2.0**-9)
+    )
 
 
-def _blockify(x: jnp.ndarray, block_size: int) -> tuple[jnp.ndarray, tuple[int, ...]]:
+def _blockify(
+    x: jnp.ndarray, block_size: int
+) -> tuple[jnp.ndarray, tuple[int, ...]]:
     if block_size <= 0 or x.shape[-1] % block_size:
         raise ValueError("last dimension must be divisible by block_size")
     shape = x.shape
-    return x.reshape(*shape[:-1], shape[-1] // block_size, block_size), shape
+    return x.reshape(
+        *shape[:-1], shape[-1] // block_size, block_size
+    ), shape
 
 
 def fake_mxfp4_e2m1(
@@ -95,7 +112,9 @@ def fake_fp8_e4m3(
     """Block-scaled E4M3 fake quantization for the SWA-KV educational path."""
     blocks, shape = _blockify(x.astype(jnp.float32), block_size)
     raw_scale = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True) / 448.0
-    scale = fake_e8m0_scale(jnp.maximum(raw_scale, jnp.finfo(jnp.float32).tiny))
+    scale = fake_e8m0_scale(
+        jnp.maximum(raw_scale, jnp.finfo(jnp.float32).tiny)
+    )
     q = fake_e4m3(jnp.clip(blocks / scale, -448.0, 448.0)) * scale
     q = q.reshape(shape)
     return _ste(x, q, ste)
