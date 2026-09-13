@@ -6,7 +6,13 @@ A TPU-first educational reimplementation of the architectural/training ideas in 
 
 ## Default nano architecture
 
-The default now mirrors the *topology* of DeepSeek's released small runnable reference:
+DeepSeek's released inference code contains a useful **five-layer tiny topology anchor**:
+
+```text
+L0 SWA | L1 Full(r=2) -> L2 Reuse | L3 Full(r=1) -> L4 Reuse
+```
+
+That anchor is excellent for checking our scaling choices, but it never gets deep enough to demonstrate the decoder's separate **Reindex** stage. Our default therefore extends it by exactly one two-layer decoder retrieval group:
 
 ```text
 context / causal encoder
@@ -17,11 +23,16 @@ CED handoff
   final context representation -> generation KV source
 
 generation / causal decoder
-  L3  Full(r=1, KV+index source) -> L4 Reuse
+  L3  Full(r=1, KV+index source, candidate source) -> L4 Reuse
+  L5  Reindex(r=1, same KV/index-K)                 -> L6 Reuse
 
 speculation
   DSpark: 1 block-parallel Transformer layer + separate MoE + Markov + confidence
 ```
+
+The key extra idea is that **L5 does not create a new KV bank**. It computes a new retrieval decision over the index-K owned by L3. By default L3 also publishes hierarchical candidate blocks, and L5 rescans only within that candidate set before producing the Top-K reused by L6.
+
+DSpark consumes the last three backbone layer features (`L4/L5/L6`) by default, echoing the production model's use of its final three target layers while keeping the draft network itself to one educational Transformer stage.
 
 All dimensions, group counts, RoPE settings, compression ratios, expert counts, DSpark rank/block size, optimizer constants and sharding intentions live in configuration dataclasses rather than being buried in kernels.
 
@@ -29,7 +40,7 @@ All dimensions, group counts, RoPE settings, compression ratios, expert counts, 
 
 The readable JAX reference includes:
 
-- **CED / CSA2:** SWA / Full / Reuse / configurable Reindex, shared compressed-KV lifetimes, r=1/r=2 learned compression, fixed-128 local overlap and exact local/global shared-softmax LSE merge.
+- **CED / CSA2:** SWA / Full / Reindex / Reuse, shared compressed-KV lifetimes, r=1/r=2 learned compression, fixed-128 local overlap and exact local/global shared-softmax LSE merge.
 - **MLA-style attention:** Q low-rank bottleneck, one latent K/V shared by Q heads, learned attention sink, **partial RoPE on the last channels**, compressed positional regime, **inverse RoPE on attention output**, and **grouped low-rank `wo_a`** (`G=2` by default).
 - **Sparse indexer:** Q from main `qr`, K from pre-RoPE compressed latent, partial RoPE, query-dependent head weights, ReLU head scores, cross-layer K reuse and released-style hierarchical candidate-block selection.
 - **Indexer training experiment:** late-stage, latest-eligible-query distillation; all 2–3 layers served by a nano retriever can be teachers without industrial-scale replay.
@@ -42,7 +53,9 @@ The readable JAX reference includes:
 
 ## Why the retriever teacher is still cheap
 
-Default retrieval is 512 global candidates plus 128 local positions. We only distill a packed sequence once its query has at least 640 causal positions and select the **latest eligible query** by default. Unlike production V4.1's long reuse spans, nano retrievers normally serve only two layers, so `all_served` is effectively the same cost as `Full + last`.
+Default retrieval is 512 global candidates plus 128 local positions. We only distill a packed sequence once its query has at least 640 causal positions and select the **latest eligible query** by default. Nano retriever groups serve only two layers by default, so `all_served` and `Full + last` have the same teacher set.
+
+The added decoder Reindex group does not make each retriever more expensive: it creates a **second two-layer retrieval lifetime**, rather than stretching one retriever across many layers.
 
 This query-subsampling rule is our educational experiment, not a claim about DeepSeek's private training recipe.
 
@@ -57,7 +70,7 @@ src/nano_dsv41f/
   packing.py         packed-example/query-selection utilities
   attention.py       standalone mask/LSE helpers
   compression.py     learned r=1/r=2 compression
-  csa2.py            SWA + compressed MLA state machine
+  csa2.py            SWA + compressed MLA + Full/Reindex/Reuse state machine
   indexer.py         late-stage teacher/distillation utilities
   indexer_scorer.py  released-style indexer + hierarchy reference
   mhc.py             Single-Pass mHC mechanics
