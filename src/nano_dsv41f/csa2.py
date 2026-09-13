@@ -155,12 +155,18 @@ def apply_csa2_attention(
     head_dim: int,
     local_window: int,
     norm_eps: float,
+    global_source: jax.Array | None = None,
 ) -> tuple[jax.Array, SharedCSA2State, dict[str, jax.Array]]:
     """Apply dense local+compressed attention while preserving CSA2 ownership semantics.
 
     `full` source layers publish a new compressed KV bank. `reuse` layers consume it.
     `reindex` layers also consume the same bank; their distinct indexer is intentionally
     trained/evaluated outside this dense backbone path until sparse-aware training exists.
+
+    `global_source` exists for the CED boundary. The first generation-side Full layer
+    queries from its ordinary input `x`, but publishes global KV from the final context-side
+    representation. Context-side Full layers leave this unset and therefore source KV from
+    their own input.
     """
     qr = rms_norm(linear(x, params["q_a"]), params["q_norm"], eps=norm_eps)
     q = linear(qr, params["q_b"]).reshape(
@@ -175,14 +181,20 @@ def apply_csa2_attention(
     )
 
     if owns_global_kv:
+        source = x if global_source is None else global_source
+        if source.shape != x.shape:
+            raise ValueError("global_source must have the same [batch, tokens, dim] shape as x")
         state = _build_global_state(
-            x,
+            source,
             segment_ids,
             params,
             compression_ratio=compression_ratio,
             source_layer=layer_id,
             eps=norm_eps,
         )
+    elif global_source is not None:
+        raise ValueError("global_source is only valid on a CSA2 layer that owns global KV")
+
     if state is None:
         raise ValueError(
             f"CSA2 {mode} layer {layer_id} has no shared global KV source"
