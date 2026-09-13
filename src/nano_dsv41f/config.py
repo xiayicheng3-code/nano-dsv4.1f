@@ -49,7 +49,6 @@ class AttentionConfig:
     # V4.1 uses grouped low-rank wo_a. G=2 keeps the mechanism visible at nano scale.
     o_groups: int = 2
     local_window: int = 128
-    retrieve_top_k: int = 512
     attention_sink: bool = True
     attention_sink_init: float = 0.0
     rope: RopeConfig = RopeConfig()
@@ -69,8 +68,8 @@ class AttentionConfig:
             raise ValueError("rope_head_dim must be in [1, head_dim]")
         if self.rope.rope_head_dim % 2:
             raise ValueError("rope_head_dim must be even")
-        if self.local_window <= 0 or self.retrieve_top_k <= 0:
-            raise ValueError("attention windows/top-k must be positive")
+        if self.local_window <= 0:
+            raise ValueError("local_window must be positive")
 
 
 @dataclass(frozen=True)
@@ -114,6 +113,7 @@ class CSA2Config:
 class IndexerConfig:
     n_heads: int = 4
     head_dim: int = 16
+    # Single source of truth for retrieval width throughout scoring and warmup eligibility.
     top_k: int = 512
     # Default L3 is the first decoder Full/index source. It publishes block candidates;
     # later Reindex layers (L5 by default) rescore only inside those candidate blocks.
@@ -235,7 +235,7 @@ class RematConfig:
 class ParallelismConfig:
     # Semantic sharding names: several can reuse the same physical 8-chip TPU mesh axis.
     vocab_shard: int = 8
-    engram_table_shard: int = 8
+    enram_table_shard: int = 8
     expert_shard: int = 8
     dspark_expert_shard: int = 8
     attention_context_shard: int = 8
