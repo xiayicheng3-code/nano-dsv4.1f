@@ -34,7 +34,7 @@ def init_moe(
         "router_weight": (
             jax.random.normal(kr, (dim, n_experts), dtype=jnp.float32) * dim**-0.5
         ),
-        # Mirrors no-aux routing semantics: this bias changes selection only.
+        # Correction bias affects expert selection only; output mixture uses unbiased score.
         "router_bias": jnp.zeros((n_experts,), dtype=jnp.float32),
         "experts": _init_expert_stack(ke, n_experts, dim, hidden),
         "shared": _init_expert(ks, dim, hidden),
@@ -63,17 +63,16 @@ def route_tokens(
     *,
     top_k: int,
     route_scale: float = 1.0,
+    eps: float = 1e-20,
 ) -> tuple[jax.Array, jax.Array]:
     logits = jnp.einsum(
         "...d,de->...e", x.astype(jnp.float32), params["router_weight"]
     )
-    # V4.1 uses sqrt(softplus(.)) routing scores.
     raw = jnp.sqrt(jax.nn.softplus(logits))
     selection = raw + params["router_bias"]
     _, indices = jax.lax.top_k(selection, top_k)
-    # The correction bias selects experts but does not scale expert outputs.
     weights = jnp.take_along_axis(raw, indices, axis=-1)
-    weights = weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), 1e-9)
+    weights = weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), eps)
     return weights * route_scale, indices
 
 
@@ -84,14 +83,11 @@ def apply_moe(
     top_k: int,
     route_scale: float = 1.0,
     swiglu_limit: float = 7.0,
+    eps: float = 1e-20,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Reference sparse MoE with one shared expert.
-
-    Parameter gathers keep compute proportional to selected experts in this readable path.
-    A TPU expert-parallel implementation will replace this gather pattern later.
-    """
+    """Readable routed-MoE reference with one always-on shared expert."""
     weights, indices = route_tokens(
-        x, params, top_k=top_k, route_scale=route_scale
+        x, params, top_k=top_k, route_scale=route_scale, eps=eps
     )
     experts = params["experts"]
     w1 = experts["w1"][indices]
