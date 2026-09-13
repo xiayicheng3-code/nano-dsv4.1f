@@ -75,10 +75,17 @@ class AttentionConfig:
 
 @dataclass(frozen=True)
 class CSA2Config:
-    # Released-small-reference-like nano topology:
+    # DeepSeek's released code contains a useful five-layer tiny default:
     #   L0 SWA | L1 Full(r=2) -> L2 Reuse | L3 Full(r=1) -> L4 Reuse
+    #
+    # Our default adds one decoder retrieval group so Reindex is actually exercised:
+    #   L0 SWA | L1 Full(r=2) -> L2 Reuse
+    #          | L3 Full(r=1) -> L4 Reuse -> L5 Reindex(r=1) -> L6 Reuse
+    #
+    # L3 owns the decoder compressed KV and candidate-block hierarchy. L5 changes the
+    # retrieval decision while continuing to consume the same L3 KV / index-K bank.
     context_layers: int = 3
-    generation_layers: int = 2
+    generation_layers: int = 4
     context_swa_only_layers: int = 1
     context_retriever_group_size: int = 2
     generation_retriever_group_size: int = 2
@@ -108,8 +115,9 @@ class IndexerConfig:
     n_heads: int = 4
     head_dim: int = 16
     top_k: int = 512
-    # Hierarchical retrieval is implemented but inactive in the minimal 5-layer default.
-    candidate_source_layer: int = -1
+    # Default L3 is the first decoder Full/index source. It publishes block candidates;
+    # later Reindex layers (L5 by default) rescore only inside those candidate blocks.
+    candidate_source_layer: int = 3
     candidate_topk_blocks: int = 16
     candidate_block_size: int = 8
 
@@ -146,7 +154,9 @@ class DSparkConfig:
     n_layers: int = 1
     block_size: int = 5
     noise_token_id: int = 0
-    target_layer_ids: tuple[int, ...] = (3, 4)
+    # The released full V4.1 DSpark consumes the final three backbone layers. With the
+    # seven-layer nano default we mirror that pattern using L4/L5/L6.
+    target_layer_ids: tuple[int, ...] = (4, 5, 6)
     markov_rank: int = 32
     n_routed_experts: int = 4
     experts_per_token: int = 1
@@ -267,6 +277,8 @@ class ModelConfig:
             layer < 0 or layer >= self.n_layers for layer in self.dspark.target_layer_ids
         ):
             raise ValueError("DSpark target_layer_ids must refer to backbone layers")
+        if self.indexer.candidate_source_layer >= self.n_layers:
+            raise ValueError("candidate_source_layer must refer to a backbone layer")
 
     @property
     def n_layers(self) -> int:
