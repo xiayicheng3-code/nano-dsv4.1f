@@ -18,7 +18,7 @@ We will preserve the asymmetric causal encoder/decoder idea and cross-layer reus
 
 We preserve:
 
-- a raw sliding/local attention branch;
+- a fixed 128-token raw sliding/local attention branch;
 - a compressed/global KV branch;
 - cross-layer reuse of compressed KV;
 - Full / Reindex / Reuse as model-level concepts;
@@ -26,19 +26,25 @@ We preserve:
 
 The TPU training reference initially executes the global branch densely. Sparse Top-K is **not** on the main training forward path in the first implementation.
 
+### Fixed SWA with representational overlap
+
+The released model keeps a fixed 128-token SWA branch. With `r=2` compressed global KV, the compression lattice and the raw-token SWA boundary do not always form a perfectly disjoint partition. A compressed group can contain a raw token that is also visible through SWA.
+
+We intentionally preserve that overlap. We do **not** alternate between 127- and 128-token local windows merely to force a disjoint partition. The local and compressed representations are different KV entries, so "repeated attention" here means overlapping source-token coverage, not literally duplicating an identical key/value vector.
+
 ### Compression ratios
 
 The reference attention algebra supports `r in {1, 2}`, matching the two ratios that matter for the released V4.1 architecture.
 
-Packed segments must be padded to a multiple of `r`. With aligned Q/K cropping, each segment satisfies
+Packed segments must be padded to a multiple of `r`. With the 128-token global-Q crop and the corresponding `128 / r` compressed-KV tail crop, each segment satisfies
 
-```
+```text
 Q_len = r * K_len
 ```
 
 which lets the packed global causal predicate be evaluated from physical packed ids:
 
-```
+```text
 same_segment && (q_id >= r * k_id)
 ```
 
@@ -46,7 +52,7 @@ without a materialized QxK mask or per-segment local-position table.
 
 ### Shared softmax denominator
 
-Local and global attention are allowed to run as separate kernels, but they are merged exactly using each branch's log-sum-exp. This is mathematically equivalent to concatenating both attention domains before softmax.
+Local and global attention are allowed to run as separate kernels, but they are merged exactly using each branch's log-sum-exp. This is mathematically equivalent to concatenating both attention domains before softmax, including when local and compressed branches cover some of the same source-token region.
 
 ### Single-Pass mHC
 
@@ -62,13 +68,11 @@ We plan to reproduce the *idea* of QAT for compressed/global KV plus software de
 
 ## Intentional changes
 
-### Disjoint local/global coverage for dense TPU training
+### Nano-scale retriever reuse groups
 
-The released model's fixed SWA branch can overlap with compressed representations of the same recent token region. With `r=2`, a fixed token boundary cannot always partition raw and compressed history without either overlap or a gap.
+The released model has much longer Full/Reuse spans than we need to demonstrate cross-layer index reuse. The nano model will use small retriever groups, typically **2-3 served layers per retriever**.
 
-For the first dense TPU implementation we may use an alternating 127/128-token local window so the local/global boundary aligns with 2-token compression groups. This gives a clean disjoint partition and a 128-token global-Q crop.
-
-This is **not exact V4.1 attention semantics** and must remain an ablation rather than be silently described as faithful reproduction. A fixed-128 overlapping mode should also exist for comparison.
+Because these groups are small, indexer distillation can use **all served layers** by default without turning the teacher into a six-layer replay problem. For a 2-layer group, `full_last` and `all_served` are equivalent teacher sets.
 
 ### Sparse-aware training
 
@@ -91,9 +95,9 @@ Our default approximation is:
 - target retrieval size = 512;
 - only queries with enough causal history for `128 + 512 = 640` positions are eligible;
 - select only the **latest eligible query in each packed segment** for dense teacher scoring;
-- optionally use only the Full layer and the last layer served by that indexer as teachers.
+- distill from **all layers served by that retriever** in the default nano configuration.
 
-This keeps teacher work fixed-shape and bounded. It is an experiment, not a claim about DeepSeek's private recipe.
+The query subsampling keeps teacher work fixed-shape and bounded. Using all served layers remains affordable because nano retriever groups are deliberately only 2-3 layers. This is an experiment, not a claim about DeepSeek's private recipe.
 
 ### Indexer teacher implementation
 
@@ -107,7 +111,8 @@ Activation checkpointing/rematerialization is an engineering choice for the nano
 
 ## Not currently reimplemented
 
-- Full 552B/763B-class parameter scale or original expert count.
+- Full 552B-class parameter scale or original expert count.
+- The released model's original number of layers per retriever reuse group.
 - DeepSeek's production training cluster topology and proprietary training stack.
 - Exact tokenizer/data mixture/training corpus.
 - Exact optimizer schedule unless publicly specified and useful at nano scale.
