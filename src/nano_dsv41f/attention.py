@@ -19,8 +19,12 @@ def compressed_global_mask(
 
         same_segment & (q_id >= r * kv_id)
 
-    The relation remains valid globally when every packed segment is padded to a multiple
-    of `r` and Q/K spans are cropped so each segment satisfies Q_len == r * K_len.
+    With every packed segment padded to a multiple of `r` and the 128-token global-Q
+    crop paired with a `128 / r` tail crop of compressed KV, each segment satisfies
+    `Q_len == r * K_len`. For r=2, this causal boundary can overlap the fixed 128-token
+    local window by one raw token on alternating query positions. That overlap is kept
+    intentionally because the released model uses fixed-width SWA rather than a disjoint
+    local/global partition.
     """
     q_ids = jnp.asarray(q_ids)
     kv_ids = jnp.asarray(kv_ids)
@@ -29,33 +33,27 @@ def compressed_global_mask(
     return same_segment & causal
 
 
-def alternating_local_window_mask(
+def fixed_local_window_mask(
     q_ids: jnp.ndarray,
     kv_ids: jnp.ndarray,
     q_segment_ids: jnp.ndarray,
     kv_segment_ids: jnp.ndarray,
     *,
-    base_window: int = 128,
-    compression_ratio: int = 2,
+    window: int = 128,
 ) -> jnp.ndarray:
-    """Disjoint local side of the educational dense CSA2 approximation.
+    """Fixed-width causal SWA reference mask.
 
-    For r=2 and a 128-token crop, local coverage alternates between 127 and 128 tokens
-    so the boundary always lies on a compression-group boundary. This is *not* exact
-    DeepSeek semantics: the released model keeps a fixed SWA window and permits overlap
-    between raw-local and compressed representations.
+    This deliberately permits representation overlap with compressed/global attention.
+    For r=2, a compression group that straddles the local/global boundary may represent a
+    raw token that is also present in the 128-token SWA branch. We preserve that behavior
+    rather than alternating between 127/128 local tokens merely to make the domains
+    disjoint.
     """
-    if compression_ratio == 1:
-        lower = q_ids - (base_window - 1)
-    elif compression_ratio == 2:
-        # Even q: 127 tokens; odd q: 128 tokens.
-        lower = q_ids - (base_window - 2) - (q_ids & 1)
-    else:
-        raise ValueError("reference implementation currently supports r in {1, 2}")
-
+    if window <= 0:
+        raise ValueError("window must be positive")
     same_segment = q_segment_ids[:, None] == kv_segment_ids[None, :]
     causal = kv_ids[None, :] <= q_ids[:, None]
-    in_window = kv_ids[None, :] >= lower[:, None]
+    in_window = kv_ids[None, :] >= (q_ids[:, None] - (window - 1))
     return same_segment & causal & in_window
 
 
@@ -70,6 +68,10 @@ def merge_attention_outputs(
     `*_out` are already normalized within their own domains. `*_lse` are corresponding
     log-sum-exp values. Shapes may have trailing singleton dimensions; broadcasting is
     intentional.
+
+    If one historical region is represented in both domains, the two representations are
+    still distinct KV entries and both participate in the shared denominator. This matches
+    the intended fixed-SWA + compressed-global reference semantics.
     """
     total_lse = jnp.logaddexp(local_lse, global_lse)
     local_weight = jnp.exp(local_lse - total_lse)
