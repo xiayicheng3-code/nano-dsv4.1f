@@ -30,7 +30,11 @@ class QuantizationConfig:
     swa_fp8_block_size: int = 32
 
     def __post_init__(self) -> None:
-        if min(self.main_kv_block_size, self.indexer_block_size, self.swa_fp8_block_size) <= 0:
+        if min(
+            self.main_kv_block_size,
+            self.indexer_block_size,
+            self.swa_fp8_block_size,
+        ) <= 0:
             raise ValueError("quantization block sizes must be positive")
 
 
@@ -50,7 +54,13 @@ class AttentionConfig:
     rope: RopeConfig = RopeConfig()
 
     def __post_init__(self) -> None:
-        if min(self.d_model, self.n_heads, self.head_dim, self.q_rank, self.o_rank) <= 0:
+        if min(
+            self.d_model,
+            self.n_heads,
+            self.head_dim,
+            self.q_rank,
+            self.o_rank,
+        ) <= 0:
             raise ValueError("attention dimensions must be positive")
         if self.n_heads % self.o_groups:
             raise ValueError("n_heads must be divisible by o_groups")
@@ -64,9 +74,8 @@ class AttentionConfig:
 
 @dataclass(frozen=True)
 class CSA2Config:
-    # This mirrors the released runnable reference topology at nano scale:
+    # Released-small-reference-like nano topology:
     #   L0 SWA | L1 Full(r=2) -> L2 Reuse | L3 Full(r=1) -> L4 Reuse
-    # The CED split is therefore 3 encoder/context layers + 2 decoder/generation layers.
     context_layers: int = 3
     generation_layers: int = 2
     context_swa_only_layers: int = 1
@@ -79,8 +88,13 @@ class CSA2Config:
         if self.context_layers <= 0 or self.generation_layers <= 0:
             raise ValueError("both CED halves need at least one layer")
         if not (0 <= self.context_swa_only_layers < self.context_layers):
-            raise ValueError("context_swa_only_layers must leave at least one compressed context layer")
-        if min(self.context_retriever_group_size, self.generation_retriever_group_size) <= 0:
+            raise ValueError(
+                "context_swa_only_layers must leave at least one compressed context layer"
+            )
+        if min(
+            self.context_retriever_group_size,
+            self.generation_retriever_group_size,
+        ) <= 0:
             raise ValueError("retriever group sizes must be positive")
         if self.context_compression_ratio not in (1, 2):
             raise ValueError("context compression ratio must be 1 or 2")
@@ -93,7 +107,7 @@ class IndexerConfig:
     n_heads: int = 4
     head_dim: int = 16
     top_k: int = 512
-    # Hierarchical retrieval is implemented but disabled in the minimal 5-layer default.
+    # Hierarchical retrieval is implemented but inactive in the minimal 5-layer default.
     candidate_source_layer: int = -1
     candidate_topk_blocks: int = 16
     candidate_block_size: int = 8
@@ -101,14 +115,15 @@ class IndexerConfig:
     def __post_init__(self) -> None:
         if min(self.n_heads, self.head_dim, self.top_k) <= 0:
             raise ValueError("indexer dimensions/top-k must be positive")
-        if self.candidate_source_layer >= 0 and min(self.candidate_topk_blocks, self.candidate_block_size) <= 0:
+        if self.candidate_source_layer >= 0 and min(
+            self.candidate_topk_blocks, self.candidate_block_size
+        ) <= 0:
             raise ValueError("candidate hierarchy sizes must be positive when enabled")
 
 
 @dataclass(frozen=True)
 class EngramConfig:
     enabled: bool = True
-    # Keep Engram in the causal-encoder half, as in V4.1.
     layer_ids: tuple[int, ...] = (1,)
     table_size: int = 32_768
     max_ngram_size: int = 4
@@ -126,7 +141,7 @@ class EngramConfig:
 @dataclass(frozen=True)
 class DSparkConfig:
     enabled: bool = True
-    # User-selected nano scaling: one released-style DSpark Transformer stage.
+    # This project intentionally implements exactly one draft Transformer stage.
     n_layers: int = 1
     block_size: int = 5
     noise_token_id: int = 0
@@ -139,11 +154,16 @@ class DSparkConfig:
 
     def __post_init__(self) -> None:
         if self.enabled:
-            if self.n_layers <= 0 or self.block_size <= 0 or self.markov_rank <= 0:
-                raise ValueError("enabled DSpark needs positive layer/block/Markov sizes")
+            if self.n_layers != 1:
+                raise ValueError("nano DSpark intentionally implements exactly one layer")
+            if self.block_size <= 0 or self.markov_rank <= 0:
+                raise ValueError("enabled DSpark needs positive block/Markov sizes")
             if not self.target_layer_ids:
                 raise ValueError("DSpark needs at least one target backbone layer")
-            if self.n_routed_experts < self.experts_per_token or self.experts_per_token <= 0:
+            if (
+                self.n_routed_experts < self.experts_per_token
+                or self.experts_per_token <= 0
+            ):
                 raise ValueError("invalid DSpark expert counts")
 
 
@@ -165,7 +185,7 @@ class IndexerTrainingConfig:
 
 @dataclass(frozen=True)
 class OptimizerConfig:
-    # Report-faithful parameter partitioning. Learning-rate schedule is kept explicit below.
+    # Disclosed parameter-family split; all constants remain notebook-editable.
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     adam_eps: float = 1e-20
@@ -176,9 +196,11 @@ class OptimizerConfig:
     muon_fast_steps: int = 8
     muon_stable_steps: int = 2
     sinkhorn_momentum: float = 0.95
-    sinkhorn_update_rms: float = 0.18
+    # gamma in the V4.1 Sinkhorn-balanced update algorithm.
+    sinkhorn_gamma: float = 0.18
     sinkhorn_iters: int = 11
     sinkhorn_eps: float = 1e-12
+    # Report describes the threshold structurally but does not publish tau; keep explicit.
     sinkhorn_row_mask_tau: float = 1e-3
     headwise_qk_muon: bool = True
 
@@ -239,7 +261,9 @@ class ModelConfig:
             raise ValueError("indexer head_dim must fit the shared partial-RoPE dimension")
         if any(layer < 0 or layer >= self.n_layers for layer in self.engram.layer_ids):
             raise ValueError("Engram layer ids must refer to backbone layers")
-        if any(layer < 0 or layer >= self.n_layers for layer in self.dspark.target_layer_ids):
+        if self.dspark.enabled and any(
+            layer < 0 or layer >= self.n_layers for layer in self.dspark.target_layer_ids
+        ):
             raise ValueError("DSpark target_layer_ids must refer to backbone layers")
 
     @property
@@ -251,6 +275,7 @@ class ModelConfig:
 class TrainConfig:
     total_steps: int = 10_000
     seq_len: int = 4096
+    # V4.1 report summaries give 2.6e-4 -> 2.6e-5. Warmup length below is a nano default.
     learning_rate: float = 2.6e-4
     warmup_steps: int = 500
     min_learning_rate: float = 2.6e-5
