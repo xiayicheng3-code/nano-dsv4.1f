@@ -4,30 +4,89 @@ import jax
 import jax.numpy as jnp
 
 
+def eligibility_position(
+    *,
+    local_window: int,
+    retrieve_top_k: int,
+    compression_ratio: int,
+    rule: str,
+) -> int:
+    """Minimum segment-local query position used by the educational warmup.
+
+    ``local_plus_topk`` preserves the originally proposed 128+512=640 rule. The
+    ratio-aware variant waits until the compressed global bank can actually contain more
+    than Top-K candidates: 128 + r*512 (1152 at r=2).
+    """
+    if local_window <= 0 or retrieve_top_k <= 0 or compression_ratio <= 0:
+        raise ValueError("window/top-k/compression ratio must be positive")
+    if rule == "local_plus_topk":
+        return local_window + retrieve_top_k
+    if rule == "local_plus_ratio_topk":
+        return local_window + compression_ratio * retrieve_top_k
+    raise ValueError(f"unknown eligibility rule: {rule}")
+
+
 def latest_teacher_indices(
     segment_ids: jnp.ndarray,
     *,
     n_segments: int,
-    local_window: int,
-    retrieve_top_k: int,
+    min_local_position: int | None = None,
+    local_window: int | None = None,
+    retrieve_top_k: int | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Return one fixed-shape latest eligible teacher query per packed segment."""
+    """Return one fixed-shape latest eligible teacher query per packed segment.
+
+    `min_local_position` is the preferred explicit threshold. The window/top-k pair is kept
+    for backwards compatibility with the original 640-history helper.
+    """
     if segment_ids.ndim != 1:
         raise ValueError("segment_ids must be rank-1")
     if n_segments <= 0:
         raise ValueError("n_segments must be positive")
+    if min_local_position is None:
+        if local_window is None or retrieve_top_k is None:
+            raise ValueError(
+                "provide min_local_position or both local_window and retrieve_top_k"
+            )
+        min_local_position = local_window + retrieve_top_k
 
     pos = jnp.arange(segment_ids.shape[0], dtype=jnp.int32)
-    starts = jnp.concatenate([jnp.array([True]), segment_ids[1:] != segment_ids[:-1]])
+    starts = jnp.concatenate(
+        [jnp.array([True]), segment_ids[1:] != segment_ids[:-1]]
+    )
     segment_start = jnp.stack(
-        [jnp.max(jnp.where((segment_ids == s) & starts, pos, -1)) for s in range(n_segments)]
+        [
+            jnp.max(jnp.where((segment_ids == s) & starts, pos, -1))
+            for s in range(n_segments)
+        ]
     )
     segment_end = jnp.stack(
-        [jnp.max(jnp.where(segment_ids == s, pos, -1)) for s in range(n_segments)]
+        [
+            jnp.max(jnp.where(segment_ids == s, pos, -1))
+            for s in range(n_segments)
+        ]
     )
     local_end = segment_end - segment_start
-    valid = (segment_start >= 0) & (local_end >= (local_window + retrieve_top_k))
+    valid = (segment_start >= 0) & (local_end >= min_local_position)
     return jnp.where(valid, segment_end, 0), valid
+
+
+def latest_teacher_indices_batched(
+    segment_ids: jnp.ndarray,
+    *,
+    n_segments: int,
+    min_local_position: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Batch-vmap the fixed-shape selector, returning [B, n_segments]."""
+    if segment_ids.ndim != 2:
+        raise ValueError("segment_ids must be [batch,tokens]")
+    return jax.vmap(
+        lambda row: latest_teacher_indices(
+            row,
+            n_segments=n_segments,
+            min_local_position=min_local_position,
+        )
+    )(segment_ids)
 
 
 def dense_teacher_mass(
@@ -36,24 +95,25 @@ def dense_teacher_mass(
     total_lse: jnp.ndarray,
     valid_k: jnp.ndarray,
 ) -> jnp.ndarray:
-    """Teacher attention mass over compressed/global candidates.
+    """Teacher attention mass over selected queries and compressed candidates.
 
-    Args:
-      q: [Q,H,D] already-RoPE'd main attention queries.
-      k: [K,D] shared MLA latent K (also already RoPE'd / fake-quantized as configured).
-      total_lse: [Q,H] LSE from the complete local + global + sink denominator.
-      valid_k: [Q,K] legality mask.
+    Shapes may be unbatched or batched:
+      q: [..., Q, H, D]
+      k: [..., K, D]
+      total_lse: [..., Q, H] from complete local + global + sink denominator
+      valid_k: [..., Q, K]
 
-    The returned [Q,K] mass sums the main-attention probability assigned by all Q heads.
-    This dense reference is only for selected teacher queries; TPU code can stream K tiles.
+    Returns [..., Q, K], summing the main-attention probability mass across Q heads.
     """
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("q and shared latent k must use the same head dimension")
+    if q.shape[:-3] != k.shape[:-2]:
+        raise ValueError("q and k batch-prefix dimensions must match")
     scale = q.shape[-1] ** -0.5
-    logits = jnp.einsum("qhd,kd->qhk", q, k) * scale
+    logits = jnp.einsum("...qhd,...kd->...qhk", q, k) * scale
     probs = jnp.exp(logits - total_lse[..., None])
-    probs = jnp.where(valid_k[:, None, :], probs, 0.0)
-    return jnp.sum(probs, axis=1)
+    probs = jnp.where(valid_k[..., :, None, :], probs, 0.0)
+    return jnp.sum(probs, axis=-2)
 
 
 def indexer_cross_entropy_from_mass(
@@ -64,10 +124,14 @@ def indexer_cross_entropy_from_mass(
     eps: float = 1e-9,
 ) -> jnp.ndarray:
     """Cross entropy against normalized teacher mass without materializing normalization."""
+    if index_scores.shape != teacher_mass.shape or index_scores.shape != valid_k.shape:
+        raise ValueError("student scores, teacher mass and valid_k must have same shape")
     masked_scores = jnp.where(valid_k, index_scores, -jnp.inf)
     mass = jnp.where(valid_k, teacher_mass, 0.0)
     mass_sum = jnp.sum(mass, axis=-1)
-    weighted_score = jnp.sum(mass * jnp.where(valid_k, index_scores, 0.0), axis=-1)
+    weighted_score = jnp.sum(
+        mass * jnp.where(valid_k, index_scores, 0.0), axis=-1
+    )
     per_query = jax.nn.logsumexp(masked_scores, axis=-1) - weighted_score / jnp.maximum(
         mass_sum, eps
     )
@@ -80,7 +144,7 @@ def indexer_cross_entropy_from_mass(
 def mean_all_served_teacher_mass(
     teacher_masses: tuple[jnp.ndarray, ...],
 ) -> jnp.ndarray:
-    """Aggregate all served-layer teachers in the nano 2-3 layer reuse group."""
+    """Aggregate all served-layer teachers in a small retrieval-sharing group."""
     if not teacher_masses:
         raise ValueError("at least one served-layer teacher is required")
     return jnp.mean(jnp.stack(teacher_masses, axis=0), axis=0)
