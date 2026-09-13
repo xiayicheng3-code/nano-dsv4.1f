@@ -185,6 +185,16 @@ class IndexerTrainingConfig:
     end_fraction: float = 0.90
     teacher_queries: Literal["latest_eligible", "all_eligible"] = "latest_eligible"
     teacher_layers: Literal["full_only", "full_last", "all_served"] = "all_served"
+    # User-proposed cheap warmup starts after local_window + top_k raw history (640 with
+    # 128+512). `ratio_aware` waits until Top-K is actually selective for compressed r>1,
+    # i.e. local_window + compression_ratio*top_k (1152 for r=2, top-k=512).
+    eligibility_rule: Literal[
+        "local_plus_topk", "local_plus_ratio_topk"
+    ] = "local_plus_topk"
+    # Keep the warmup auxiliary loss from perturbing the dense backbone by default while
+    # still training indexer-specific q/k/head-weight parameters. Notebook ablations can
+    # turn this off to let retrieval supervision shape shared representations too.
+    detach_backbone_inputs: bool = True
     loss_weight: float = 0.05
 
     def __post_init__(self) -> None:
