@@ -123,19 +123,26 @@ def indexer_cross_entropy_from_mass(
     query_valid: jnp.ndarray | None = None,
     eps: float = 1e-9,
 ) -> jnp.ndarray:
-    """Cross entropy against normalized teacher mass without materializing normalization."""
+    """Cross entropy against normalized teacher mass without materializing normalization.
+
+    Empty fixed-shape teacher slots are replaced with a harmless finite row before
+    ``logsumexp``. This matters for JAX autodiff: computing an all-``-inf`` logsumexp and
+    masking it afterwards can still leak NaN gradients from an otherwise invalid slot.
+    """
     if index_scores.shape != teacher_mass.shape or index_scores.shape != valid_k.shape:
         raise ValueError("student scores, teacher mass and valid_k must have same shape")
+    row_has_key = jnp.any(valid_k, axis=-1)
     masked_scores = jnp.where(valid_k, index_scores, -jnp.inf)
+    safe_scores = jnp.where(row_has_key[..., None], masked_scores, 0.0)
     mass = jnp.where(valid_k, teacher_mass, 0.0)
     mass_sum = jnp.sum(mass, axis=-1)
     weighted_score = jnp.sum(
         mass * jnp.where(valid_k, index_scores, 0.0), axis=-1
     )
-    per_query = jax.nn.logsumexp(masked_scores, axis=-1) - weighted_score / jnp.maximum(
+    per_query = jax.nn.logsumexp(safe_scores, axis=-1) - weighted_score / jnp.maximum(
         mass_sum, eps
     )
-    finite_teacher = mass_sum > eps
+    finite_teacher = (mass_sum > eps) & row_has_key
     valid = finite_teacher if query_valid is None else (finite_teacher & query_valid)
     denom = jnp.maximum(jnp.sum(valid), 1)
     return jnp.sum(jnp.where(valid, per_query, 0.0)) / denom
