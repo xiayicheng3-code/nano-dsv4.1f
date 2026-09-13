@@ -15,6 +15,7 @@ from .indexer import (
 )
 from .indexer_scorer import apply_indexer_scores, build_index_k
 from .model import apply_model, build_layer_specs
+from .optimizer import optimizer_step
 from .rope import rope_kwargs_for_layer
 
 
@@ -141,55 +142,55 @@ def _selected_teacher_mass(
     return jax.lax.stop_gradient(dense_teacher_mass(q, main_kv, lse, valid))
 
 
-def selective_indexer_distillation_loss(
+def causal_lm_loss(
+    logits: jax.Array,
+    input_ids: jax.Array,
+    segment_ids: jax.Array,
+    *,
+    token_mask: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Packed next-token cross entropy that never predicts across segment boundaries."""
+    if logits.ndim != 3 or input_ids.ndim != 2 or segment_ids.shape != input_ids.shape:
+        raise ValueError("expected logits=[B,T,V] and ids/segments=[B,T]")
+    if logits.shape[:2] != input_ids.shape or input_ids.shape[1] < 2:
+        raise ValueError("logit/token shapes must align and sequence length must be >= 2")
+    if token_mask is not None and token_mask.shape != input_ids.shape:
+        raise ValueError("token_mask must match input_ids")
+
+    pred = logits[:, :-1].astype(jnp.float32)
+    labels = input_ids[:, 1:]
+    valid = segment_ids[:, :-1] == segment_ids[:, 1:]
+    if token_mask is not None:
+        valid = valid & token_mask[:, :-1] & token_mask[:, 1:]
+    logp = jax.nn.log_softmax(pred, axis=-1)
+    nll = -jnp.take_along_axis(logp, labels[..., None], axis=-1)[..., 0]
+    count = jnp.sum(valid.astype(jnp.int32))
+    loss = jnp.sum(jnp.where(valid, nll, 0.0)) / jnp.maximum(count, 1)
+    return loss, count
+
+
+def _selective_indexer_from_backbone_aux(
     params,
     config,
-    input_ids: jax.Array,
     *,
     segment_ids: jax.Array,
     n_segments: int,
+    backbone_aux: dict[str, object],
 ) -> tuple[jax.Array, dict[str, object]]:
-    """Late-stage fixed-shape indexer distillation without full T-by-K scoring.
-
-    The backbone runs once with dense main attention and ``compute_indexer=False``. For
-    each Full/Reindex group, this function then:
-
-    1. picks one latest eligible query slot per packed segment;
-    2. builds the shared index K once from the owning compressor latent;
-    3. scores only those selected student Q rows;
-    4. reconstructs teacher global attention mass for selected rows from every configured
-       served layer using the complete local+global+sink LSE;
-    5. applies cross entropy over the legal (and, for later Reindex, hierarchical) pool.
-
-    With ``detach_backbone_inputs=True`` the student still trains indexer-specific
-    ``wk/k_norm/wq_b/weights_proj`` parameters, but its auxiliary gradients do not perturb
-    the dense backbone. The teacher branch is always stop-gradient.
-    """
+    """Compute selected-row indexer loss from an already executed dense backbone."""
     tc = config.indexer_training
     if not tc.enabled:
         zero = jnp.asarray(0.0, dtype=jnp.float32)
-        return zero, {"group_losses": {}, "active_queries": zero}
+        return zero, {"group_losses": {}, "active_queries": jnp.asarray(0, jnp.int32)}
     if tc.teacher_queries != "latest_eligible":
         raise NotImplementedError(
             "selective reference currently implements teacher_queries='latest_eligible'"
         )
-    if segment_ids.shape != input_ids.shape:
-        raise ValueError("segment_ids must match input_ids")
     if n_segments <= 0:
         raise ValueError("n_segments must be a positive static integer")
 
-    # The logits are intentionally unused; under jit/XLA their materialization can be DCE'd
-    # when the caller only consumes this auxiliary loss.
-    _, backbone_aux = apply_model(
-        params,
-        config,
-        input_ids,
-        segment_ids=segment_ids,
-        compute_indexer=False,
-    )
     layers = backbone_aux["layers"]
     local_positions = segment_local_positions(segment_ids)
-
     group_losses: dict[str, jax.Array] = {}
     query_counts: dict[str, jax.Array] = {}
     student_shapes: dict[str, jax.Array] = {}
@@ -220,17 +221,10 @@ def selective_indexer_distillation_loss(
             raise ValueError("indexer group has no compressed source state")
 
         latent_for_student = (
-            jax.lax.stop_gradient(latent)
-            if tc.detach_backbone_inputs
-            else latent
+            jax.lax.stop_gradient(latent) if tc.detach_backbone_inputs else latent
         )
-
-        kv_indexer_params = params["blocks"][group.kv_source_layer]["attn"][
-            "indexer"
-        ]
-        student_params = params["blocks"][group.index_source_layer]["attn"][
-            "indexer"
-        ]
+        kv_indexer_params = params["blocks"][group.kv_source_layer]["attn"]["indexer"]
+        student_params = params["blocks"][group.index_source_layer]["attn"]["indexer"]
         index_k = build_index_k(
             latent_for_student,
             global_positions,
@@ -263,7 +257,6 @@ def selective_indexer_distillation_loss(
             fp4_block_size=config.quantization.indexer_block_size,
             fp4_scale_format=config.quantization.indexer_scale_format,
         )
-
         student_valid = _batched_gather_tokens(
             source_aux["global_valid"], query_indices
         ) & query_valid[..., None]
@@ -273,8 +266,6 @@ def selective_indexer_distillation_loss(
             and config.indexer.candidate_source_layer < group.index_source_layer
             and candidate_kv_source == group.kv_source_layer
         ):
-            # The default decoder source/reindex groups use the same r=1 selected-query
-            # coordinates. Keep the assumption explicit rather than silently misaligning.
             if candidate_indices is None:
                 raise AssertionError("candidate indices missing")
             same_slots = jnp.all(query_indices == candidate_indices, axis=-1)
@@ -313,14 +304,159 @@ def selective_indexer_distillation_loss(
             candidate_indices = query_indices
             candidate_kv_source = group.kv_source_layer
 
-    if not group_losses:
-        total = jnp.asarray(0.0, dtype=jnp.float32)
-    else:
-        total = jnp.mean(jnp.stack(tuple(group_losses.values())))
-    total = total * tc.loss_weight
+    raw = (
+        jnp.mean(jnp.stack(tuple(group_losses.values())))
+        if group_losses
+        else jnp.asarray(0.0, dtype=jnp.float32)
+    )
+    weighted = raw * tc.loss_weight
     active_queries = sum(query_counts.values(), jnp.asarray(0, dtype=jnp.int32))
-    return total, {
+    return weighted, {
+        "raw_loss": raw,
         "group_losses": group_losses,
         "active_queries": active_queries,
         "student_score_shapes": student_shapes,
+    }
+
+
+def selective_indexer_distillation_loss(
+    params,
+    config,
+    input_ids: jax.Array,
+    *,
+    segment_ids: jax.Array,
+    n_segments: int,
+) -> tuple[jax.Array, dict[str, object]]:
+    """Standalone selected-row indexer loss; useful for tests and retrieval-only tuning."""
+    if segment_ids.shape != input_ids.shape:
+        raise ValueError("segment_ids must match input_ids")
+    _, backbone_aux = apply_model(
+        params,
+        config,
+        input_ids,
+        segment_ids=segment_ids,
+        compute_indexer=False,
+    )
+    return _selective_indexer_from_backbone_aux(
+        params,
+        config,
+        segment_ids=segment_ids,
+        n_segments=n_segments,
+        backbone_aux=backbone_aux,
+    )
+
+
+def pretrain_loss(
+    params,
+    config,
+    input_ids: jax.Array,
+    *,
+    segment_ids: jax.Array,
+    token_mask: jax.Array | None = None,
+    include_indexer: bool = False,
+    n_segments: int | None = None,
+) -> tuple[jax.Array, dict[str, object]]:
+    """One-backbone-pass packed LM objective, optionally with late indexer distillation.
+
+    `include_indexer` is intended to be a **static** choice: compile one base function and
+    one late-indexer function, then let the Python training driver select between them by
+    step. This avoids embedding a large dynamic branch inside one XLA graph.
+    """
+    logits, backbone_aux = apply_model(
+        params,
+        config,
+        input_ids,
+        segment_ids=segment_ids,
+        token_mask=token_mask,
+        compute_indexer=False,
+    )
+    lm, lm_tokens = causal_lm_loss(
+        logits, input_ids, segment_ids, token_mask=token_mask
+    )
+    if include_indexer and config.indexer_training.enabled:
+        if n_segments is None:
+            raise ValueError("n_segments is required when include_indexer=True")
+        index_loss, index_aux = _selective_indexer_from_backbone_aux(
+            params,
+            config,
+            segment_ids=segment_ids,
+            n_segments=n_segments,
+            backbone_aux=backbone_aux,
+        )
+    else:
+        index_loss = jnp.asarray(0.0, dtype=jnp.float32)
+        index_aux = {
+            "raw_loss": jnp.asarray(0.0, dtype=jnp.float32),
+            "group_losses": {},
+            "active_queries": jnp.asarray(0, dtype=jnp.int32),
+            "student_score_shapes": {},
+        }
+    total = lm + index_loss
+    return total, {
+        "lm_loss": lm,
+        "lm_tokens": lm_tokens,
+        "indexer_loss": index_loss,
+        "indexer": index_aux,
+    }
+
+
+def indexer_phase_enabled(step: int, train_config, config) -> bool:
+    """Python-side phase selector used to choose between two separately-jitted steps."""
+    if not config.indexer_training.enabled:
+        return False
+    progress = step / float(train_config.total_steps)
+    return (
+        config.indexer_training.start_fraction
+        <= progress
+        <= config.indexer_training.end_fraction
+    )
+
+
+def pretrain_step(
+    params,
+    optimizer_state,
+    config,
+    train_config,
+    input_ids: jax.Array,
+    *,
+    segment_ids: jax.Array,
+    step: jax.Array,
+    token_mask: jax.Array | None = None,
+    include_indexer: bool = False,
+    n_segments: int | None = None,
+):
+    """Reference gradient/update step for base or late-indexer pretraining phases.
+
+    `include_indexer` should be closed over as a static bool before `jax.jit`. DSpark is
+    intentionally frozen here because its separate draft objective is not part of this
+    language-model pretraining step.
+    """
+
+    def loss_fn(p):
+        return pretrain_loss(
+            p,
+            config,
+            input_ids,
+            segment_ids=segment_ids,
+            token_mask=token_mask,
+            include_indexer=include_indexer,
+            n_segments=n_segments,
+        )
+
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    train_indexer = bool(include_indexer and config.indexer_training.enabled)
+    new_params, new_state, optimizer_metrics = optimizer_step(
+        params,
+        grads,
+        optimizer_state,
+        step=step,
+        config=config,
+        train_config=train_config,
+        train_indexer=train_indexer,
+        train_dspark=False,
+    )
+    return new_params, new_state, {
+        "loss": loss,
+        **metrics,
+        **optimizer_metrics,
     }
