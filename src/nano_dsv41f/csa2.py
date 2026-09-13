@@ -6,7 +6,12 @@ import jax
 import jax.numpy as jnp
 
 from .compression import learned_group_compress
-from .indexer_scorer import apply_indexer_scores, build_index_k, init_indexer, masked_top_k
+from .indexer_scorer import (
+    apply_indexer_scores,
+    build_index_k,
+    init_indexer,
+    masked_top_k,
+)
 from .layers import init_linear, init_rms_norm, linear, rms_norm
 from .quantization import fake_fp8_e4m3, fake_mxfp4_e2m1
 from .rope import apply_partial_rope, rope_kwargs_for_layer
@@ -18,9 +23,10 @@ class SharedCSA2State(NamedTuple):
     """Cross-layer compressed attention state.
 
     `latent` is the normalized compressed representation before RoPE. `kv` is the
-    partial-RoPE'd (and optionally fake-quantized) main cache. `index_k` is projected
-    independently from `latent`. The final fields make Full/Reindex/Reuse observable even
-    while the backbone deliberately keeps dense global attention for TPU-friendly training.
+    partial-RoPE'd (and optionally fake-quantized) main cache. `index_k` is optional:
+    dense LM warmup can leave it unbuilt, while retrieval-evaluation mode materializes it.
+    The final fields make Full/Reindex/Reuse observable without putting sparse attention on
+    the ordinary TPU-training critical path.
     """
 
     kv: jax.Array
@@ -37,7 +43,9 @@ class SharedCSA2State(NamedTuple):
 
 
 def _segment_local_positions_1d(segment_ids: jax.Array) -> jax.Array:
-    starts = jnp.concatenate([jnp.array([True]), segment_ids[1:] != segment_ids[:-1]])
+    starts = jnp.concatenate(
+        [jnp.array([True]), segment_ids[1:] != segment_ids[:-1]]
+    )
     pos = jnp.arange(segment_ids.shape[0], dtype=jnp.int32)
     start_values = jnp.where(starts, pos, 0)
     start_pos = jax.lax.associative_scan(jnp.maximum, start_values)
@@ -160,13 +168,18 @@ def _build_global_state(
     *,
     compression_ratio: int,
     source_layer: int,
+    build_index_k_cache: bool,
     config,
 ) -> SharedCSA2State:
     latent = linear(source, params["global_kv"])
     if compression_ratio > 1:
         gate = linear(source, params["global_gate"])
-        latent = learned_group_compress(latent, gate, ratio=compression_ratio)
-    latent = rms_norm(latent, params["global_norm"], eps=config.norm_eps)
+        latent = learned_group_compress(
+            latent, gate, ratio=compression_ratio
+        )
+    latent = rms_norm(
+        latent, params["global_norm"], eps=config.norm_eps
+    )
 
     local_pos = segment_local_positions(segment_ids)
     group_pos = local_pos[:, ::compression_ratio]
@@ -188,7 +201,7 @@ def _build_global_state(
         )
 
     index_k = None
-    if "indexer" in params:
+    if build_index_k_cache and "indexer" in params:
         index_k = build_index_k(
             latent,
             group_pos,
@@ -256,7 +269,9 @@ def _hierarchical_candidate_mask(
     compressed_pos = state.group_start_positions // compression_ratio
     block_ids = compressed_pos // block_size
     block_ids = jnp.clip(block_ids, 0, n_blocks - 1)
-    one_hot = jax.nn.one_hot(block_ids, n_blocks, dtype=bool)  # [B,K,NB]
+    one_hot = jax.nn.one_hot(
+        block_ids, n_blocks, dtype=bool
+    )  # [B,K,NB]
     masked = jnp.where(valid, scores, -jnp.inf)
     block_scores = jnp.max(
         jnp.where(
@@ -280,7 +295,8 @@ def _hierarchical_candidate_mask(
         jax.nn.one_hot(selected_ids, n_blocks, dtype=bool), axis=-2
     ) | newest_oh
     candidate = jnp.any(
-        selected_blocks[:, :, None, :] & one_hot[:, None, :, :], axis=-1
+        selected_blocks[:, :, None, :] & one_hot[:, None, :, :],
+        axis=-1,
     )
     return candidate & valid
 
@@ -298,7 +314,9 @@ def _run_indexer(
     config,
 ) -> tuple[SharedCSA2State, dict[str, jax.Array]]:
     if "indexer" not in params or state.index_k is None:
-        raise ValueError("index-source layer requires an available shared index K")
+        raise ValueError(
+            "index-source layer requires an available shared index K"
+        )
     rope_kwargs = _rope_kwargs(config.attention, compression_ratio)
     scores, index_aux = apply_indexer_scores(
         qr,
@@ -316,11 +334,16 @@ def _run_indexer(
     )
 
     candidate = state.candidate_mask
-    if candidate is not None and layer_id != config.indexer.candidate_source_layer:
+    if (
+        candidate is not None
+        and layer_id != config.indexer.candidate_source_layer
+    ):
         valid = valid & candidate
     masked_scores = jnp.where(valid, scores, -jnp.inf)
     k = min(config.indexer.top_k, scores.shape[-1])
-    topk_values, topk_indices = masked_top_k(masked_scores, valid, k=k)
+    topk_values, topk_indices = masked_top_k(
+        masked_scores, valid, k=k
+    )
 
     if layer_id == config.indexer.candidate_source_layer:
         candidate = _hierarchical_candidate_mask(
@@ -367,7 +390,11 @@ def _merge_with_sink(
     if sink is None:
         return merged, branch_lse
     total_lse = jnp.logaddexp(branch_lse, sink[None, None, :])
-    return merged * jnp.exp(branch_lse - total_lse)[..., None], total_lse
+    # Sink contributes denominator mass only; it has no value vector.
+    return (
+        merged * jnp.exp(branch_lse - total_lse)[..., None],
+        total_lse,
+    )
 
 
 def grouped_output_projection(
@@ -382,9 +409,12 @@ def grouped_output_projection(
     grouped = o.reshape(
         *o.shape[:-2], n_groups, heads_per_group * o.shape[-1]
     )
-    low_rank = jnp.einsum("...gd,gdr->...gr", grouped, params["wo_a"])
+    low_rank = jnp.einsum(
+        "...gd,gdr->...gr", grouped, params["wo_a"]
+    )
     return linear(
-        low_rank.reshape(*low_rank.shape[:-2], n_groups * o_rank), params["wo_b"]
+        low_rank.reshape(*low_rank.shape[:-2], n_groups * o_rank),
+        params["wo_b"],
     )
 
 
@@ -400,14 +430,25 @@ def apply_csa2_attention(
     compression_ratio: int,
     config,
     global_source: jax.Array | None = None,
+    compute_indexer: bool = True,
 ) -> tuple[jax.Array, SharedCSA2State | None, dict[str, object]]:
-    """Dense backbone attention plus an operational Full/Reindex/Reuse index state."""
+    """Dense backbone attention plus optional full-sequence retrieval diagnostics.
+
+    ``compute_indexer=False`` is the normal dense-training path: no index-K projection and
+    no T-by-K retrieval score matrix are produced. Late-stage indexer distillation can then
+    score only selected teacher queries from the exposed Q-LoRA/compressor intermediates.
+
+    ``compute_indexer=True`` is an analysis/evaluation path that executes the operational
+    Full/Reindex/Reuse state machine and materializes Top-K selections.
+    """
     ac = config.attention
     q_pos = segment_local_positions(segment_ids)
     rope_kwargs = _rope_kwargs(ac, compression_ratio)
 
     qr = rms_norm(
-        linear(x, params["q_a"]), params["q_norm"], eps=config.norm_eps
+        linear(x, params["q_a"]),
+        params["q_norm"],
+        eps=config.norm_eps,
     )
     q = linear(qr, params["q_b"]).reshape(
         *x.shape[:-1], ac.n_heads, ac.head_dim
@@ -420,7 +461,9 @@ def apply_csa2_attention(
     )
 
     local_kv = rms_norm(
-        linear(x, params["local_kv"]), params["local_kv_norm"], eps=config.norm_eps
+        linear(x, params["local_kv"]),
+        params["local_kv_norm"],
+        eps=config.norm_eps,
     )
     local_kv = apply_partial_rope(
         local_kv,
@@ -435,44 +478,64 @@ def apply_csa2_attention(
             ste=True,
         )
     local_out, local_lse = _latent_attention(
-        q, local_kv, _local_mask(segment_ids, ac.local_window)
+        q,
+        local_kv,
+        _local_mask(segment_ids, ac.local_window),
     )
 
     index_aux: dict[str, object] = {
         "index_scores": None,
-        "index_topk_indices": None if state is None else state.latest_topk_indices,
-        "index_topk_values": None if state is None else state.latest_topk_values,
-        "index_candidate_mask": None if state is None else state.candidate_mask,
+        "index_topk_indices": None
+        if state is None
+        else state.latest_topk_indices,
+        "index_topk_values": None
+        if state is None
+        else state.latest_topk_values,
+        "index_candidate_mask": None
+        if state is None
+        else state.candidate_mask,
     }
+    global_valid = None
 
     if mode == "swa":
         if owns_global_kv or global_source is not None:
-            raise ValueError("SWA-only layer cannot own/take compressed global KV")
+            raise ValueError(
+                "SWA-only layer cannot own/take compressed global KV"
+            )
         global_out = global_lse = None
     else:
         if owns_global_kv:
             source = x if global_source is None else global_source
             if source.shape != x.shape:
-                raise ValueError("global_source must match x [batch,tokens,dim]")
+                raise ValueError(
+                    "global_source must match x [batch,tokens,dim]"
+                )
             state = _build_global_state(
                 source,
                 segment_ids,
                 params,
                 compression_ratio=compression_ratio,
                 source_layer=layer_id,
+                build_index_k_cache=compute_indexer,
                 config=config,
             )
         elif global_source is not None:
-            raise ValueError("global_source only applies to a compressed-KV source")
+            raise ValueError(
+                "global_source only applies to a compressed-KV source"
+            )
         if state is None:
             raise ValueError(
                 f"CSA2 {mode} layer {layer_id} has no shared compressed state"
             )
 
-        global_valid = _global_mask(segment_ids, state, ac.local_window)
-        global_out, global_lse = _latent_attention(q, state.kv, global_valid)
+        global_valid = _global_mask(
+            segment_ids, state, ac.local_window
+        )
+        global_out, global_lse = _latent_attention(
+            q, state.kv, global_valid
+        )
 
-        if mode in ("full", "reindex"):
+        if compute_indexer and mode in ("full", "reindex"):
             state, index_aux = _run_indexer(
                 qr,
                 x,
@@ -484,7 +547,7 @@ def apply_csa2_attention(
                 compression_ratio=compression_ratio,
                 config=config,
             )
-        elif mode == "reuse":
+        elif mode == "reuse" or not compute_indexer:
             index_aux = {
                 "index_scores": None,
                 "index_topk_indices": state.latest_topk_indices,
@@ -513,12 +576,25 @@ def apply_csa2_attention(
         n_groups=ac.o_groups,
         o_rank=ac.o_rank,
     )
+
+    active_state = None if mode == "swa" else state
     return out, state, {
         "qr": qr,
         "q": q,
         "index_hidden": x,
         "total_lse": total_lse,
         "global_lse": global_lse,
-        "index_k": None if state is None else state.index_k,
+        "main_kv": None if active_state is None else active_state.kv,
+        "compressed_latent": None
+        if active_state is None
+        else active_state.latent,
+        "global_positions": None
+        if active_state is None
+        else active_state.group_start_positions,
+        "global_segment_ids": None
+        if active_state is None
+        else active_state.segment_ids,
+        "global_valid": global_valid,
+        "index_k": None if active_state is None else active_state.index_k,
         **index_aux,
     }
