@@ -219,10 +219,11 @@ def selective_indexer_distillation_loss(
         if latent is None or global_positions is None or main_kv is None:
             raise ValueError("indexer group has no compressed source state")
 
-        if tc.detach_backbone_inputs:
-            latent_for_student = jax.lax.stop_gradient(latent)
-        else:
-            latent_for_student = latent
+        latent_for_student = (
+            jax.lax.stop_gradient(latent)
+            if tc.detach_backbone_inputs
+            else latent
+        )
 
         kv_indexer_params = params["blocks"][group.kv_source_layer]["attn"][
             "indexer"
@@ -238,9 +239,7 @@ def selective_indexer_distillation_loss(
             rope_kwargs=_rope_kwargs(config, group.compression_ratio),
             norm_eps=config.norm_eps,
             fp4_qat=config.quantization.indexer_fp4_qat,
-            fp4_block_size=config.quantization.indexer.block_size
-            if hasattr(config.quantization, "indexer")
-            else config.quantization.indexer_block_size,
+            fp4_block_size=config.quantization.indexer_block_size,
             fp4_scale_format=config.quantization.indexer_scale_format,
         )
 
