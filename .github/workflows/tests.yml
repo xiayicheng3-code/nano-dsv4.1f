@@ -21,3 +21,20 @@ jobs:
         env:
           JAX_PLATFORMS: cpu
         run: pytest -q
+      - name: Build and parse Kaggle notebook
+        env:
+          JAX_PLATFORMS: cpu
+        run: |
+          python scripts/build_notebook.py --output /tmp/nano_dsv41f_kaggle.ipynb
+          python - <<'PY'
+          import nbformat
+          path = '/tmp/nano_dsv41f_kaggle.ipynb'
+          nb = nbformat.read(path, as_version=4)
+          nbformat.validate(nb)
+          assert len(nb.cells) > 10
+          joined = '\n'.join(cell.source for cell in nb.cells)
+          assert 'init_model_sharded_mixed_precision' in joined
+          assert 'make_v5e_sharded_local_mqa' in joined
+          assert '%pip install -q -e . --no-deps' in joined
+          print(f'validated {path}: {len(nb.cells)} cells')
+          PY
