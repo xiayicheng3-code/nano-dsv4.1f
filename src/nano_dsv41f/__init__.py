@@ -18,6 +18,17 @@ from .config import (
 from .dspark import apply_dspark, sample_markov_block
 from .model import apply_model, apply_model_dspark, build_layer_specs, init_model
 from .optimizer import init_optimizer_state, optimizer_step, parameter_rule_map
+from .precision import (
+    cast_payload_parameters,
+    init_model_sharded_mixed_precision,
+    precision_summary,
+)
+from .profiling import (
+    collective_counts,
+    compile_diagnostics,
+    compiled_cost_report,
+    compiled_memory_report,
+)
 from .tpu import (
     V5E,
     batch_named_sharding,
@@ -63,11 +74,17 @@ __all__ = [
     "batch_named_sharding",
     "build_indexer_groups",
     "build_layer_specs",
+    "cast_payload_parameters",
     "causal_lm_loss",
+    "collective_counts",
+    "compile_diagnostics",
     "compile_pretrain_step",
+    "compiled_cost_report",
+    "compiled_memory_report",
     "indexer_phase_enabled",
     "init_model",
     "init_model_sharded",
+    "init_model_sharded_mixed_precision",
     "init_optimizer_state",
     "init_optimizer_state_sharded",
     "make_v5e_mesh",
@@ -75,6 +92,7 @@ __all__ = [
     "optimizer_step",
     "parameter_partition_specs",
     "parameter_rule_map",
+    "precision_summary",
     "pretrain_loss",
     "pretrain_step",
     "put_training_batch",
