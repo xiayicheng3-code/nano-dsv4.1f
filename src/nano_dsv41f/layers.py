@@ -19,7 +19,15 @@ def init_linear(
 
 
 def linear(x: jax.Array, params: dict[str, jax.Array]) -> jax.Array:
-    return jnp.einsum("...d,df->...f", x, params["weight"])
+    """Linear projection whose compute dtype follows the stored matrix dtype.
+
+    CPU/reference initialization leaves matrices in FP32. The v5e initializer can store
+    matrix/table parameters as BF16; explicitly casting the activation here prevents an
+    FP32 residual/control path from silently promoting a large MXU matmul back to FP32.
+    """
+    weight = params["weight"]
+    x_compute = x.astype(weight.dtype) if x.dtype != weight.dtype else x
+    return jnp.einsum("...d,df->...f", x_compute, weight)
 
 
 def init_rms_norm(dim: int) -> dict[str, jax.Array]:
@@ -32,9 +40,11 @@ def rms_norm(
     *,
     eps: float = 1e-6,
 ) -> jax.Array:
+    # Statistics and scale application stay FP32; the normalized activation returns to the
+    # residual stream dtype so BF16 TPU paths do not get permanently promoted.
     xf = x.astype(jnp.float32)
     scale = jax.lax.rsqrt(jnp.mean(jnp.square(xf), axis=-1, keepdims=True) + eps)
-    return (xf * scale * params["weight"]).astype(x.dtype)
+    return (xf * scale * params["weight"].astype(jnp.float32)).astype(x.dtype)
 
 
 def init_embedding(
