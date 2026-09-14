@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import PartitionSpec as P
+from jax.sharding import AxisType, PartitionSpec as P
 
 from nano_dsv41f.config import (
     AttentionConfig,
@@ -105,6 +105,11 @@ def test_v5e_2x4_semantic_axis_mapping():
     assert axes_for_shard_count(mesh, 8) == ("x", "y")
     with pytest.raises(ValueError):
         axes_for_shard_count(mesh, 3)
+
+
+def test_fallback_runtime_mesh_uses_auto_axes():
+    mesh = make_v5e_mesh(strict=False)
+    assert all(axis_type == AxisType.Auto for axis_type in mesh.axis_types)
 
 
 def test_parameter_specs_reuse_physical_mesh_by_semantic_role():
