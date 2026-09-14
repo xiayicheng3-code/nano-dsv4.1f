@@ -70,49 +70,84 @@ The default follows the proposed `local_window + top_k` eligibility rule: `128 +
 
 Nano retrievers serve only two layers by default, so `all_served` and `Full + last` use the same teacher set. Teacher attention is always stop-gradient. By default student inputs from the dense backbone are detached too, so the auxiliary loss trains the indexer-specific `wk/k_norm/wq_b/weights_proj` without perturbing the backbone; this is our educational/stability choice, not a claimed DeepSeek recipe, and it is configurable.
 
+## TPU v5e-8 baseline
+
+The repository now contains a real GSPMD/mixed-precision baseline rather than only sharding intentions. The target is a single-host **2×4 v5e-8** mesh:
+
+- `jax.make_mesh((2, 4), ("x", "y"))` keeps physical topology visible;
+- vocabulary rows, Engram table rows and routed experts can each reuse the full 8-chip physical mesh in their own modules;
+- nano DSpark uses 4-way expert sharding because it has four routed experts by default;
+- attention starts with **8-way context/Q-sequence sharding and no head TP**;
+- large matrix/table payload parameters are initialized directly into their final shards as **BF16**;
+- norm, bias, sink, router/control vectors and optimizer accumulators remain FP32;
+- base-LM and late-indexer training are compiled as separate static executables;
+- parameters and optimizer state are donated across training steps;
+- compiler diagnostics report estimated memory, cost-analysis fields and same-runtime StableHLO collective counts.
+
+This is a **placement/compilation baseline**, not a claim that expert parallelism is already efficient. The current readable MoE still performs data-dependent expert gathers, so XLA may insert costly communication around expert-sharded parameters. The first v5e profiling run should determine whether MoE dispatch or attention is the larger systems bottleneck before replacing either one.
+
+A standalone `splash.py` prototype also exercises the intended MLA-friendly local attention layout: Q rows are sequence-sharded while the compact latent K/V is replicated, packed examples use Splash `SegmentIds`, and `save_residuals=True` exposes LSE for the exact local/global softmax merge. It deliberately remains outside the backbone until it passes numerical checks on an actual Kaggle v5e runtime.
+
+## Kaggle notebook workflow
+
+`scripts/build_notebook.py` generates a self-contained Kaggle notebook from the maintained Python sources. The generated notebook:
+
+1. checks that the selected accelerator is TPU before modifying the environment;
+2. **does not upgrade JAX/libtpu** and installs this package with `--no-deps`;
+3. constructs the topology-aware v5e mesh;
+4. initializes BF16 payload / FP32 control parameters directly into final shards;
+5. initializes sharded optimizer state and compiles base/late-indexer executables;
+6. uses a `T=1024` smoke batch so 8-way context sharding gives 128 Q tokens per chip;
+7. prints compiler memory/cost/collective diagnostics;
+8. compares the standalone sharded Splash local-MQA output and LSE against the dense reference before it is allowed into the backbone.
+
+Normal Python remains canonical; notebook cells are generated views, not a second implementation. CI also generates and validates the notebook structure so the Kaggle artifact cannot silently drift away from the package.
+
 ## Source layout
 
 ```text
 src/nano_dsv41f/
-  config.py          Every architecture/training/sharding hyperparameter
+  config.py          architecture/training/sharding hyperparameters
   rope.py            partial/inverse RoPE + compressed/YaRN frequency reference
   quantization.py    software FP4/FP8 fake-QAT reference
-  layers.py          small JAX primitives
+  layers.py          small JAX primitives + dtype-preserving linear/RMSNorm
   packing.py         packed-example/query-selection utilities
   attention.py       standalone mask/LSE helpers
-  compression.py     learned r=1/r=2 compression
+  compression.py     learned r=1/r=2 compression with FP32 control math
   csa2.py            SWA + compressed MLA + optional Full/Reindex/Reuse diagnostics
   indexer.py         fixed-shape teacher selection + distillation math
   indexer_scorer.py  released-style indexer + hierarchy reference
-  training.py        selective late-stage indexer auxiliary loss
-  mhc.py             Single-Pass mHC mechanics
-  moe.py             routed + shared-expert MoE
-  engram.py          conditional hashed memory
+  training.py        packed causal LM + selective late-stage indexer objective
+  mhc.py             Single-Pass mHC mechanics + BF16 payload boundaries
+  moe.py             routed + shared-expert MoE, FP32 routing/BF16 expert payload
+  engram.py          conditional hashed memory, FP32 gate/BF16 payload
   dspark.py          one-stage released-style DSpark reference
   optimizer.py       hybrid optimizer rules and update kernels
   model.py           end-to-end backbone + DSpark wiring + remat boundaries
+  tpu.py             v5e mesh, PartitionSpec, direct-to-shard init and JIT helpers
+  precision.py       BF16 payload / FP32 control parameter policy
+  profiling.py       AOT memory/cost/collective diagnostics
+  splash.py          standalone sharded Splash local-MQA prototype
 scripts/
-  build_notebook.py  compile maintained source into a Kaggle notebook
+  build_notebook.py  generate the self-contained Kaggle TPU notebook
 ```
-
-Normal Python is canonical. Notebook cells are generated views of this codebase, not a second implementation.
 
 ## Still a systems project
 
-The current dense path establishes semantics before TPU specialization. Major next milestones are:
+The next milestones are deliberately hardware-driven rather than cosmetic:
 
-- SplashAttention/Pallas kernels for long-context local + compressed attention;
-- packed MXFP4 cache storage with software dequantization on-chip;
-- real `NamedSharding`/collectives for context, experts, vocabulary and Engram tables on TPU v5e-8;
-- TPU memory/throughput benchmarks for the three remat policies;
-- full causal-LM data/training loop and phase scheduling around the selective indexer objective;
-- sparse-aware GPU continuation only if retriever quality justifies it;
-- notebook compilation and Kaggle profiling.
+- run the generated notebook on a real Kaggle v5e-8 and record HBM, StableHLO collectives and steady-state step time;
+- promote local SplashAttention into the backbone only after output/LSE parity is verified;
+- replace compressed-global dense attention with a packed-safe Splash/Pallas path that handles rows with no global history;
+- implement real token dispatch/all-to-all if profiler evidence shows the current expert-sharded dynamic gather is expensive;
+- implement packed MXFP4 main-KV storage with on-chip software dequantization rather than materializing dequantized KV in HBM;
+- benchmark `none` / `attention` / `block` rematerialization on actual v5e HBM and throughput;
+- add the DSpark training/verification path and sparse-aware GPU continuation only when those experiments become useful.
 
 See `docs/implementation_scope.md` for the detailed fidelity matrix.
 
 ## References
 
-Primary references are the DeepSeek-V4.1-Flash technical report/released configuration and inference implementation, vLLM's V4.1 implementation for deployment details, and DeepSeek's released DeepSpec DSpark code.
+Primary references are the DeepSeek-V4.1-Flash technical report/released configuration and inference implementation, vLLM's V4.1 implementation for deployment details, JAX's TPU/Pallas/SplashAttention implementation, and DeepSeek's released DeepSpec DSpark code.
 
 This project is unaffiliated with DeepSeek.
