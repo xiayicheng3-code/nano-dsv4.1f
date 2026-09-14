@@ -12,10 +12,9 @@ def learned_group_compress(
 ) -> jnp.ndarray:
     """Learned pooling over contiguous token groups.
 
-    `score` may be scalar per token (`x.shape[:-1]`) for toy experiments or per latent
-    channel (`x.shape`). The latter matches the released V4.1 compressor more closely:
-    `wkv(x)` and `wgate(x)` both have `head_dim` channels and softmax is taken across
-    tokens within each compression group independently for each channel.
+    Compression weights are normalized in FP32, then cast back to the payload dtype before
+    the weighted reduction. This mirrors the TPU mixed-precision policy used elsewhere:
+    numerically sensitive control math stays FP32 without promoting the stored latent.
     """
     if ratio not in (1, 2):
         raise ValueError("current reference supports compression ratio 1 or 2")
@@ -31,14 +30,14 @@ def learned_group_compress(
     if score.shape == x.shape:
         grouped_score = score.reshape(
             *score.shape[:-2], t // ratio, ratio, d
-        )
-        weight = jnn.softmax(grouped_score, axis=-2)
+        ).astype(jnp.float32)
+        weight = jnn.softmax(grouped_score, axis=-2).astype(x.dtype)
     else:
         grouped_score = score.reshape(
             *score.shape[:-1], t // ratio, ratio
-        )
-        weight = jnn.softmax(grouped_score, axis=-1)[..., None]
-    return jnp.sum(grouped_x * weight, axis=-2)
+        ).astype(jnp.float32)
+        weight = jnn.softmax(grouped_score, axis=-1).astype(x.dtype)[..., None]
+    return jnp.sum(grouped_x * weight, axis=-2).astype(x.dtype)
 
 
 def completed_group_mask(length: int, ratio: int) -> jnp.ndarray:
