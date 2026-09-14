@@ -235,14 +235,30 @@ class RematConfig:
 
 @dataclass(frozen=True)
 class ParallelismConfig:
-    # Semantic sharding names: several can reuse the same physical 8-chip TPU mesh axis.
+    # Logical roles may map to the same physical v5e 2x4 mesh in different modules.
+    # Defaults intentionally avoid one overloaded global TP knob.
     vocab_shard: int = 8
     engram_table_shard: int = 8
     expert_shard: int = 8
-    dspark_expert_shard: int = 8
+    # Nano DSpark has four routed experts, so its capacity axis starts on the 4-chip mesh
+    # dimension rather than pretending four experts can be eight-way expert-parallel.
+    dspark_expert_shard: int = 4
     attention_context_shard: int = 8
     attention_head_shard: int = 1
     indexer_context_shard: int = 8
+
+    def __post_init__(self) -> None:
+        values = (
+            self.vocab_shard,
+            self.engram_table_shard,
+            self.expert_shard,
+            self.dspark_expert_shard,
+            self.attention_context_shard,
+            self.attention_head_shard,
+            self.indexer_context_shard,
+        )
+        if min(values) <= 0:
+            raise ValueError("all parallelism shard counts must be positive")
 
 
 @dataclass(frozen=True)
@@ -294,11 +310,36 @@ class ModelConfig:
 
         qc = self.quantization
         if qc.main_kv_fp4_qat and self.attention.head_dim % qc.main_kv_block_size:
-            raise ValueError("attention.head_dim must be divisible by main_kv_block_size when main KV FP4 QAT is enabled")
+            raise ValueError(
+                "attention.head_dim must be divisible by main_kv_block_size when main "
+                "KV FP4 QAT is enabled"
+            )
         if qc.swa_fp8_qat and self.attention.head_dim % qc.swa_fp8_block_size:
-            raise ValueError("attention.head_dim must be divisible by swa_fp8_block_size when SWA FP8 QAT is enabled")
+            raise ValueError(
+                "attention.head_dim must be divisible by swa_fp8_block_size when SWA "
+                "FP8 QAT is enabled"
+            )
         if qc.indexer_fp4_qat and self.indexer.head_dim % qc.indexer_block_size:
-            raise ValueError("indexer.head_dim must be divisible by indexer_block_size when indexer FP4 QAT is enabled")
+            raise ValueError(
+                "indexer.head_dim must be divisible by indexer_block_size when indexer "
+                "FP4 QAT is enabled"
+            )
+
+        pc = self.parallelism
+        if self.vocab_size % pc.vocab_shard:
+            raise ValueError("vocab_size must be divisible by vocab_shard")
+        if self.engram.enabled and self.engram.table_size % pc.engram_table_shard:
+            raise ValueError("Engram table_size must be divisible by engram_table_shard")
+        if self.n_experts % pc.expert_shard:
+            raise ValueError("n_experts must be divisible by expert_shard")
+        if self.dspark.enabled and self.dspark.n_routed_experts % pc.dspark_expert_shard:
+            raise ValueError("DSpark routed experts must be divisible by dspark_expert_shard")
+        if self.attention.n_heads % pc.attention_head_shard:
+            raise ValueError("attention.n_heads must be divisible by attention_head_shard")
+        if pc.attention_head_shard > 1 and self.attention.o_groups % pc.attention_head_shard:
+            raise ValueError(
+                "o_groups must be divisible by attention_head_shard for grouped wo_a TP"
+            )
 
     @property
     def n_layers(self) -> int:
