@@ -9,6 +9,7 @@ import nbformat as nbf
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_GLOBS = [
     "pyproject.toml",
+    "README.md",
     "src/nano_dsv41f/*.py",
 ]
 
@@ -58,9 +59,9 @@ def build(output: Path) -> None:
         ),
         nbf.v4.new_markdown_cell(
             "## Materialize the maintained package\n\n"
-            "The following generated cells write the repository source files into the "
-            "notebook working directory. `%pip install -e . --no-deps` then exposes the "
-            "package without replacing Kaggle's TPU-matched JAX/libtpu wheels."
+            "The generated cells below write `pyproject.toml`, `README.md`, and package "
+            "sources into the notebook working directory. `%pip install -e . --no-deps` "
+            "then exposes the package without replacing Kaggle's TPU-matched JAX/libtpu."
         ),
     ]
 
@@ -78,7 +79,7 @@ def build(output: Path) -> None:
             nbf.v4.new_markdown_cell(
                 "## v5e-8 topology and semantic sharding\n\n"
                 "The target is one 8-chip v5e host with a 2×4 ICI topology. `jax.make_mesh` "
-                "chooses a topology-aware device ordering. Logical roles reuse that same "
+                "chooses topology-aware device ordering. Logical roles reuse the same "
                 "physical mesh: sequence/context, routed experts, vocabulary rows and "
                 "Engram rows are not conflated into one global TP setting."
             ),
@@ -103,31 +104,34 @@ def build(output: Path) -> None:
                 "    print('WARNING:', warning)"
             ),
             nbf.v4.new_markdown_cell(
-                "## Direct-to-shard initialization\n\n"
-                "We first `eval_shape` the model, derive parameter `PartitionSpec`s, and "
-                "JIT initialization with explicit output shardings. This avoids creating a "
-                "full temporary copy of the model in one TPU's HBM before resharding it."
+                "## Direct-to-shard mixed-precision initialization\n\n"
+                "Large matrix/table payloads are BF16 on v5e; norm/bias/sink/control "
+                "vectors stay FP32. Initialization, BF16 cast and final placement happen in "
+                "one JIT, so a complete FP32 model is never materialized on one TPU."
             ),
             nbf.v4.new_code_cell(
                 "from nano_dsv41f import (\n"
-                "    init_model_sharded, init_optimizer_state_sharded, memory_report,\n"
+                "    init_model_sharded_mixed_precision, init_optimizer_state_sharded,\n"
+                "    memory_report, precision_summary,\n"
                 ")\n\n"
                 "key = jax.random.PRNGKey(0)\n"
-                "params, param_specs, param_shardings = init_model_sharded(key, config, mesh)\n"
+                "params, param_specs, param_shardings = init_model_sharded_mixed_precision(\n"
+                "    key, config, mesh, payload_dtype=jnp.bfloat16\n"
+                ")\n"
                 "jax.block_until_ready(jax.tree_util.tree_leaves(params)[0])\n"
+                "print('parameter dtypes:', precision_summary(params))\n"
                 "print(memory_report(params, param_specs, mesh))\n"
                 "opt_state, opt_state_shardings = init_optimizer_state_sharded(\n"
                 "    params, param_specs, config, mesh\n"
                 ")\n"
                 "jax.block_until_ready(jax.tree_util.tree_leaves(opt_state)[0])\n"
-                "print('model + optimizer state initialized on mesh')"
+                "print('mixed-precision model + FP32 optimizer state initialized on mesh')"
             ),
             nbf.v4.new_markdown_cell(
                 "## Static base and late-indexer executables\n\n"
                 "Compile two separate functions. The base graph never contains selective "
-                "teacher work; the late graph adds the selected-row retriever objective. "
-                "The Python training driver switches executables according to the configured "
-                "training phase rather than placing a large dynamic branch inside XLA."
+                "teacher work; the late graph adds selected-row retriever supervision. This "
+                "keeps the expensive auxiliary branch out of normal XLA steps."
             ),
             nbf.v4.new_code_cell(
                 "from nano_dsv41f import compile_pretrain_step\n\n"
@@ -144,15 +148,14 @@ def build(output: Path) -> None:
             nbf.v4.new_markdown_cell(
                 "## v5e-friendly smoke batch\n\n"
                 "`T=1024` gives 128 query tokens per chip under 8-way context sharding. "
-                "It is long enough to exercise the decoder's 128+512 retriever eligibility "
-                "later, while keeping the dense semantic attention reference small enough "
-                "for a notebook smoke test."
+                "It is long enough to exercise decoder 128+512 retriever eligibility later, "
+                "while keeping the dense semantic baseline manageable."
             ),
             nbf.v4.new_code_cell(
                 "import numpy as np\n"
                 "from nano_dsv41f import put_training_batch\n\n"
                 "smoke_t = 1024\n"
-                "host_ids = (np.arange(smoke_t, dtype=np.int32)[None, :] % config.vocab_size)\n"
+                "host_ids = np.arange(smoke_t, dtype=np.int32)[None, :] % config.vocab_size\n"
                 "host_segments = np.zeros_like(host_ids, dtype=np.int32)\n"
                 "host_mask = np.ones_like(host_ids, dtype=bool)\n"
                 "ids, segments, token_mask = put_training_batch(\n"
@@ -164,11 +167,11 @@ def build(output: Path) -> None:
             nbf.v4.new_markdown_cell(
                 "## Compile diagnostics before execution\n\n"
                 "Lower and compile the base step without consuming donated buffers. The "
-                "StableHLO collective count is deliberately a same-runtime diagnostic, not "
-                "a stable API contract; memory analysis is the more important first signal."
+                "StableHLO collective count is a same-runtime diagnostic rather than a "
+                "stable compiler API; memory analysis is the first signal to trust."
             ),
             nbf.v4.new_code_cell(
-                "from nano_dsv41f.profiling import compile_diagnostics\n\n"
+                "from nano_dsv41f import compile_diagnostics\n\n"
                 "zero_step = jnp.asarray(0, dtype=jnp.int32)\n"
                 "compiled_base, diagnostics = compile_diagnostics(\n"
                 "    base_step, params, opt_state, ids, segments, zero_step, token_mask\n"
@@ -176,16 +179,52 @@ def build(output: Path) -> None:
                 "print('collectives:', diagnostics['collectives'])\n"
                 "print('compiler memory:', diagnostics['memory'])\n"
                 "cost = diagnostics['cost']\n"
-                "for key in sorted(cost):\n"
-                "    if any(tag in key.lower() for tag in ('flop', 'byte', 'transcend')):\n"
-                "        print(key, cost[key])"
+                "for name in sorted(cost):\n"
+                "    if any(tag in name.lower() for tag in ('flop', 'byte', 'transcend')):\n"
+                "        print(name, cost[name])"
+            ),
+            nbf.v4.new_markdown_cell(
+                "## Standalone Splash local-MQA validation\n\n"
+                "Before replacing backbone attention, validate JAX's sharded Splash kernel "
+                "against the dense local branch. Q rows are 8-way sequence-sharded while "
+                "the compact latent K/V is replicated. `save_residuals=True` gives the LSE "
+                "needed later for exact local/global shared-softmax merging."
+            ),
+            nbf.v4.new_code_cell(
+                "from nano_dsv41f.splash import (\n"
+                "    dense_local_mqa_reference, make_v5e_sharded_local_mqa,\n"
+                ")\n\n"
+                "kq, kk = jax.random.split(jax.random.PRNGKey(7))\n"
+                "q_test = jax.random.normal(\n"
+                "    kq, (1, smoke_t, config.attention.n_heads, config.attention.head_dim),\n"
+                "    dtype=jnp.bfloat16,\n"
+                ")\n"
+                "kv_test = jax.random.normal(\n"
+                "    kk, (1, smoke_t, config.attention.head_dim), dtype=jnp.bfloat16\n"
+                ")\n"
+                "seg_test = jnp.zeros((1, smoke_t), dtype=jnp.int32)\n"
+                "splash_local = make_v5e_sharded_local_mqa(\n"
+                "    mesh, seq_len=smoke_t, n_heads=config.attention.n_heads,\n"
+                "    head_dim=config.attention.head_dim,\n"
+                "    local_window=config.attention.local_window,\n"
+                ")\n"
+                "splash_out, splash_lse = jax.jit(splash_local)(q_test, kv_test, seg_test)\n"
+                "ref_out, ref_lse = jax.jit(\n"
+                "    lambda q, kv, s: dense_local_mqa_reference(\n"
+                "        q, kv, s, local_window=config.attention.local_window\n"
+                "    )\n"
+                ")(q_test, kv_test, seg_test)\n"
+                "jax.block_until_ready(splash_out)\n"
+                "print('max |output error|:', float(jnp.max(jnp.abs(\n"
+                "    splash_out.astype(jnp.float32) - ref_out.astype(jnp.float32)\n"
+                "))))\n"
+                "print('max |LSE error|:', float(jnp.max(jnp.abs(splash_lse - ref_lse))))"
             ),
             nbf.v4.new_markdown_cell(
                 "## First compiled training step\n\n"
                 "Parameters and optimizer state are donated to the executable, so always "
-                "assign the returned trees back to the same variables. The preceding AOT "
-                "compile normally warms the executable cache; time only later steady-state "
-                "steps."
+                "assign returned trees back to the same variables. The AOT compile above "
+                "normally warms the executable cache; time only later steady-state steps."
             ),
             nbf.v4.new_code_cell(
                 "params, opt_state, metrics = base_step(\n"
@@ -196,12 +235,11 @@ def build(output: Path) -> None:
             ),
             nbf.v4.new_markdown_cell(
                 "## Next systems milestones\n\n"
-                "This notebook now establishes real v5e placement and a measurable GSPMD "
-                "baseline. The routed expert gather is still a dense semantic implementation, "
-                "so expert parameter sharding is **not yet an efficient all-to-all EP "
-                "kernel**. Likewise, dense CSA2 establishes correctness before replacing "
-                "local/global attention with Splash/Pallas. Use the compiler diagnostics "
-                "above to choose the next optimization rather than guessing."
+                "This notebook now establishes mixed-precision v5e placement, measurable "
+                "GSPMD behavior and an isolated Splash local-attention check. Expert "
+                "parameter sharding is **not yet an efficient all-to-all EP kernel**, and "
+                "compressed-global attention remains dense. Use HLO/memory plus the Splash "
+                "numerical check above before promoting either prototype into the backbone."
             ),
         ]
     )
