@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any
 
 import jax
@@ -98,10 +97,10 @@ def make_v5e_mesh(
     devices: tuple[jax.Device, ...] | list[jax.Device] | None = None,
     strict: bool = True,
 ) -> Mesh:
-    """Construct a topology-aware mesh, using JAX's physical-device ordering helper.
+    """Construct a topology-aware mesh using JAX's physical-device ordering helper.
 
     On the Kaggle target this is a 2x4 explicit mesh. For one-device CPU CI, `strict=False`
-    yields a one-axis mesh so sharding helpers remain testable without pretending the CPU
+    yields a one-axis mesh so sharding helpers remain executable without pretending the CPU
     runner is a TPU.
     """
     devs = tuple(jax.devices() if devices is None else devices)
@@ -119,9 +118,8 @@ def make_v5e_mesh(
 def axes_for_shard_count(mesh: Mesh, shards: int, *, strict: bool = True):
     """Map a semantic shard count onto one or both physical mesh axes.
 
-    For the v5e 2x4 mesh this gives 2 -> 'x', 4 -> 'y', 8 -> ('x','y'). The
-    communication-heavier exact match prefers the last mesh axis, consistent with JAX mesh
-    utilities treating later axes as the more network-intensive dimensions.
+    For the v5e 2x4 mesh this gives 2 -> 'x', 4 -> 'y', 8 -> ('x','y'). The exact
+    single-axis match prefers the last mesh axis so 4-way DSpark EP naturally lands on y.
     """
     if shards <= 0:
         raise ValueError("shard count must be positive")
@@ -170,7 +168,9 @@ def semantic_axes(config, mesh: Mesh, *, strict: bool = True) -> dict[str, Any]:
 def _axis_factor(mesh: Mesh, axis) -> int:
     if axis is None:
         return 1
-    axis_sizes = {name: int(size) for name, size in zip(mesh.axis_names, mesh.devices.shape)}
+    axis_sizes = {
+        name: int(size) for name, size in zip(mesh.axis_names, mesh.devices.shape)
+    }
     if isinstance(axis, tuple):
         out = 1
         for name in axis:
@@ -212,7 +212,7 @@ def parameter_partition_spec(path, value, config, mesh: Mesh, *, strict: bool = 
         entries[dim] = axis
         return P(*entries)
 
-    # Vocabulary tables: row-shard embeddings, column-shard [D,V] prediction matrices.
+    # Vocabulary capacity: row-shard embeddings, column-shard [D,V] prediction matrices.
     if parts and parts[0] == "embed":
         return spec_with(0, axes["vocab"])
     if parts and parts[0] == "lm_head":
@@ -222,13 +222,15 @@ def parameter_partition_spec(path, value, config, mesh: Mesh, *, strict: bool = 
     if parts[:2] == ("dspark", "markov_head") and parts[-1] == "weight":
         return spec_with(ndim - 1, axes["vocab"])
 
-    # Engram capacity lives in hash-table rows. Its projection/gates remain replicated.
+    # Engram capacity lives in hash-table rows. Projection/gates stay replicated.
     if "engram" in parts and parts[-1] == "table":
         return spec_with(0, axes["engram"])
 
-    # Routed expert stacks are [E,...]. Router logits are sharded over their expert axis.
+    # Routed expert stacks are [E,...]. Router logits are sharded over the expert axis.
     if "moe" in parts:
-        expert_axis = axes["dspark_experts"] if "dspark" in parts else axes["experts"]
+        expert_axis = (
+            axes["dspark_experts"] if "dspark" in parts else axes["experts"]
+        )
         if "experts" in parts:
             return spec_with(0, expert_axis)
         if parts[-1] == "router_weight":
@@ -237,8 +239,7 @@ def parameter_partition_spec(path, value, config, mesh: Mesh, *, strict: bool = 
             return spec_with(0, expert_axis)
 
     # Optional attention TP. Nano defaults to 1 so MLA projections stay replicated while
-    # context parallelism consumes all eight chips. These rules make TP=2/4 experiments
-    # explicit without changing unrelated vocab/expert/table sharding semantics.
+    # context parallelism consumes all eight chips. These rules allow explicit TP ablations.
     head_axis = axes["heads"]
     if head_axis is not None:
         if "q_b" in parts and parts[-1] == "weight":
@@ -294,6 +295,8 @@ def optimizer_state_named_shardings(params, param_specs, config, mesh: Mesh):
         if classify_parameter(path, param, config) == "adamw":
             second = NamedSharding(mesh, spec)
         else:
+            # Muon/Sinkhorn use an empty sentinel for `second`; keep that tiny leaf
+            # replicated instead of inventing a parameter-shaped optimizer allocation.
             second = NamedSharding(mesh, P())
         leaves.append(
             OptimizerLeafState(
@@ -311,7 +314,8 @@ def init_optimizer_state_sharded(params, param_specs, config, mesh: Mesh):
     )
     init_fn = jax.jit(
         lambda p: init_optimizer_state(p, config),
-        in_shardings=param_shardings,
+        # A single positional pytree argument still needs a singleton tuple here.
+        in_shardings=(param_shardings,),
         out_shardings=state_shardings,
     )
     return init_fn(params), state_shardings
@@ -332,7 +336,10 @@ def validate_sequence_length(seq_len: int, config, mesh: Mesh) -> tuple[str, ...
         raise ValueError(
             f"seq_len={seq_len} must be divisible by context sharding={context_shards}"
         )
-    if config.csa2.context_compression_ratio > 1 and seq_len % config.csa2.context_compression_ratio:
+    if (
+        config.csa2.context_compression_ratio > 1
+        and seq_len % config.csa2.context_compression_ratio
+    ):
         raise ValueError("sequence length must be divisible by the r=2 context compressor")
 
     warnings: list[str] = []
@@ -358,7 +365,9 @@ def put_training_batch(
     mesh: Mesh,
 ):
     if input_ids.shape != segment_ids.shape or input_ids.shape != token_mask.shape:
-        raise ValueError("input_ids, segment_ids and token_mask must have identical [B,T] shapes")
+        raise ValueError(
+            "input_ids, segment_ids and token_mask must have identical [B,T] shapes"
+        )
     validate_sequence_length(int(input_ids.shape[1]), config, mesh)
     sharding = batch_named_sharding(config, mesh)
     return (
@@ -382,7 +391,7 @@ def compile_pretrain_step(
     """Compile one static base or late-indexer step for the v5e mesh.
 
     We intentionally compile two executables rather than branch on the training step inside
-    XLA. That keeps the expensive selected-row teacher path out of the base executable.
+    XLA. That keeps selected-row teacher work out of the base executable.
     """
     if include_indexer and n_segments is None:
         raise ValueError("n_segments is required for the late-indexer executable")
@@ -423,7 +432,10 @@ def compile_pretrain_step(
 
 
 def global_tree_nbytes(tree) -> int:
-    return sum(int(x.size) * int(jnp.dtype(x.dtype).itemsize) for x in jax.tree_util.tree_leaves(tree))
+    return sum(
+        int(x.size) * int(jnp.dtype(x.dtype).itemsize)
+        for x in jax.tree_util.tree_leaves(tree)
+    )
 
 
 def per_device_parameter_nbytes(params, specs, mesh: Mesh) -> int:
@@ -438,7 +450,9 @@ def per_device_parameter_nbytes(params, specs, mesh: Mesh) -> int:
         factor = 1
         for axis in spec:
             factor *= _axis_factor(mesh, axis)
-        total += (int(value.size) * int(jnp.dtype(value.dtype).itemsize)) // factor
+        total += (
+            int(value.size) * int(jnp.dtype(value.dtype).itemsize)
+        ) // factor
     return total
 
 
