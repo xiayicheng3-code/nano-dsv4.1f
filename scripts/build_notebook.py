@@ -49,6 +49,7 @@ def build(output: Path) -> None:
         nbf.v4.new_code_cell(
             "# Runtime preflight before touching the Python environment.\n"
             "import jax\n"
+            "import jax.numpy as jnp\n"
             "print('JAX:', jax.__version__)\n"
             "print('devices:', jax.devices())\n"
             "print('process_count:', jax.process_count(), 'local_device_count:', jax.local_device_count())\n"
@@ -161,28 +162,46 @@ def build(output: Path) -> None:
                 "print('local shard shape:', ids.addressable_shards[0].data.shape)"
             ),
             nbf.v4.new_markdown_cell(
-                "## First compiled training step\n\n"
-                "The first call includes XLA compilation. Parameters and optimizer state are "
-                "donated to the executable, so always assign the returned trees back to the "
-                "same variables. Time steady-state steps only after this warmup call."
+                "## Compile diagnostics before execution\n\n"
+                "Lower and compile the base step without consuming donated buffers. The "
+                "StableHLO collective count is deliberately a same-runtime diagnostic, not "
+                "a stable API contract; memory analysis is the more important first signal."
             ),
             nbf.v4.new_code_cell(
-                "step = jnp.asarray(0, dtype=jnp.int32)\n"
+                "from nano_dsv41f.profiling import compile_diagnostics\n\n"
+                "zero_step = jnp.asarray(0, dtype=jnp.int32)\n"
+                "compiled_base, diagnostics = compile_diagnostics(\n"
+                "    base_step, params, opt_state, ids, segments, zero_step, token_mask\n"
+                ")\n"
+                "print('collectives:', diagnostics['collectives'])\n"
+                "print('compiler memory:', diagnostics['memory'])\n"
+                "cost = diagnostics['cost']\n"
+                "for key in sorted(cost):\n"
+                "    if any(tag in key.lower() for tag in ('flop', 'byte', 'transcend')):\n"
+                "        print(key, cost[key])"
+            ),
+            nbf.v4.new_markdown_cell(
+                "## First compiled training step\n\n"
+                "Parameters and optimizer state are donated to the executable, so always "
+                "assign the returned trees back to the same variables. The preceding AOT "
+                "compile normally warms the executable cache; time only later steady-state "
+                "steps."
+            ),
+            nbf.v4.new_code_cell(
                 "params, opt_state, metrics = base_step(\n"
-                "    params, opt_state, ids, segments, step, token_mask\n"
+                "    params, opt_state, ids, segments, zero_step, token_mask\n"
                 ")\n"
                 "jax.block_until_ready(metrics['loss'])\n"
                 "print({k: float(v) for k, v in metrics.items() if getattr(v, 'ndim', 1) == 0})"
             ),
             nbf.v4.new_markdown_cell(
                 "## Next systems milestones\n\n"
-                "This notebook now establishes real v5e placement and a GSPMD baseline. "
-                "The routed expert gather is still a dense semantic implementation, so its "
-                "8-way parameter sharding is **not yet an efficient all-to-all EP kernel**. "
-                "Likewise, dense CSA2 establishes correctness before replacing local/global "
-                "attention with Splash/Pallas. The next profiling pass should inspect HLO/" 
-                "collectives, then replace the two dominant communication patterns rather "
-                "than guessing."
+                "This notebook now establishes real v5e placement and a measurable GSPMD "
+                "baseline. The routed expert gather is still a dense semantic implementation, "
+                "so expert parameter sharding is **not yet an efficient all-to-all EP "
+                "kernel**. Likewise, dense CSA2 establishes correctness before replacing "
+                "local/global attention with Splash/Pallas. Use the compiler diagnostics "
+                "above to choose the next optimization rather than guessing."
             ),
         ]
     )
