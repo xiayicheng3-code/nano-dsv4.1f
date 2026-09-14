@@ -23,13 +23,7 @@ def ngram_hash_ids(
     pad_token_id: int = 0,
     seed: int = 0,
 ) -> jax.Array:
-    """Build per-position n-gram hash ids without crossing packed boundaries.
-
-    The released model first maps tokenizer ids into a normalization-aware compressed
-    vocabulary and uses prime-sized disjoint buckets. The nano reference deliberately
-    uses raw token ids and equal disjoint bucket ranges, while retaining the important
-    mechanics: multiple n-gram lengths, multiple hash heads, and segment-safe lookback.
-    """
+    """Build per-position n-gram hash ids without crossing packed boundaries."""
     if input_ids.shape != segment_ids.shape:
         raise ValueError("input_ids and segment_ids must have the same shape")
     n_cols = (max_ngram_size - 1) * n_hash_heads
@@ -93,12 +87,14 @@ def apply_engram(
 ) -> jax.Array:
     """Gate one shared memory value into each mHC residual stream.
 
-    This follows the released Engram dataflow: hashed rows -> key per HC stream + one
-    shared value -> normalized stream/key dot product -> signed-sqrt sigmoid gate.
+    Table/projection payload follows the stored matrix dtype (BF16 on v5e), while the
+    normalization and scalar gate stay FP32. The injected result returns to the residual
+    dtype so the large downstream projections remain low precision.
     """
     looked_up = params["table"][hash_ids]
     flat = looked_up.reshape(*looked_up.shape[:-2], -1)
-    kv = jnp.einsum("...d,df->...f", flat, params["wkv"])
+    wkv = params["wkv"]
+    kv = jnp.einsum("...d,df->...f", flat.astype(wkv.dtype), wkv)
 
     n_streams, dim = streams.shape[-2:]
     key = kv[..., : n_streams * dim].reshape(
@@ -107,14 +103,22 @@ def apply_engram(
     value = kv[..., n_streams * dim :]
 
     h = streams.astype(jnp.float32)
-    key = key.astype(jnp.float32)
-    weight = params["q_weight"] * params["k_weight"]
-    rstd = jax.lax.rsqrt(jnp.mean(jnp.square(h), axis=-1) + eps) * jax.lax.rsqrt(
-        jnp.mean(jnp.square(key), axis=-1) + eps
+    key_fp32 = key.astype(jnp.float32)
+    weight = (
+        params["q_weight"].astype(jnp.float32)
+        * params["k_weight"].astype(jnp.float32)
     )
-    dot = jnp.sum(h * weight * key, axis=-1) * rstd * (dim**-0.5)
+    rstd = jax.lax.rsqrt(jnp.mean(jnp.square(h), axis=-1) + eps) * jax.lax.rsqrt(
+        jnp.mean(jnp.square(key_fp32), axis=-1) + eps
+    )
+    dot = jnp.sum(h * weight * key_fp32, axis=-1) * rstd * (dim**-0.5)
     signed_sqrt = jnp.sign(dot) * jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6))
     gate = jax.nn.sigmoid(signed_sqrt)
     if token_mask is not None:
         gate = jnp.where(token_mask[..., None], gate, 0.0)
-    return streams + gate[..., None] * value[..., None, :]
+
+    injected = (
+        gate.astype(streams.dtype)[..., None]
+        * value.astype(streams.dtype)[..., None, :]
+    )
+    return (streams + injected).astype(streams.dtype)
