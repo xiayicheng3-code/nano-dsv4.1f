@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,10 +18,13 @@ from nano_dsv41f.config import (
     RopeConfig,
     TrainConfig,
 )
+from nano_dsv41f.precision import (
+    init_model_sharded_mixed_precision,
+    precision_summary,
+)
 from nano_dsv41f.tpu import (
     axes_for_shard_count,
     compile_pretrain_step,
-    init_model_sharded,
     init_optimizer_state_sharded,
     make_v5e_mesh,
     parameter_partition_spec,
@@ -151,12 +152,20 @@ def test_v5e_sequence_guardrails():
         validate_sequence_length(4097, cfg, mesh)
 
 
-def test_single_device_ci_can_compile_sharded_pretrain_step():
+def test_single_device_ci_can_compile_mixed_precision_sharded_pretrain_step():
     cfg = tiny_single_device_config()
     train_cfg = TrainConfig(total_steps=8, seq_len=8, warmup_steps=1)
     mesh = make_v5e_mesh(strict=False)
 
-    params, specs, _ = init_model_sharded(jax.random.PRNGKey(0), cfg, mesh)
+    params, specs, _ = init_model_sharded_mixed_precision(
+        jax.random.PRNGKey(0), cfg, mesh, payload_dtype=jnp.bfloat16
+    )
+    summary = precision_summary(params)
+    assert summary.get("bfloat16", 0) > 0
+    assert summary.get("float32", 0) > 0
+    assert params["embed"].dtype == jnp.bfloat16
+    assert params["blocks"][0]["attn_norm"]["weight"].dtype == jnp.float32
+
     opt_state, _ = init_optimizer_state_sharded(params, specs, cfg, mesh)
     step_fn = compile_pretrain_step(
         params,
@@ -169,7 +178,7 @@ def test_single_device_ci_can_compile_sharded_pretrain_step():
         n_segments=None,
     )
 
-    ids = (jnp.arange(8, dtype=jnp.int32)[None, :] % cfg.vocab_size)
+    ids = jnp.arange(8, dtype=jnp.int32)[None, :] % cfg.vocab_size
     segments = jnp.zeros_like(ids)
     mask = jnp.ones_like(ids, dtype=bool)
     ids, segments, mask = put_training_batch(ids, segments, mask, cfg, mesh)
@@ -184,5 +193,6 @@ def test_single_device_ci_can_compile_sharded_pretrain_step():
     )
     jax.block_until_ready(metrics["loss"])
     assert jnp.isfinite(metrics["loss"])
+    assert new_params["embed"].dtype == jnp.bfloat16
     assert jax.tree_util.tree_structure(new_params) == jax.tree_util.tree_structure(params)
     assert jax.tree_util.tree_structure(new_state) == jax.tree_util.tree_structure(opt_state)
