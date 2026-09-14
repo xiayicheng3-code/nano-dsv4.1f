@@ -10,6 +10,7 @@ from nano_dsv41f.config import (
     EngramConfig,
     IndexerConfig,
     ModelConfig,
+    ParallelismConfig,
     RematConfig,
     RopeConfig,
 )
@@ -82,6 +83,17 @@ def tiny_config(*, dspark=True) -> ModelConfig:
             n_routed_experts=2,
             experts_per_token=1,
             confidence_head=True,
+        ),
+        # Unit tests exercise model semantics on one CPU. v5e sharding is tested
+        # separately in tests/test_tpu.py and must not constrain tiny dimensions here.
+        parallelism=ParallelismConfig(
+            vocab_shard=1,
+            engram_table_shard=1,
+            expert_shard=1,
+            dspark_expert_shard=1,
+            attention_context_shard=1,
+            attention_head_shard=1,
+            indexer_context_shard=1,
         ),
     )
 
