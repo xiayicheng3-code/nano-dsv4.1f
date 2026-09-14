@@ -48,11 +48,18 @@ def _expert_forward(
     w3: jax.Array,
     swiglu_limit: float,
 ) -> jax.Array:
-    gate = jnp.einsum("...d,...df->...f", x, w1)
-    up = jnp.einsum("...d,...df->...f", x, w3)
+    """Expert payload follows expert matrix dtype (BF16 on the v5e path)."""
+    compute_dtype = w1.dtype
+    x_compute = x.astype(compute_dtype)
+    gate = jnp.einsum("...d,...df->...f", x_compute, w1)
+    up = jnp.einsum("...d,...df->...f", x_compute, w3)
     if swiglu_limit > 0:
-        gate = jnp.minimum(gate, swiglu_limit)
-        up = jnp.clip(up, -swiglu_limit, swiglu_limit)
+        gate = jnp.minimum(gate, jnp.asarray(swiglu_limit, dtype=gate.dtype))
+        up = jnp.clip(
+            up,
+            jnp.asarray(-swiglu_limit, dtype=up.dtype),
+            jnp.asarray(swiglu_limit, dtype=up.dtype),
+        )
     hidden = jax.nn.silu(gate) * up
     return jnp.einsum("...f,...fd->...d", hidden, w2)
 
@@ -65,11 +72,14 @@ def route_tokens(
     route_scale: float = 1.0,
     eps: float = 1e-20,
 ) -> tuple[jax.Array, jax.Array]:
+    """Route in FP32 even when expert matrices/residual payload use BF16."""
     logits = jnp.einsum(
-        "...d,de->...e", x.astype(jnp.float32), params["router_weight"]
+        "...d,de->...e",
+        x.astype(jnp.float32),
+        params["router_weight"].astype(jnp.float32),
     )
     raw = jnp.sqrt(jax.nn.softplus(logits))
-    selection = raw + params["router_bias"]
+    selection = raw + params["router_bias"].astype(jnp.float32)
     _, indices = jax.lax.top_k(selection, top_k)
     weights = jnp.take_along_axis(raw, indices, axis=-1)
     weights = weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), eps)
@@ -94,13 +104,17 @@ def apply_moe(
     w2 = experts["w2"][indices]
     w3 = experts["w3"][indices]
     selected = _expert_forward(x[..., None, :], w1, w2, w3, swiglu_limit)
-    routed = jnp.sum(weights[..., None] * selected, axis=-2)
+    routed = jnp.sum(
+        weights.astype(selected.dtype)[..., None] * selected,
+        axis=-2,
+    )
 
     shared = params["shared"]
     shared_out = _expert_forward(
         x, shared["w1"], shared["w2"], shared["w3"], swiglu_limit
     )
-    return routed + shared_out, {
+    out = routed.astype(x.dtype) + shared_out.astype(x.dtype)
+    return out.astype(x.dtype), {
         "router_indices": indices,
         "router_weights": weights,
     }
