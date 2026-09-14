@@ -5,7 +5,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from .model import init_model
 from .optimizer import OptimizerLeafState, classify_parameter, init_optimizer_state
@@ -97,22 +97,41 @@ def make_v5e_mesh(
     devices: tuple[jax.Device, ...] | list[jax.Device] | None = None,
     strict: bool = True,
 ) -> Mesh:
-    """Construct a topology-aware mesh using JAX's physical-device ordering helper.
+    """Construct a topology-aware mesh for the dense GSPMD baseline.
 
-    On the Kaggle target this is a 2x4 explicit mesh. For one-device CPU CI, `strict=False`
-    yields a one-axis mesh so sharding helpers remain executable without pretending the CPU
-    runner is a TPU.
+    The first real v5e run exposed why fully explicit axes are too strict for the readable
+    dense reference: the same physical axes are intentionally reused for context sharding,
+    vocabulary capacity and expert capacity, and operations such as embedding gathers and
+    dense QK products need compiler-inserted resharding/collectives between those layouts.
+
+    We therefore keep concrete NamedSharding constraints on parameters, batches and final
+    state, but mark the mesh axes ``Auto`` so XLA may choose legal intermediate shardings.
+    Splash/shard_map kernels can still take manual control locally where their communication
+    pattern is known. This is a baseline for measurement, not a claim of optimal collectives.
+
+    On Kaggle the physical mesh is 2x4. For one-device CPU tests, ``strict=False`` yields a
+    one-axis Auto mesh so the same helpers remain executable without pretending CPU is TPU.
     """
     devs = tuple(jax.devices() if devices is None else devices)
     if len(devs) == V5E.chips_per_host:
-        return jax.make_mesh(V5E.topology, V5E_AXIS_NAMES, devices=devs)
+        return jax.make_mesh(
+            V5E.topology,
+            V5E_AXIS_NAMES,
+            (AxisType.Auto, AxisType.Auto),
+            devices=devs,
+        )
     if strict:
         raise ValueError(
             f"v5e mesh requires exactly {V5E.chips_per_host} devices, got {len(devs)}"
         )
     if not devs:
         raise ValueError("cannot build a mesh without devices")
-    return jax.make_mesh((len(devs),), ("x",), devices=devs)
+    return jax.make_mesh(
+        (len(devs),),
+        ("x",),
+        (AxisType.Auto,),
+        devices=devs,
+    )
 
 
 def axes_for_shard_count(mesh: Mesh, shards: int, *, strict: bool = True):
