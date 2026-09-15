@@ -32,7 +32,7 @@ from .profiling import (
 from .tpu import (
     V5E,
     batch_named_sharding,
-    compile_pretrain_step,
+    compile_pretrain_step as compile_pretrain_step_reference,
     init_model_sharded,
     init_optimizer_state_sharded,
     make_v5e_mesh,
@@ -44,6 +44,7 @@ from .tpu import (
     validate_sequence_length,
     validate_v5e_runtime,
 )
+from .tpu_native import TPUNativeConfig, compile_pretrain_step_native
 from .training import (
     build_indexer_groups,
     causal_lm_loss,
@@ -52,6 +53,10 @@ from .training import (
     pretrain_step,
     selective_indexer_distillation_loss,
 )
+
+# Kaggle/v5e callers get the memory-bounded native executable by default. The old
+# auto-sharded dense compiler remains explicitly available for reference/ablation work.
+compile_pretrain_step = compile_pretrain_step_native
 
 __all__ = [
     "AttentionConfig",
@@ -66,6 +71,7 @@ __all__ = [
     "QuantizationConfig",
     "RematConfig",
     "RopeConfig",
+    "TPUNativeConfig",
     "TrainConfig",
     "V5E",
     "apply_dspark",
@@ -79,6 +85,8 @@ __all__ = [
     "collective_counts",
     "compile_diagnostics",
     "compile_pretrain_step",
+    "compile_pretrain_step_native",
+    "compile_pretrain_step_reference",
     "compiled_cost_report",
     "compiled_memory_report",
     "indexer_phase_enabled",
