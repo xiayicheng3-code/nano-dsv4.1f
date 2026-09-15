@@ -28,11 +28,7 @@ from .splash import _splash_modules
 
 @dataclass(frozen=True)
 class TPUNativeConfig:
-    """Execution knobs for the v5e-native training backend.
-
-    The semantic/reference model remains unchanged when no native context is active.
-    These options only affect the executable built by ``compile_pretrain_step``.
-    """
+    """Execution knobs for the v5e-native training backend."""
 
     use_splash_attention: bool = True
     use_expert_parallel_moe: bool = True
@@ -79,18 +75,18 @@ def tpu_native_context(mesh: Mesh, options: TPUNativeConfig):
 
 
 def manual_v5e_mesh(mesh: Mesh, axis_name: str = "tp") -> Mesh:
-    """Flatten the topology-aware Auto mesh into one explicit manual SPMD axis.
+    """Flatten the topology-aware mesh into one shard_map-local SPMD axis.
 
-    The device order comes from the original 2x4 topology-aware mesh. The one-dimensional
-    manual view gives ``shard_map`` one stable meaning for the same eight physical chips:
-    sequence shards for Splash and one routed expert per chip for MoE.
+    The flat mesh remains Auto to surrounding JAX.  ``shard_map`` itself owns the manual
+    interpretation of ``tp``; this prevents manual-axis annotations from leaking into
+    ordinary model matmuls such as the LM head.
     """
     key = (id(mesh), axis_name)
     cached = _MANUAL_MESH_CACHE.get(key)
     if cached is not None:
         return cached
     devices = np.asarray(mesh.devices, dtype=object).reshape(-1)
-    manual = Mesh(devices, (axis_name,), axis_types=(AxisType.Explicit,))
+    manual = Mesh(devices, (axis_name,), axis_types=(AxisType.Auto,))
     _MANUAL_MESH_CACHE[key] = manual
     return manual
 
@@ -133,16 +129,12 @@ def apply_moe_v5e(
     eps: float,
     state: TPUNativeState,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Static-capacity expert-parallel MoE for v5e-8.
+    """Memory-bounded static-capacity expert parallelism for v5e-8.
 
-    Tokens are context-sharded over eight chips while the eight routed experts are sharded
-    one-per-chip. We all-gather compact token/router payloads, each device selects a fixed
-    capacity of assignments for its resident expert, computes only that expert, then sums
-    expert contributions and slices the original local token shard back out.
-
-    This intentionally favors a simple, differentiable and memory-bounded first backend over
-    a fully ragged all-to-all kernel. It removes the pathological reference expression
-    ``expert_weights[per_token_indices]`` which duplicates whole expert matrices per token.
+    Eight backbone routed experts map one-per-chip.  Compact token/router payloads move;
+    expert matrices stay resident.  This removes the reference path's per-token gather of
+    whole expert matrices.  A later ragged/all-to-all kernel can optimize communication
+    without changing these semantics.
     """
     n_experts = int(params["experts"]["w1"].shape[0])
     manual = manual_v5e_mesh(state.mesh, state.options.manual_axis_name)
@@ -189,8 +181,6 @@ def apply_moe_v5e(
             route_scale=route_scale,
             eps=eps,
         )
-
-        # Token vectors are cheap to communicate; expert matrices remain resident.
         global_x = jax.lax.all_gather(local_x, axis, axis=1, tiled=True)
         global_weights = jax.lax.all_gather(local_weights, axis, axis=1, tiled=True)
         global_indices = jax.lax.all_gather(local_indices, axis, axis=1, tiled=True)
@@ -232,7 +222,6 @@ def apply_moe_v5e(
         routed_local = jax.lax.dynamic_slice_in_dim(
             routed_global, start, local_tokens, axis=1
         )
-
         shared = local_params["shared"]
         shared_out = _expert_forward(
             local_x,
@@ -242,7 +231,6 @@ def apply_moe_v5e(
             swiglu_limit,
         )
         out = routed_local.astype(local_x.dtype) + shared_out.astype(local_x.dtype)
-
         load = jnp.sum(matches.astype(jnp.int32))[None]
         overflow = jnp.maximum(load - capacity, 0)
         return out.astype(local_x.dtype), local_weights, local_indices, load, overflow
@@ -338,8 +326,6 @@ def _splash_runner(
     shards = int(manual.size)
     if seq_len % shards:
         raise ValueError("Splash query length must divide evenly over all v5e chips")
-    # Default TPU Splash tiles Q in 128-row blocks. Keeping this hard guard makes a
-    # failure obvious instead of silently falling back to the dense T^2 reference.
     if (seq_len // shards) % 128:
         raise ValueError(
             f"TPU Splash needs 128-row Q tiles per shard; got {seq_len // shards}"
@@ -371,8 +357,8 @@ def _splash_runner(
         interpret=state.options.splash_interpret,
     )
     kernel_spec = kernel.manual_sharding_spec(NamedSharding(manual, P(None, axis)))
-    q_spec = P(None, None, axis, None)  # [B,H,T,D]
-    kv_spec = P()  # compact latent KV is small enough to replicate
+    q_spec = P(None, None, axis, None)
+    kv_spec = P()
     q_segment_spec = P(None, axis)
     kv_segment_spec = P()
     lse_spec = P(None, None, axis)
@@ -514,8 +500,6 @@ def apply_csa2_attention_v5e(
     compute_indexer: bool = True,
     state: TPUNativeState,
 ):
-    # Full retrieval diagnostics still use the readable dense path; ordinary base/late
-    # pretraining calls with compute_indexer=False and gets the native kernel path.
     if compute_indexer:
         from .csa2 import apply_csa2_attention as reference_attention
 
@@ -546,9 +530,7 @@ def apply_csa2_attention_v5e(
     )
 
     local_kv = rms_norm(
-        linear(x, params["local_kv"]),
-        params["local_kv_norm"],
-        eps=config.norm_eps,
+        linear(x, params["local_kv"]), params["local_kv_norm"], eps=config.norm_eps
     )
     local_kv = apply_partial_rope(
         local_kv,
@@ -657,13 +639,7 @@ def apply_csa2_attention_dispatch(*args, **kwargs):
 
 
 def install_model_dispatch() -> None:
-    """Install backend-dispatching call targets into ``model`` once.
-
-    ``model._apply_block`` resolves ``apply_moe`` and ``apply_csa2_attention`` through the
-    module globals at trace time. Rebinding those globals to dispatchers keeps the public
-    reference API unchanged: outside ``tpu_native_context`` the dispatchers immediately call
-    the original dense implementations; inside the context they emit the v5e-native graph.
-    """
+    """Install context-sensitive native/reference call targets into ``model`` once."""
     from . import model as model_module
 
     if model_module.apply_moe is not apply_moe_dispatch:
@@ -679,8 +655,7 @@ class _NativeLowered:
         self._options = options
 
     def compile(self, *args, **kwargs):
-        manual = manual_v5e_mesh(self._mesh, self._options.manual_axis_name)
-        with tpu_native_context(self._mesh, self._options), jax.set_mesh(manual):
+        with tpu_native_context(self._mesh, self._options):
             return self._lowered.compile(*args, **kwargs)
 
     def __getattr__(self, name):
@@ -688,7 +663,7 @@ class _NativeLowered:
 
 
 class NativeCompiledStep:
-    """Jitted step wrapper that activates manual TPU axes only while tracing/executing."""
+    """Jitted step wrapper that activates native dispatch while tracing/executing."""
 
     def __init__(self, jitted, mesh: Mesh, options: TPUNativeConfig):
         self._jitted = jitted
@@ -696,13 +671,11 @@ class NativeCompiledStep:
         self._options = options
 
     def __call__(self, *args, **kwargs):
-        manual = manual_v5e_mesh(self._mesh, self._options.manual_axis_name)
-        with tpu_native_context(self._mesh, self._options), jax.set_mesh(manual):
+        with tpu_native_context(self._mesh, self._options):
             return self._jitted(*args, **kwargs)
 
     def lower(self, *args, **kwargs):
-        manual = manual_v5e_mesh(self._mesh, self._options.manual_axis_name)
-        with tpu_native_context(self._mesh, self._options), jax.set_mesh(manual):
+        with tpu_native_context(self._mesh, self._options):
             lowered = self._jitted.lower(*args, **kwargs)
         return _NativeLowered(lowered, self._mesh, self._options)
 
