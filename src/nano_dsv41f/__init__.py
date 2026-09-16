@@ -22,6 +22,15 @@ from .chat_protocol import (
     validate_model_token_ids,
 )
 from .agent_data import CleanPolicy, TraceNormalizationError, normalize_agent_trace
+from .reasoning_effort import (
+    assign_length_guided_reasoning_effort,
+    character_reasoning_length,
+    missing_reasoning_efforts,
+    reasoning_effort_histogram,
+    reasoning_text,
+    render_v41_reasoning_effort_prompt,
+    tokenizer_reasoning_length,
+)
 from .dspark import apply_dspark, sample_markov_block
 from .model import apply_model, apply_model_dspark, build_layer_specs, init_model
 from .hf_export import (
@@ -96,6 +105,7 @@ __all__ = [
     "apply_tokenizer_contract",
     "apply_model",
     "apply_model_dspark",
+    "assign_length_guided_reasoning_effort",
     "batch_named_sharding",
     "build_deepseek_v41_probe_config",
     "build_indexer_groups",
@@ -103,6 +113,7 @@ __all__ = [
     "build_nano_hf_config",
     "cast_payload_parameters",
     "causal_lm_loss",
+    "character_reasoning_length",
     "collective_counts",
     "compile_diagnostics",
     "compile_pretrain_step",
@@ -120,6 +131,7 @@ __all__ = [
     "init_optimizer_state_sharded",
     "make_v5e_mesh",
     "memory_report",
+    "missing_reasoning_efforts",
     "nano_v41_tokenizer_contract",
     "normalize_agent_trace",
     "optimizer_step",
@@ -129,11 +141,15 @@ __all__ = [
     "pretrain_loss",
     "pretrain_step",
     "put_training_batch",
+    "reasoning_effort_histogram",
+    "reasoning_text",
+    "render_v41_reasoning_effort_prompt",
     "runtime_compatibility_report",
     "runtime_report",
     "sample_markov_block",
     "selective_indexer_distillation_loss",
     "semantic_axes",
+    "tokenizer_reasoning_length",
     "validate_model_token_ids",
     "validate_sequence_length",
     "validate_v5e_runtime",
