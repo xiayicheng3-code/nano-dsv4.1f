@@ -33,14 +33,20 @@ def latest_teacher_indices(
     min_local_position: int | None = None,
     local_window: int | None = None,
     retrieve_top_k: int | None = None,
+    token_mask: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Return one fixed-shape latest eligible teacher query per packed segment.
+    """Return one fixed-shape latest eligible *real* query per packed segment.
 
+    `segment_ids` describes physical ratio-aligned packing, so a segment may end in one or
+    more masked padding tokens. `token_mask` prevents those padding positions from becoming
+    teacher queries while local positions still count from the physical segment start.
     `min_local_position` is the preferred explicit threshold. The window/top-k pair is kept
     for backwards compatibility with the original 640-history helper.
     """
     if segment_ids.ndim != 1:
         raise ValueError("segment_ids must be rank-1")
+    if token_mask is not None and token_mask.shape != segment_ids.shape:
+        raise ValueError("token_mask must match segment_ids")
     if n_segments <= 0:
         raise ValueError("n_segments must be positive")
     if min_local_position is None:
@@ -54,6 +60,7 @@ def latest_teacher_indices(
     starts = jnp.concatenate(
         [jnp.array([True]), segment_ids[1:] != segment_ids[:-1]]
     )
+    real = jnp.ones_like(segment_ids, dtype=bool) if token_mask is None else token_mask
     segment_start = jnp.stack(
         [
             jnp.max(jnp.where((segment_ids == s) & starts, pos, -1))
@@ -62,12 +69,16 @@ def latest_teacher_indices(
     )
     segment_end = jnp.stack(
         [
-            jnp.max(jnp.where(segment_ids == s, pos, -1))
+            jnp.max(jnp.where((segment_ids == s) & real, pos, -1))
             for s in range(n_segments)
         ]
     )
     local_end = segment_end - segment_start
-    valid = (segment_start >= 0) & (local_end >= min_local_position)
+    valid = (
+        (segment_start >= 0)
+        & (segment_end >= 0)
+        & (local_end >= min_local_position)
+    )
     return jnp.where(valid, segment_end, 0), valid
 
 
@@ -76,17 +87,29 @@ def latest_teacher_indices_batched(
     *,
     n_segments: int,
     min_local_position: int,
+    token_mask: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Batch-vmap the fixed-shape selector, returning [B, n_segments]."""
     if segment_ids.ndim != 2:
         raise ValueError("segment_ids must be [batch,tokens]")
+    if token_mask is not None and token_mask.shape != segment_ids.shape:
+        raise ValueError("token_mask must match segment_ids")
+    if token_mask is None:
+        return jax.vmap(
+            lambda row: latest_teacher_indices(
+                row,
+                n_segments=n_segments,
+                min_local_position=min_local_position,
+            )
+        )(segment_ids)
     return jax.vmap(
-        lambda row: latest_teacher_indices(
+        lambda row, mask: latest_teacher_indices(
             row,
             n_segments=n_segments,
             min_local_position=min_local_position,
+            token_mask=mask,
         )
-    )(segment_ids)
+    )(segment_ids, token_mask)
 
 
 def dense_teacher_mass(
