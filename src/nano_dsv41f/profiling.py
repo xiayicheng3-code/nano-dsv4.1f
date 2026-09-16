@@ -13,6 +13,31 @@ _COLLECTIVE_TOKENS = {
 }
 
 
+class DiagnosticExecutable:
+    """Expose AOT diagnostics while preserving the caller's execution wrapper.
+
+    A native TPU step is not just a raw ``jax.stages.Compiled`` object: its Python wrapper
+    activates context-sensitive Splash/MoE dispatch before entering the jitted function.
+    Calling the raw AOT object returned by ``lower().compile()`` can therefore bypass that
+    wrapper and, with JAX captured constants, produce a flattened-input signature mismatch.
+
+    Attribute access is delegated to the AOT executable so callers can still inspect memory,
+    cost analysis and other compiled metadata. Calling the object delegates to the original
+    jitted/wrapped function, which preserves its execution semantics.
+    """
+
+    def __init__(self, compiled, runner):
+        self._compiled = compiled
+        self._runner = runner
+
+    def __call__(self, *args, **kwargs):
+        return self._runner(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._compiled, name)
+
+
+
 def collective_counts(lowered_or_text: Any) -> dict[str, int]:
     """Best-effort StableHLO collective count for notebook comparisons.
 
@@ -30,6 +55,7 @@ def collective_counts(lowered_or_text: Any) -> dict[str, int]:
     for name, tokens in _COLLECTIVE_TOKENS.items():
         counts[name] = max(lowered.count(token) for token in tokens)
     return counts
+
 
 
 def compiled_memory_report(compiled) -> dict[str, float] | None:
@@ -50,6 +76,7 @@ def compiled_memory_report(compiled) -> dict[str, float] | None:
         "alias_gib": alias / gib,
         "estimated_total_gib": total / gib,
     }
+
 
 
 def compiled_cost_report(compiled) -> dict[str, float]:
@@ -73,11 +100,18 @@ def compiled_cost_report(compiled) -> dict[str, float]:
     return dict(out)
 
 
+
 def compile_diagnostics(jitted_fn, *args):
-    """Lower/compile without executing and return the object plus lightweight diagnostics."""
+    """Lower/compile without executing and return a safe callable plus diagnostics.
+
+    The returned object delegates diagnostics to the AOT executable, but delegates execution
+    to ``jitted_fn`` itself. This matters for context-sensitive native TPU wrappers and is
+    harmless for ordinary ``jax.jit`` callables.
+    """
     lowered = jitted_fn.lower(*args)
     compiled = lowered.compile()
-    return compiled, {
+    executable = DiagnosticExecutable(compiled, jitted_fn)
+    return executable, {
         "collectives": collective_counts(lowered),
         "memory": compiled_memory_report(compiled),
         "cost": compiled_cost_report(compiled),
