@@ -45,6 +45,7 @@ from .tpu import (
     validate_v5e_runtime,
 )
 from .tpu_native import TPUNativeConfig, compile_pretrain_step_native
+from . import tpu_native_trace_safety as _tpu_native_trace_safety
 from .training import (
     build_indexer_groups,
     causal_lm_loss,
