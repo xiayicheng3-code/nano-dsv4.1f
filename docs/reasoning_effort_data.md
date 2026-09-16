@@ -35,12 +35,16 @@ Character length is available only as an early fallback.
 2. measures the sum of assistant reasoning spans;
 3. sorts examples by measured reasoning length;
 4. maps empirical rank monotonically across integer efforts 1..100;
-5. keeps one untouched **coverage anchor** for every base effort;
-6. applies a small seeded jitter (default +/-2) only to duplicate percentile buckets.
+5. keeps the shortest and longest eligible examples fixed at the endpoint labels and keeps
+   one untouched **coverage anchor** for every base effort;
+6. applies a small seeded jitter (default +/-2) only to non-anchor duplicate percentile
+   buckets.
 
 With at least 100 eligible examples, the base rank mapping necessarily touches all 100
 integer efforts. Protecting one anchor per bucket means the random deviation cannot remove
-that coverage.
+that coverage. Protecting the empirical endpoints separately also guarantees that the
+shortest and longest examples retain efforts 1 and 100 whenever more than one example is
+eligible, even when several ranks share the endpoint bucket.
 
 This is deliberately a *soft control label*, not a claim that effort 73 should always mean
 an exact number of tokens. The jitter prevents the model from learning a brittle lookup from
