@@ -19,10 +19,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .tokenizer-bootstrap/part-* | base64 --decode > /tmp/nano-dsv41f-tokenizer.zip
-          echo 'b1413976b26632221d5c29fa3d8135d43c4862822514eb6c307188c98720fbba  /tmp/nano-dsv41f-tokenizer.zip' | sha256sum -c -
+          cat .tokenizer-bootstrap/part-* | base64 --decode > /tmp/nano-tokenizer.tar.xz
+          echo 'da4e0687ec3e0afeae45672f45042695a88655090c909bde5a91837ad92e372c  /tmp/nano-tokenizer.tar.xz' | sha256sum -c -
           mkdir -p artifacts/tokenizer
-          unzip -q /tmp/nano-dsv41f-tokenizer.zip -d artifacts/tokenizer
+          tar -xJf /tmp/nano-tokenizer.tar.xz -C artifacts/tokenizer
           python - <<'PY'
           import hashlib, json, pathlib
           root = pathlib.Path('artifacts/tokenizer')
