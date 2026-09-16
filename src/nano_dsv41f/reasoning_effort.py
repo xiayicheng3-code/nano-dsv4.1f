@@ -115,9 +115,11 @@ def assign_length_guided_reasoning_effort(
     necessarily contains every effort integer.
 
     A small deterministic jitter is then applied only to *duplicate* percentile buckets.
-    One anchor example for every base effort remains untouched, so full 1..100 coverage
-    cannot be destroyed by jitter. This exposes nearby effort values without turning the
-    label into a brittle exact function of target length.
+    The shortest and longest eligible examples remain fixed at the percentile endpoints,
+    and one anchor example for every base effort remains untouched. Thus full 1..100
+    coverage cannot be destroyed by jitter, and the empirical extremes keep labels 1 and
+    100 whenever there is more than one eligible example. This exposes nearby effort values
+    without turning the label into a brittle exact function of target length.
 
     The original messages/reasoning are never modified. Assignment provenance is stored
     under ``metadata.reasoning_effort_assignment``.
@@ -144,10 +146,12 @@ def assign_length_guided_reasoning_effort(
     count = len(eligible)
     base_efforts = [_percentile_effort(rank, count) for rank in range(count)]
 
-    # Protect one example per base effort as a coverage anchor. When count >= 100 the
-    # monotone rank mapping contains every integer 1..100, so anchors guarantee final
-    # coverage even after jittering the duplicate assignments.
-    anchor_ranks: set[int] = set()
+    # Protect both empirical endpoints plus one example per base effort as coverage
+    # anchors. The final-rank protection matters when several ranks map to effort 100:
+    # otherwise the first 100-valued rank is anchored while the actual longest example
+    # can still be jittered down to 99. When count >= 100, the remaining anchors preserve
+    # complete 1..100 coverage.
+    anchor_ranks: set[int] = {0, count - 1} if count > 1 else set()
     seen_efforts: set[int] = set()
     for rank, effort in enumerate(base_efforts):
         if effort not in seen_efforts:
