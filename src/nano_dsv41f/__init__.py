@@ -15,8 +15,22 @@ from .config import (
     RopeConfig,
     TrainConfig,
 )
+from .chat_protocol import (
+    TokenizerContract,
+    apply_tokenizer_contract,
+    nano_v41_tokenizer_contract,
+    validate_model_token_ids,
+)
+from .agent_data import CleanPolicy, TraceNormalizationError, normalize_agent_trace
 from .dspark import apply_dspark, sample_markov_block
 from .model import apply_model, apply_model_dspark, build_layer_specs, init_model
+from .hf_export import (
+    build_deepseek_v41_probe_config,
+    build_nano_hf_config,
+    export_portable_checkpoint,
+    flatten_parameter_tree,
+    runtime_compatibility_report,
+)
 from .optimizer import init_optimizer_state, optimizer_step, parameter_rule_map
 from .precision import (
     cast_payload_parameters,
@@ -61,6 +75,9 @@ compile_pretrain_step = compile_pretrain_step_native
 
 __all__ = [
     "AttentionConfig",
+    "CleanPolicy",
+    "TokenizerContract",
+    "TraceNormalizationError",
     "CSA2Config",
     "DSparkConfig",
     "EngramConfig",
@@ -76,11 +93,14 @@ __all__ = [
     "TrainConfig",
     "V5E",
     "apply_dspark",
+    "apply_tokenizer_contract",
     "apply_model",
     "apply_model_dspark",
     "batch_named_sharding",
+    "build_deepseek_v41_probe_config",
     "build_indexer_groups",
     "build_layer_specs",
+    "build_nano_hf_config",
     "cast_payload_parameters",
     "causal_lm_loss",
     "collective_counts",
@@ -90,6 +110,8 @@ __all__ = [
     "compile_pretrain_step_reference",
     "compiled_cost_report",
     "compiled_memory_report",
+    "export_portable_checkpoint",
+    "flatten_parameter_tree",
     "indexer_phase_enabled",
     "init_model",
     "init_model_sharded",
@@ -98,6 +120,8 @@ __all__ = [
     "init_optimizer_state_sharded",
     "make_v5e_mesh",
     "memory_report",
+    "nano_v41_tokenizer_contract",
+    "normalize_agent_trace",
     "optimizer_step",
     "parameter_partition_specs",
     "parameter_rule_map",
@@ -105,10 +129,12 @@ __all__ = [
     "pretrain_loss",
     "pretrain_step",
     "put_training_batch",
+    "runtime_compatibility_report",
     "runtime_report",
     "sample_markov_block",
     "selective_indexer_distillation_loss",
     "semantic_axes",
+    "validate_model_token_ids",
     "validate_sequence_length",
     "validate_v5e_runtime",
 ]
