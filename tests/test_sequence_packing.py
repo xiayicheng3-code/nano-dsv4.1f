@@ -3,6 +3,7 @@ import numpy as np
 
 from nano_dsv41f.indexer import latest_teacher_indices_batched
 from nano_dsv41f.sequence_packing import pack_token_sequences
+from nano_dsv41f.training import causal_lm_loss
 
 
 def test_odd_documents_pack_to_ratio_aligned_segments_without_fake_teachers():
@@ -22,6 +23,15 @@ def test_odd_documents_pack_to_ratio_aligned_segments_without_fake_teachers():
     assert packed.segment_ids.shape == (1, 2048)
     assert packed.token_mask.shape == (1, 2048)
     assert int(packed.token_mask.sum()) == 2045
+
+    logits = jnp.zeros((1, 2048, 2048), dtype=jnp.float32)
+    _, lm_tokens = causal_lm_loss(
+        logits,
+        jnp.asarray(packed.input_ids),
+        jnp.asarray(packed.segment_ids),
+        token_mask=jnp.asarray(packed.token_mask),
+    )
+    assert int(lm_tokens) == 2042
 
     indices, valid = latest_teacher_indices_batched(
         jnp.asarray(packed.segment_ids),
