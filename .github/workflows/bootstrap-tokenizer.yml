@@ -1,0 +1,46 @@
+name: Bootstrap tokenizer artifacts
+
+on:
+  push:
+    paths:
+      - '.tokenizer-bootstrap/READY'
+
+permissions:
+  contents: write
+
+jobs:
+  unpack-tokenizer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reconstruct tokenizer archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .tokenizer-bootstrap/part-* | base64 --decode > /tmp/nano-dsv41f-tokenizer.zip
+          echo 'b1413976b26632221d5c29fa3d8135d43c4862822514eb6c307188c98720fbba  /tmp/nano-dsv41f-tokenizer.zip' | sha256sum -c -
+          mkdir -p artifacts/tokenizer
+          unzip -q /tmp/nano-dsv41f-tokenizer.zip -d artifacts/tokenizer
+          python - <<'PY'
+          import hashlib, json, pathlib
+          root = pathlib.Path('artifacts/tokenizer')
+          checks = json.loads((root / 'SHA256SUMS.json').read_text())
+          for name, expected in checks.items():
+              got = hashlib.sha256((root / name).read_bytes()).hexdigest()
+              if got != expected:
+                  raise SystemExit(f'checksum mismatch for {name}: {got} != {expected}')
+          print('Tokenizer checksums verified.')
+          PY
+      - name: Commit tokenizer artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .tokenizer-bootstrap
+          git rm .github/workflows/bootstrap-tokenizer.yml
+          git add artifacts/tokenizer
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Add trained nano-dsv4.1f tokenizer artifacts'
+          git push
