@@ -42,6 +42,8 @@ def test_length_percentiles_cover_every_integer_effort_when_dataset_is_large_eno
     assert missing_reasoning_efforts(assigned) == ()
     assert assigned[0]["reasoning_effort"] == 1
     assert assigned[-1]["reasoning_effort"] == 100
+    assert assigned[0]["metadata"]["reasoning_effort_assignment"]["jitter"] == 0
+    assert assigned[-1]["metadata"]["reasoning_effort_assignment"]["jitter"] == 0
     assert all(1 <= case["reasoning_effort"] <= 100 for case in assigned)
     assert any(
         case["metadata"]["reasoning_effort_assignment"]["jitter"] != 0
