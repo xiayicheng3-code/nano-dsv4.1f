@@ -64,6 +64,16 @@ def _expert_forward(
     return jnp.einsum("...f,...fd->...d", hidden, w2)
 
 
+def _expert_forward_fused(x, w1, w2, w3, swiglu_limit):
+    """Resident-weight expert: one wide gate/up GEMM, then one down GEMM."""
+    gate_up = x.astype(w1.dtype) @ jnp.concatenate((w1, w3), axis=-1)
+    gate, up = jnp.split(gate_up, 2, axis=-1)
+    if swiglu_limit > 0:
+        gate = jnp.minimum(gate, jnp.asarray(swiglu_limit, gate.dtype))
+        up = jnp.clip(up, -swiglu_limit, swiglu_limit)
+    return (jax.nn.silu(gate) * up) @ w2
+
+
 def route_tokens(
     x: jax.Array,
     params: dict[str, object],

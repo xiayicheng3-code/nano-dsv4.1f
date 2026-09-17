@@ -173,6 +173,7 @@ def apply_dspark(
         params["mhc_attn"],
         sinkhorn_iters=config.mhc_sinkhorn_iters,
         eps=config.mhc_eps,
+        norm_eps=config.norm_eps,
     )
     x = rms_norm(pre_mix(streams, incoming_pre), params["attn_norm"], eps=config.norm_eps)
     qr = rms_norm(linear(x, params["q_a"]), params["q_norm"], eps=config.norm_eps)
@@ -251,6 +252,7 @@ def apply_dspark(
         params["mhc_ffn"],
         sinkhorn_iters=config.mhc_sinkhorn_iters,
         eps=config.mhc_eps,
+        norm_eps=config.norm_eps,
     )
     ffn_x = rms_norm(pre_mix(streams, attn_pre), params["ffn_norm"], eps=config.norm_eps)
     ffn_out, moe_aux = apply_moe(

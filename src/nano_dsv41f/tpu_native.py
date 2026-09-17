@@ -14,7 +14,6 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from .csa2 import (
     SharedCSA2State,
     _build_global_state,
-    _global_mask,
     _rope_kwargs,
     grouped_output_projection,
     segment_local_positions,
@@ -129,120 +128,13 @@ def apply_moe_v5e(
     eps: float,
     state: TPUNativeState,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    """Memory-bounded static-capacity expert parallelism for v5e-8.
+    """Compatibility entry point for the unified dropless multi-expert kernel."""
+    from .tpu_moe import apply_moe_v5e_multi
 
-    Eight backbone routed experts map one-per-chip.  Compact token/router payloads move;
-    expert matrices stay resident.  This removes the reference path's per-token gather of
-    whole expert matrices.  A later ragged/all-to-all kernel can optimize communication
-    without changing these semantics.
-    """
-    n_experts = int(params["experts"]["w1"].shape[0])
-    manual = manual_v5e_mesh(state.mesh, state.options.manual_axis_name)
-    if n_experts != int(manual.size):
-        return apply_moe_reference(
-            x,
-            params,
-            top_k=top_k,
-            route_scale=route_scale,
-            swiglu_limit=swiglu_limit,
-            eps=eps,
-        )
-    if x.ndim != 3:
-        raise ValueError("v5e EP MoE expects x=[batch,tokens,dim]")
-
-    batch, tokens, dim = map(int, x.shape)
-    capacity = moe_capacity(
-        batch * tokens,
-        top_k=top_k,
-        n_experts=n_experts,
-        capacity_factor=state.options.moe_capacity_factor,
-        multiple=state.options.moe_capacity_multiple,
+    return apply_moe_v5e_multi(
+        x, params, top_k=top_k, route_scale=route_scale,
+        swiglu_limit=swiglu_limit, eps=eps, state=state,
     )
-    axis = state.options.manual_axis_name
-    param_specs = _moe_param_specs(axis)
-
-    @jax.shard_map(
-        mesh=manual,
-        in_specs=(P(None, axis, None), param_specs),
-        out_specs=(
-            P(None, axis, None),
-            P(None, axis, None),
-            P(None, axis, None),
-            P(axis),
-            P(axis),
-        ),
-        check_vma=False,
-    )
-    def _mapped(local_x, local_params):
-        local_weights, local_indices = route_tokens(
-            local_x,
-            local_params,
-            top_k=top_k,
-            route_scale=route_scale,
-            eps=eps,
-        )
-        global_x = jax.lax.all_gather(local_x, axis, axis=1, tiled=True)
-        global_weights = jax.lax.all_gather(local_weights, axis, axis=1, tiled=True)
-        global_indices = jax.lax.all_gather(local_indices, axis, axis=1, tiled=True)
-
-        n_global = int(global_x.shape[0] * global_x.shape[1])
-        flat_x = global_x.reshape(n_global, dim)
-        flat_weights = global_weights.reshape(n_global * top_k)
-        flat_indices = global_indices.reshape(n_global * top_k)
-
-        expert_id = jax.lax.axis_index(axis)
-        matches = flat_indices == expert_id
-        selected_valid, selected_assignment = jax.lax.top_k(
-            matches.astype(jnp.int32), capacity
-        )
-        selected_token = selected_assignment // top_k
-        selected_x = flat_x[selected_token]
-
-        experts = local_params["experts"]
-        selected_out = _expert_forward(
-            selected_x,
-            experts["w1"][0],
-            experts["w2"][0],
-            experts["w3"][0],
-            swiglu_limit,
-        )
-        selected_out = selected_out * (
-            flat_weights[selected_assignment, None].astype(selected_out.dtype)
-            * selected_valid[:, None].astype(selected_out.dtype)
-        )
-
-        contribution = jnp.zeros((n_global, dim), dtype=selected_out.dtype).at[
-            selected_token
-        ].add(selected_out)
-        contribution = contribution.reshape(global_x.shape)
-        routed_global = jax.lax.psum(contribution, axis)
-
-        local_tokens = int(local_x.shape[1])
-        start = expert_id * local_tokens
-        routed_local = jax.lax.dynamic_slice_in_dim(
-            routed_global, start, local_tokens, axis=1
-        )
-        shared = local_params["shared"]
-        shared_out = _expert_forward(
-            local_x,
-            shared["w1"],
-            shared["w2"],
-            shared["w3"],
-            swiglu_limit,
-        )
-        out = routed_local.astype(local_x.dtype) + shared_out.astype(local_x.dtype)
-        load = jnp.sum(matches.astype(jnp.int32))[None]
-        overflow = jnp.maximum(load - capacity, 0)
-        return out.astype(local_x.dtype), local_weights, local_indices, load, overflow
-
-    out, weights, indices, loads, overflow = _mapped(x, params)
-    return out, {
-        "router_indices": indices,
-        "router_weights": weights,
-        "expert_loads": loads,
-        "expert_overflow": overflow,
-        "expert_capacity": jnp.asarray(capacity, dtype=jnp.int32),
-    }
 
 
 def apply_moe_dispatch(
@@ -463,26 +355,9 @@ def _combined_splash_attention(
     )
     out = runner(q, kv, segment_ids, kv_segments, sinks)
 
-    teacher_lse = None
-    if state.options.need_teacher_lse:
-        teacher_runner = _splash_runner(
-            state,
-            seq_len=seq_len,
-            kv_len=int(kv.shape[1]),
-            n_heads=int(q.shape[-2]),
-            head_dim=int(q.shape[-1]),
-            mask_array=mask,
-            save_residuals=True,
-        )
-        _, teacher_lse = teacher_runner(
-            jax.lax.stop_gradient(q),
-            jax.lax.stop_gradient(kv),
-            segment_ids,
-            kv_segments,
-            jax.lax.stop_gradient(sinks),
-        )
-        teacher_lse = jax.lax.stop_gradient(teacher_lse)
-    return out, teacher_lse
+    # Late distillation reconstructs the denominator only for selected query rows.
+    # Running Splash again for every query just to obtain LSE doubled forward work.
+    return out, None
 
 
 def apply_csa2_attention_v5e(
@@ -569,7 +444,7 @@ def apply_csa2_attention_v5e(
         if shared_state is None:
             raise ValueError(f"CSA2 {mode} layer {layer_id} has no shared compressed state")
         active_global = shared_state
-        global_valid = _global_mask(segment_ids, shared_state, ac.local_window)
+        # Do not materialize [B,T,K] for a loss that uses only [B,Q,K].
 
     merged, total_lse = _combined_splash_attention(
         q,
@@ -624,6 +499,8 @@ def apply_csa2_attention_v5e(
         if active_state is None
         else active_state.segment_ids,
         "global_valid": global_valid,
+        "local_kv": local_kv if state.options.need_teacher_lse else None,
+        "attn_sink": params.get("attn_sink"),
         "index_k": None if active_state is None else active_state.index_k,
         **index_aux,
     }

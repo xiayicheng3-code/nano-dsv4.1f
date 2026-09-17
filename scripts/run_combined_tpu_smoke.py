@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import argparse
+from dataclasses import asdict
+import json
+from pathlib import Path
+import subprocess
+import time
 
 import jax
 import jax.numpy as jnp
@@ -36,7 +42,11 @@ def _scalar(x) -> float:
 
 
 def main() -> None:
-    print("runtime:", runtime_report())
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output', type=Path, default=Path('combined-smoke.json'))
+    args = parser.parse_args()
+    from nano_dsv41f.runtime import pallas_preflight
+    runtime = pallas_preflight()
     for warning in validate_v5e_runtime():
         print("WARNING:", warning)
     mesh = make_v5e_mesh()
@@ -121,15 +131,20 @@ def main() -> None:
     )
 
     zero_step = jnp.asarray(0, dtype=jnp.int32)
+    compile_start = time.perf_counter()
     _, diagnostics = compile_diagnostics(
         late_step, params, opt_state, ids, segments, zero_step, token_mask
     )
     print("late collectives:", diagnostics["collectives"])
     print("late compiler memory:", diagnostics["memory"])
+    compile_seconds = time.perf_counter() - compile_start
 
     base_losses: list[float] = []
+    base_seconds = []
+    late_seconds = []
     print("\n=== 10 base/no-indexer overfit steps ===")
     for step_i in range(10):
+        start = time.perf_counter()
         params, opt_state, metrics = base_step(
             params,
             opt_state,
@@ -138,7 +153,9 @@ def main() -> None:
             jnp.asarray(step_i, dtype=jnp.int32),
             token_mask,
         )
-        jax.block_until_ready(metrics["loss"])
+        jax.block_until_ready((params, opt_state, metrics))
+        base_seconds.append(time.perf_counter() - start)
+        assert int(jax.device_get(metrics['expert_dropped'].sum())) == 0
         loss = _scalar(metrics["lm_loss"])
         base_losses.append(loss)
         if step_i == 0:
@@ -157,7 +174,8 @@ def main() -> None:
             print("expert loads across all backbone layers:", loads.tolist())
             print("expert overflow across all backbone layers:", overflow.tolist())
             print("per-expert capacity per layer:", int(jax.device_get(metrics["expert_capacity"])))
-        print(f"base step {step_i:02d}: lm_loss={loss:.6f}")
+        assert np.isfinite(loss), (step_i, loss)
+        print(f"base step {step_i:02d}: lm_loss={loss:.6f} seconds={base_seconds[-1]:.4f}")
 
     expected_teacher = np.asarray([[640, 1344, 2046]], dtype=np.int32)
     late_lm_losses: list[float] = []
@@ -165,6 +183,7 @@ def main() -> None:
     print("\n=== 10 late-indexer overfit steps ===")
     for offset in range(10):
         step_i = 10 + offset
+        start = time.perf_counter()
         params, opt_state, metrics = late_step(
             params,
             opt_state,
@@ -173,11 +192,14 @@ def main() -> None:
             jnp.asarray(step_i, dtype=jnp.int32),
             token_mask,
         )
-        jax.block_until_ready(metrics["loss"])
+        jax.block_until_ready((params, opt_state, metrics))
+        late_seconds.append(time.perf_counter() - start)
+        assert int(jax.device_get(metrics['expert_dropped'].sum())) == 0
         lm_loss = _scalar(metrics["lm_loss"])
         index_loss = _scalar(metrics["indexer_loss"])
         late_lm_losses.append(lm_loss)
         late_indexer_losses.append(index_loss)
+        assert np.isfinite(lm_loss) and np.isfinite(index_loss), (offset, lm_loss, index_loss)
 
         index_aux = metrics["indexer"]
         if offset == 0:
@@ -203,13 +225,34 @@ def main() -> None:
             )
         print(
             f"late step {offset:02d}: lm_loss={lm_loss:.6f} "
-            f"indexer_loss={index_loss:.6f}"
+            f"indexer_loss={index_loss:.6f} seconds={late_seconds[-1]:.4f}"
         )
 
     print("\nbase LM trajectory:", [round(x, 6) for x in base_losses])
     print("late LM trajectory:", [round(x, 6) for x in late_lm_losses])
     print("late indexer trajectory:", [round(x, 6) for x in late_indexer_losses])
 
+    report = {
+        'runtime': runtime,
+        'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+        'model_config': asdict(config), 'train_config': asdict(train_config),
+        'native_config': asdict(native_config), 'late_compile_seconds': compile_seconds,
+        'late_diagnostics': diagnostics,
+        'real_token_utilization': packed.real_tokens / train_config.seq_len,
+        'lm_token_utilization': packed.lm_tokens / (train_config.seq_len - 1),
+        'base_losses': base_losses, 'late_lm_losses': late_lm_losses,
+        'late_indexer_losses': late_indexer_losses,
+        'base_seconds': base_seconds, 'late_seconds': late_seconds,
+        'base_median_seconds': float(np.median(base_seconds[2:])),
+        'late_median_seconds': float(np.median(late_seconds[2:])),
+        'base_lm_tokens_per_second': packed.lm_tokens / float(np.median(base_seconds[2:])),
+        'late_lm_tokens_per_second': packed.lm_tokens / float(np.median(late_seconds[2:])),
+        'expert_dropped': int(jax.device_get(metrics['expert_dropped'].sum())),
+        'timing_note': 'Synchronized complete steps; first two steps per phase excluded from medians. Physical packing utilization is not Splash block utilization.',
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + '\n')
+    print('saved report:', args.output)
     if base_losses[-1] >= base_losses[0]:
         raise AssertionError(
             "synthetic LM loss did not fall across the 10 base steps; inspect optimizer/runtime"

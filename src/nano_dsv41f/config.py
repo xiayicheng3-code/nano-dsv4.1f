@@ -222,9 +222,10 @@ class OptimizerConfig:
     # gamma in the V4.1 Sinkhorn-balanced update algorithm.
     sinkhorn_gamma: float = 0.18
     sinkhorn_iters: int = 11
-    sinkhorn_eps: float = 1e-12
-    # Report describes the threshold structurally but does not publish tau; keep explicit.
+    sinkhorn_eps: float = 1e-20
+    # V4.1 report section 4.2.2 specifies tau=1e-3.
     sinkhorn_row_mask_tau: float = 1e-3
+    engram_lr_multiplier: float = 5.0
     headwise_qk_muon: bool = True
 
 
@@ -270,6 +271,7 @@ class ModelConfig:
     experts_per_token: int = 2
     route_scale: float = 1.5
     route_eps: float = 1e-20
+    router_bias_update_speed: float = 1e-3
     # Production V4.1 clips SwiGLU activations at 10; still fully notebook-configurable.
     swiglu_limit: float = 10.0
     mhc_streams: int = 4
@@ -295,6 +297,8 @@ class ModelConfig:
             raise ValueError("model dimensions must be positive")
         if self.n_experts < self.experts_per_token or self.experts_per_token <= 0:
             raise ValueError("require n_experts >= experts_per_token > 0")
+        if self.router_bias_update_speed < 0:
+            raise ValueError("router_bias_update_speed must be non-negative")
         if self.mhc_streams <= 0 or self.mhc_sinkhorn_iters <= 0:
             raise ValueError("mHC settings must be positive")
         if self.indexer.head_dim < self.attention.rope.rope_head_dim:

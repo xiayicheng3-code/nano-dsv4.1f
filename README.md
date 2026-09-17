@@ -18,7 +18,7 @@ This is **not** a checkpoint-compatible miniature of the 552B production model, 
 | Attention | MLA-style shared latent K/V, partial + inverse RoPE, attention sink, grouped low-rank `wo_a`, dense reference path + TPU-native Splash path |
 | Sparse retrieval | Cross-layer index-K reuse, dynamic multi-head indexer scoring, hierarchical candidate blocks, late selective distillation |
 | Residual / FFN | Single-Pass mHC + routed/shared-expert MoE + clipped SwiGLU |
-| TPU MoE | 8-way expert-parallel native path with one routed expert resident per v5e chip and fixed-capacity token dispatch |
+| TPU MoE | 8-way expert parallelism, multiple resident experts per chip, dropless tiled dispatch and reduce-scatter |
 | Memory | Engram-style hashed n-gram memory with packed-sequence-safe hashing |
 | Speculation | One-stage DSpark reference with separate MoE, Markov correction and confidence prediction |
 | Optimizer | Inspectable AdamW / Muon / head-wise Muon / Sinkhorn-balanced parameter rules |
@@ -56,7 +56,7 @@ The goal is therefore as much **ML systems / accelerator engineering** as model 
 - [x] 8-device CPU/SPMD regression tests for native MoE and Splash forward/backward behavior
 - [x] Checked-in Kaggle v5e smoke notebook that defaults to the native backend
 - [ ] First recorded native Kaggle v5e-8 HBM / compile / step-time profile
-- [ ] Replace fixed-capacity gather/reduce MoE communication with ragged all-to-all / ring-style dispatch if profiling justifies it
+- [ ] Replace gather/reduce-scatter MoE communication with ragged all-to-all / ring-style dispatch if profiling justifies it
 - [ ] Packed MXFP4 storage/dequant kernels for main KV and index caches
 - [ ] Real training dataset + pretrained tokenizer pipeline
 - [ ] Training curves, retrieval diagnostics and DSpark acceptance measurements
@@ -215,7 +215,7 @@ The target is a single-host **2×4 v5e-8** mesh.
 - the outer model uses a topology-aware Auto mesh so XLA can legally reshard ordinary JAX operations;
 - token/context positions are distributed over all eight chips;
 - attention parameters remain comparatively simple while Splash owns sequence-parallel attention execution;
-- backbone routed experts are sharded one expert per chip in the native MoE primitive;
+- backbone routed experts stay resident with one or more experts per chip;
 - large matrix/table payload parameters initialize directly into final shards as **BF16**;
 - norm, bias, sink, router/control vectors and optimizer accumulators remain FP32;
 - block rematerialization is the native training default to trade extra compute for lower activation HBM;
@@ -229,23 +229,24 @@ This is now a real accelerator-specific execution path, but **it is still under 
 
 A lightweight notebook is checked in at [`notebooks/nano_dsv41f_kaggle.ipynb`](notebooks/nano_dsv41f_kaggle.ipynb). From a blank Kaggle session, select TPU, enable Internet, and run top-to-bottom. The notebook fetches the requested Git ref and prints the exact commit SHA for reproducibility.
 
-For a single-file self-contained notebook, generate one with:
+Regenerate both maintained notebook entry points with:
 
 ```bash
 python scripts/build_notebook.py
 ```
 
-The current smoke notebook is intentionally hardware-first rather than dataset-first. It:
+Both notebooks install `requirements-tpu.txt` (JAX/jaxlib 0.10.2, libtpu 0.0.42.1)
+before importing JAX. They run the model in fresh Python processes. The combined notebook
+runs only the 20-step packed smoke; the main notebook first runs operator parity/timing.
+A real Splash forward/backward preflight fails before model initialization if the loaded
+TPU client is stale. The smoke uses `T=2048`, 16 experts, three odd-length documents,
+10 base steps and 10 late-indexer steps. JSON reports include the commit, runtime build,
+compiler memory, collectives, all losses and synchronized timings (first two steps of
+each phase excluded from the timing median).
 
-1. clones/fetches the current repo **before JAX starts**;
-2. verifies all eight v5e devices and constructs the topology-aware 2×4 mesh;
-3. initializes BF16 payload / FP32 control parameters directly into final shards;
-4. initializes sharded optimizer state;
-5. builds the **native Splash + expert-parallel MoE** base executable;
-6. runs a `T=1024` synthetic packed batch so each context shard receives 128 query tokens;
-7. attempts compile diagnostics and reports memory / cost / collectives;
-8. executes the first training step and checks for a finite loss;
-9. only after the base path succeeds, prepares the late-indexer executable.
+For an unmerged branch, set `os.environ["NANO_DSV41F_REF"]` before the bootstrap cell.
+See [the operator pass and fidelity audit](docs/tpu_operator_pass.md) for exact commands,
+validation scope, changes to mHC checkpoint semantics and remaining reproduction gaps.
 
 Once this smoke test is stable, the next layer is a pretrained ~32K tokenizer plus packed real data. Token efficiency is deliberately secondary to keeping embeddings/softmax and HBM reasonable for the nano model.
 
@@ -276,7 +277,7 @@ src/nano_dsv41f/
   profiling.py       AOT memory/cost/collective diagnostics
   splash.py          low-level Splash helpers/reference experiments
 scripts/
-  build_notebook.py  generate the self-contained Kaggle TPU notebook
+  build_notebook.py  generate both Kaggle notebooks from one bootstrap
 ```
 
 ## Next experiments
@@ -285,7 +286,7 @@ The remaining milestones are deliberately driven by real hardware/data evidence:
 
 - finish the current Kaggle v5e-8 run and record native compile memory, StableHLO collectives and steady-state step time;
 - compare native vs reference memory behavior on the smallest sequence lengths where both compile;
-- profile the fixed-capacity expert path and replace it with ragged all-to-all / ring-of-experts style dispatch only if communication is the bottleneck;
+- profile the dropless tiled expert path and replace it with ragged all-to-all / ring-of-experts style dispatch only if communication is the bottleneck;
 - implement packed MXFP4 main-KV/index storage with on-chip software dequantization instead of materializing dequantized caches in HBM;
 - decide whether vocab-parallel cross-entropy is worthwhile once the 32K LM head is measured on hardware;
 - attach a pretrained tokenizer + packed corpus and publish training curves / retrieval diagnostics;

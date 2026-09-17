@@ -69,7 +69,7 @@ Turning detachment off is an explicit ablation.
 
 ## Teacher scores
 
-For one selected query and compressed candidate `j`, main attention provides per-head logits `z_hj`. The backbone already computes the complete shared denominator:
+For one selected query and compressed candidate `j`, main attention provides per-head logits `z_hj`. The reference backbone exposes the complete shared denominator; the native path reconstructs it only for the selected queries:
 
 ```text
 LSE_h = log(local + compressed/global + sink mass)
@@ -83,7 +83,7 @@ u_j = sum_h exp(z_hj - LSE_h)
 
 The teacher uses the main attention's shared latent K, not the indexer K. Because the complete LSE is used, raw SWA, compressed/global attention, their fixed-window overlap, and the attention sink all remain competitors in the denominator.
 
-Teacher mass is always stop-gradient.
+Teacher mass is always stop-gradient. The native path gathers only the recent local window, reuses selected global logits for the denominator and mass, and constructs only `[B,Q,K]` validity. It no longer runs a second full-sequence Splash pass or retains a dense `[B,T,K]` validity mask.
 
 ## Cross-layer teacher groups
 

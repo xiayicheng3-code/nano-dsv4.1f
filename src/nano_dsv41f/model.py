@@ -179,6 +179,7 @@ def _apply_block(
         params["mhc_attn"],
         sinkhorn_iters=config.mhc_sinkhorn_iters,
         eps=config.mhc_eps,
+        norm_eps=config.norm_eps,
     )
     attn_input = rms_norm(
         pre_mix(streams, incoming_pre_mix),
@@ -217,6 +218,7 @@ def _apply_block(
         params["mhc_ffn"],
         sinkhorn_iters=config.mhc_sinkhorn_iters,
         eps=config.mhc_eps,
+        norm_eps=config.norm_eps,
     )
     ffn_input = rms_norm(
         pre_mix(streams, attn_pre),
