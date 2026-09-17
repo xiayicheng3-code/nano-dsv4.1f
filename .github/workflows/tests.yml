@@ -20,6 +20,13 @@ jobs:
         env:
           JAX_PLATFORMS: cpu
         run: pytest -q
+      - name: Test 8-device MoE sharding boundary
+        env:
+          JAX_PLATFORMS: cpu
+          XLA_FLAGS: --xla_force_host_platform_device_count=8
+        run: >-
+          pytest -q tests/test_operator_pass.py
+          -k "dropless_expert_forward_and_backward or router_loads_cross_outer_2x4_into_flat_tp"
       - name: Build and parse Kaggle notebook
         env:
           JAX_PLATFORMS: cpu
