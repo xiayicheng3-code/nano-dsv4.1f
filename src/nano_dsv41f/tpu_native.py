@@ -127,13 +127,14 @@ def apply_moe_v5e(
     swiglu_limit: float,
     eps: float,
     state: TPUNativeState,
+    token_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compatibility entry point for the unified dropless multi-expert kernel."""
     from .tpu_moe import apply_moe_v5e_multi
 
     return apply_moe_v5e_multi(
         x, params, top_k=top_k, route_scale=route_scale,
-        swiglu_limit=swiglu_limit, eps=eps, state=state,
+        swiglu_limit=swiglu_limit, eps=eps, state=state, token_mask=token_mask,
     )
 
 
@@ -145,6 +146,7 @@ def apply_moe_dispatch(
     route_scale: float = 1.0,
     swiglu_limit: float = 7.0,
     eps: float = 1e-20,
+    token_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     state = active_tpu_backend()
     if state is not None and state.options.use_expert_parallel_moe:
@@ -156,6 +158,7 @@ def apply_moe_dispatch(
             swiglu_limit=swiglu_limit,
             eps=eps,
             state=state,
+            token_mask=token_mask,
         )
     return apply_moe_reference(
         x,
@@ -164,6 +167,7 @@ def apply_moe_dispatch(
         route_scale=route_scale,
         swiglu_limit=swiglu_limit,
         eps=eps,
+        token_mask=token_mask,
     )
 
 

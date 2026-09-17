@@ -96,6 +96,24 @@ def route_tokens(
     return weights * route_scale, indices
 
 
+def _router_loads(
+    indices: jax.Array,
+    token_mask: jax.Array | None,
+    n_experts: int,
+) -> jax.Array:
+    """Count only real-token assignments in the routing tensor's own sharding domain."""
+    if token_mask is None:
+        token_mask = jnp.ones(indices.shape[:-1], dtype=bool)
+    if token_mask.shape != indices.shape[:-1]:
+        raise ValueError("token_mask must match MoE token dimensions")
+    assignment_mask = jnp.broadcast_to(token_mask[..., None], indices.shape)
+    return jnp.bincount(
+        indices.reshape(-1),
+        weights=assignment_mask.reshape(-1).astype(jnp.int32),
+        length=n_experts,
+    )
+
+
 def apply_moe(
     x: jax.Array,
     params: dict[str, object],
@@ -104,12 +122,14 @@ def apply_moe(
     route_scale: float = 1.0,
     swiglu_limit: float = 7.0,
     eps: float = 1e-20,
+    token_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Readable routed-MoE reference with one always-on shared expert."""
     weights, indices = route_tokens(
         x, params, top_k=top_k, route_scale=route_scale, eps=eps
     )
     experts = params["experts"]
+    router_loads = _router_loads(indices, token_mask, int(experts["w1"].shape[0]))
     w1 = experts["w1"][indices]
     w2 = experts["w2"][indices]
     w3 = experts["w3"][indices]
@@ -127,4 +147,5 @@ def apply_moe(
     return out.astype(x.dtype), {
         "router_indices": indices,
         "router_weights": weights,
+        "router_loads": router_loads,
     }

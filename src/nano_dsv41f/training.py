@@ -508,15 +508,11 @@ def pretrain_loss(
             "student_score_shapes": {},
         }
     total = lm + index_loss
-    # Global logical arrays: GSPMD inserts the reduction across sequence shards.
-    # Ignore compression padding when controlling expert utilization.
-    real = jnp.ones_like(input_ids, dtype=bool) if token_mask is None else token_mask
-    router_loads = jnp.stack(tuple(
-        jnp.bincount(layer["router_indices"].reshape(-1),
-                     weights=jnp.broadcast_to(real[..., None], layer["router_indices"].shape).reshape(-1).astype(jnp.int32),
-                     length=config.n_experts)
-        for layer in backbone_aux["layers"]
-    ))
+    # MoE owns token-level routing in its own sharding domain and exports only [E]
+    # real-token counts. Do not combine tp-sharded router indices with x/y masks here.
+    router_loads = jnp.stack(
+        tuple(layer["router_loads"] for layer in backbone_aux["layers"])
+    )
     return total, {
         "lm_loss": lm,
         "lm_tokens": lm_tokens,

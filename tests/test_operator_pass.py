@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import AxisType, Mesh
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from nano_dsv41f.moe import apply_moe, init_moe
 from nano_dsv41f.tpu_moe import apply_moe_v5e_multi
@@ -39,6 +39,33 @@ def test_dropless_expert_forward_and_backward(shards, skewed):
     actual = jax.jit(jax.grad(lambda x, p: objective(native, x, p), argnums=(0, 1)))(x, p)
     for a, b in zip(jax.tree_util.tree_leaves(actual), jax.tree_util.tree_leaves(expected)):
         np.testing.assert_allclose(a, b, atol=3e-6, rtol=3e-4)
+
+
+def test_router_loads_cross_outer_2x4_into_flat_tp():
+    """Regression: token masks may enter from x/y, but routing counts stay inside tp."""
+    if len(jax.devices()) < 8:
+        pytest.skip('Run with XLA_FLAGS=--xla_force_host_platform_device_count=8')
+    devices = np.asarray(jax.devices()[:8], dtype=object).reshape(2, 4)
+    outer = Mesh(devices, ('x', 'y'), axis_types=(AxisType.Auto, AxisType.Auto))
+    state = TPUNativeState(
+        outer, TPUNativeConfig(moe_capacity_factor=1.0, moe_capacity_multiple=2)
+    )
+    x_host = jax.random.normal(jax.random.key(21), (1, 16, 4)) * .2
+    mask_host = jnp.array([[1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0]], bool)
+    x = jax.device_put(x_host, NamedSharding(outer, P(None, ('x', 'y'), None)))
+    mask = jax.device_put(mask_host, NamedSharding(outer, P(None, ('x', 'y'))))
+    p = init_moe(jax.random.key(22), 4, 8, 16)
+    kw = dict(top_k=2, route_scale=1.5, swiglu_limit=10., eps=1e-20)
+
+    def native_loads(x, mask, p):
+        return apply_moe_v5e_multi(
+            x, p, state=state, token_mask=mask, **kw
+        )[1]['router_loads']
+
+    got = jax.jit(native_loads)(x, mask, p)
+    _, expected = apply_moe(x_host, p, token_mask=mask_host, **kw)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected['router_loads']))
+    assert int(np.asarray(got).sum()) == int(mask_host.sum()) * kw['top_k']
 
 
 @pytest.mark.parametrize('ratio', [1, 2])

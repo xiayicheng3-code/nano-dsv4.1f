@@ -5,9 +5,14 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 
-from .moe import _expert_forward_fused, apply_moe as apply_moe_reference, route_tokens
+from .moe import (
+    _expert_forward_fused,
+    _router_loads,
+    apply_moe as apply_moe_reference,
+    route_tokens,
+)
 from .tpu_native import TPUNativeState, _moe_param_specs, manual_v5e_mesh, moe_capacity
 
 
@@ -20,6 +25,7 @@ def apply_moe_v5e_multi(
     swiglu_limit: float,
     eps: float,
     state: TPUNativeState,
+    token_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Compact assignments into MXU-sized tiles; process every routed assignment.
 
@@ -30,13 +36,17 @@ def apply_moe_v5e_multi(
     """
     if x.ndim != 3:
         raise ValueError("v5e EP MoE expects x=[batch,tokens,dim]")
+    if token_mask is None:
+        token_mask = jnp.ones(x.shape[:2], dtype=bool)
+    if token_mask.shape != x.shape[:2]:
+        raise ValueError("token_mask must match x [batch,tokens]")
     n_experts = int(params["experts"]["w1"].shape[0])
     manual = manual_v5e_mesh(state.mesh, state.options.manual_axis_name)
     shards = int(manual.size)
     if n_experts < shards or n_experts % shards:
         return apply_moe_reference(
             x, params, top_k=top_k, route_scale=route_scale,
-            swiglu_limit=swiglu_limit, eps=eps,
+            swiglu_limit=swiglu_limit, eps=eps, token_mask=token_mask,
         )
     local_experts = n_experts // shards
     batch, tokens, dim = map(int, x.shape)
@@ -53,14 +63,19 @@ def apply_moe_v5e_multi(
 
     @jax.shard_map(
         mesh=manual,
-        in_specs=(P(None, axis, None), _moe_param_specs(axis)),
+        in_specs=(P(None, axis, None), P(None, axis), _moe_param_specs(axis)),
         out_specs=(P(None, axis, None), P(None, axis, None),
-                   P(None, axis, None), P(axis), P(axis)),
+                   P(None, axis, None), P(axis), P(axis), P()),
         check_vma=False,
     )
-    def _mapped(local_x, local_params):
+    def _mapped(local_x, local_token_mask, local_params):
         local_weights, local_indices = route_tokens(
             local_x, local_params, top_k=top_k, route_scale=route_scale, eps=eps,
+        )
+        # Keep token-level accounting in the tp coordinate system. Only the tiny [E]
+        # summary crosses back to the canonical outer mesh.
+        router_loads = jax.lax.psum(
+            _router_loads(local_indices, local_token_mask, n_experts), axis
         )
         global_x = jax.lax.all_gather(local_x, axis, axis=1, tiled=True)
         weights = jax.lax.all_gather(local_weights, axis, axis=1, tiled=True).reshape(-1)
@@ -108,11 +123,22 @@ def apply_moe_v5e_multi(
             local_x, shared["w1"], shared["w2"], shared["w3"], swiglu_limit,
         )
         out = routed_local.astype(local_x.dtype) + shared_out.astype(local_x.dtype)
-        return out, local_weights, local_indices, loads, jnp.maximum(loads - capacity, 0)
+        return (
+            out,
+            local_weights,
+            local_indices,
+            loads,
+            jnp.maximum(loads - capacity, 0),
+            router_loads,
+        )
 
-    out, weights, indices, loads, overflow = _mapped(x, params)
+    out, weights, indices, loads, overflow, router_loads = _mapped(x, token_mask, params)
+    router_loads = jax.lax.with_sharding_constraint(
+        router_loads, NamedSharding(state.mesh, P())
+    )
     return out, {
         "router_indices": indices, "router_weights": weights,
+        "router_loads": router_loads,
         "expert_loads": loads,
         # Kept for monitoring: excess over the first tile, NOT dropped assignments.
         "expert_overflow": overflow,
