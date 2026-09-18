@@ -7,7 +7,9 @@ import jax.numpy as jnp
 
 from .csa2 import segment_local_positions
 from .indexer import (
+    budgeted_teacher_indices,
     dense_teacher_mass,
+    eligible_teacher_queries,
     eligibility_position,
     indexer_cross_entropy_from_mass,
     latest_teacher_indices_batched,
@@ -258,8 +260,9 @@ def _selective_indexer_from_backbone_aux(
     *,
     segment_ids: jax.Array,
     token_mask: jax.Array | None,
-    n_segments: int,
+    n_segments: int | None,
     backbone_aux: dict[str, object],
+    step: jax.Array | int = 0,
 ) -> tuple[jax.Array, dict[str, object]]:
     """Compute selected-row indexer loss from an already executed dense backbone."""
     tc = config.indexer_training
@@ -269,22 +272,22 @@ def _selective_indexer_from_backbone_aux(
             "raw_loss": zero,
             "group_losses": {},
             "query_counts": {},
+            "eligible_query_counts": {},
+            "student_key_counts": {},
             "teacher_query_indices": {},
             "teacher_query_valid": {},
             "active_queries": jnp.asarray(0, jnp.int32),
             "student_score_shapes": {},
         }
-    if tc.teacher_queries != "latest_eligible":
-        raise NotImplementedError(
-            "selective reference currently implements teacher_queries='latest_eligible'"
-        )
-    if n_segments <= 0:
-        raise ValueError("n_segments must be a positive static integer")
+    if tc.teacher_queries == "latest_eligible" and (n_segments is None or n_segments <= 0):
+        raise ValueError("latest_eligible requires a positive static n_segments")
 
     layers = backbone_aux["layers"]
     local_positions = segment_local_positions(segment_ids)
     group_losses: dict[str, jax.Array] = {}
     query_counts: dict[str, jax.Array] = {}
+    eligible_query_counts: dict[str, jax.Array] = {}
+    student_key_counts: dict[str, jax.Array] = {}
     student_shapes: dict[str, jax.Array] = {}
     teacher_query_indices: dict[str, jax.Array] = {}
     teacher_query_valid: dict[str, jax.Array] = {}
@@ -292,6 +295,7 @@ def _selective_indexer_from_backbone_aux(
     candidate_indices = None
     candidate_kv_source = None
     index_k_cache = {}
+    query_cache = {}
 
     for group in build_indexer_groups(config):
         min_pos = eligibility_position(
@@ -300,12 +304,26 @@ def _selective_indexer_from_backbone_aux(
             compression_ratio=group.compression_ratio,
             rule=tc.eligibility_rule,
         )
-        query_indices, query_valid = latest_teacher_indices_batched(
-            segment_ids,
-            n_segments=n_segments,
-            min_local_position=min_pos,
-            token_mask=token_mask,
-        )
+        if min_pos not in query_cache:
+            eligible = eligible_teacher_queries(
+                segment_ids, min_local_position=min_pos, token_mask=token_mask,
+            )
+            if tc.teacher_queries == "sampled":
+                selected = budgeted_teacher_indices(
+                    segment_ids, query_budget=tc.query_budget,
+                    min_local_position=min_pos, token_mask=token_mask,
+                    step=step, seed=tc.query_seed,
+                )
+            elif tc.teacher_queries == "all_eligible":
+                indices = jnp.broadcast_to(jnp.arange(segment_ids.shape[1]), segment_ids.shape)
+                selected = (jnp.where(eligible, indices, 0), eligible)
+            else:  # Explicit legacy ablation; never the default.
+                selected = latest_teacher_indices_batched(
+                    segment_ids, n_segments=n_segments,
+                    min_local_position=min_pos, token_mask=token_mask,
+                )
+            query_cache[min_pos] = (*selected, jnp.sum(eligible.astype(jnp.int32)))
+        query_indices, query_valid, eligible_count = query_cache[min_pos]
         q_positions = _batched_gather_tokens(local_positions, query_indices)
 
         source_aux = layers[group.index_source_layer]
@@ -361,13 +379,14 @@ def _selective_indexer_from_backbone_aux(
         student_valid = full_history_valid & query_valid[..., None]
 
         if (
-            candidate_pool is not None
+            tc.apply_candidate_mask
+            and candidate_pool is not None
             and config.indexer.candidate_source_layer < group.index_source_layer
             and candidate_kv_source == group.kv_source_layer
         ):
             if candidate_indices is None:
                 raise AssertionError("candidate indices missing")
-            same_slots = jnp.all(query_indices == candidate_indices, axis=-1)
+            same_slots = query_indices == candidate_indices
             student_valid = student_valid & candidate_pool & same_slots[..., None]
 
         teacher_masses = tuple(
@@ -391,11 +410,13 @@ def _selective_indexer_from_backbone_aux(
         key = f"L{group.index_source_layer}"
         group_losses[key] = loss
         query_counts[key] = jnp.sum(query_valid.astype(jnp.int32))
+        eligible_query_counts[key] = eligible_count
+        student_key_counts[key] = jnp.sum(student_valid.astype(jnp.int32), axis=-1)
         student_shapes[key] = jnp.asarray(student_scores.shape, dtype=jnp.int32)
         teacher_query_indices[key] = query_indices
         teacher_query_valid[key] = query_valid
 
-        if group.index_source_layer == config.indexer.candidate_source_layer:
+        if tc.apply_candidate_mask and group.index_source_layer == config.indexer.candidate_source_layer:
             candidate_pool = _candidate_mask_for_selected_queries(
                 student_scores,
                 student_valid,
@@ -419,6 +440,8 @@ def _selective_indexer_from_backbone_aux(
         "raw_loss": raw,
         "group_losses": group_losses,
         "query_counts": query_counts,
+        "eligible_query_counts": eligible_query_counts,
+        "student_key_counts": student_key_counts,
         "teacher_query_indices": teacher_query_indices,
         "teacher_query_valid": teacher_query_valid,
         "active_queries": active_queries,
@@ -432,8 +455,9 @@ def selective_indexer_distillation_loss(
     input_ids: jax.Array,
     *,
     segment_ids: jax.Array,
-    n_segments: int,
+    n_segments: int | None = None,
     token_mask: jax.Array | None = None,
+    step: jax.Array | int = 0,
 ) -> tuple[jax.Array, dict[str, object]]:
     """Standalone selected-row indexer loss; useful for tests and retrieval-only tuning."""
     if segment_ids.shape != input_ids.shape:
@@ -455,6 +479,7 @@ def selective_indexer_distillation_loss(
         token_mask=token_mask,
         n_segments=n_segments,
         backbone_aux=backbone_aux,
+        step=step,
     )
 
 
@@ -467,6 +492,7 @@ def pretrain_loss(
     token_mask: jax.Array | None = None,
     include_indexer: bool = False,
     n_segments: int | None = None,
+    step: jax.Array | int = 0,
 ) -> tuple[jax.Array, dict[str, object]]:
     """One-backbone-pass packed LM objective, optionally with late indexer distillation.
 
@@ -486,8 +512,6 @@ def pretrain_loss(
         logits, input_ids, segment_ids, token_mask=token_mask
     )
     if include_indexer and config.indexer_training.enabled:
-        if n_segments is None:
-            raise ValueError("n_segments is required when include_indexer=True")
         index_loss, index_aux = _selective_indexer_from_backbone_aux(
             params,
             config,
@@ -495,6 +519,7 @@ def pretrain_loss(
             token_mask=token_mask,
             n_segments=n_segments,
             backbone_aux=backbone_aux,
+            step=step,
         )
     else:
         index_loss = jnp.asarray(0.0, dtype=jnp.float32)
@@ -502,6 +527,8 @@ def pretrain_loss(
             "raw_loss": jnp.asarray(0.0, dtype=jnp.float32),
             "group_losses": {},
             "query_counts": {},
+            "eligible_query_counts": {},
+            "student_key_counts": {},
             "teacher_query_indices": {},
             "teacher_query_valid": {},
             "active_queries": jnp.asarray(0, dtype=jnp.int32),
@@ -564,6 +591,7 @@ def pretrain_step(
             token_mask=token_mask,
             include_indexer=include_indexer,
             n_segments=n_segments,
+            step=step,
         )
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)

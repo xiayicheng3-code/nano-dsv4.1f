@@ -573,7 +573,7 @@ def compile_pretrain_step_native(
     mesh: Mesh,
     *,
     include_indexer: bool,
-    n_segments: int | None,
+    n_segments: int | None = None,
     native_config: TPUNativeConfig | None = None,
 ):
     """Build the ordinary static pretrain executable under the v5e-native backend."""

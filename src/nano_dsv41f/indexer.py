@@ -3,6 +3,53 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from .csa2 import segment_local_positions
+
+
+def eligible_teacher_queries(segment_ids, *, min_local_position, token_mask=None):
+    """Eligible real positions in each contiguous packed document, [B,T]."""
+    if segment_ids.ndim != 2 or min(segment_ids.shape) <= 0:
+        raise ValueError("segment_ids must be nonempty [batch,tokens]")
+    if token_mask is not None and token_mask.shape != segment_ids.shape:
+        raise ValueError("token_mask must match segment_ids")
+    eligible = segment_local_positions(segment_ids) >= min_local_position
+    return eligible if token_mask is None else eligible & token_mask.astype(bool)
+
+
+def budgeted_teacher_indices(
+    segment_ids, *, query_budget, min_local_position, token_mask=None, step=0, seed=0,
+):
+    """Sample up to Q eligible positions without replacement across the global batch.
+
+    Random priorities are refreshed by the dynamic optimizer step. The same seed/step
+    and eligibility produce the same rows for shared-K retrieval groups. Output is
+    [B,min(Q,T)] with invalid slots padded at index zero. B=1 does a single top-k;
+    larger batches pack the globally selected positions into fixed per-row buffers.
+    Padding never consumes the budget, and underfilled rows do not strand quota.
+    """
+    if type(query_budget) is not int or query_budget <= 0:
+        raise ValueError("query_budget must be a positive static integer")
+    eligible = eligible_teacher_queries(
+        segment_ids, min_local_position=min_local_position, token_mask=token_mask,
+    )
+    batch, tokens = segment_ids.shape
+    key = jax.random.fold_in(jax.random.PRNGKey(seed), jnp.asarray(step, jnp.uint32))
+    priorities = jax.random.uniform(key, segment_ids.shape)
+    priorities = jnp.where(eligible, priorities, -1.0)
+    _, flat_indices = jax.lax.top_k(priorities.reshape(-1), min(query_budget, batch * tokens))
+    flat_valid = eligible.reshape(-1)[flat_indices]
+    if batch == 1:
+        return jnp.where(flat_valid, flat_indices, 0)[None, :], flat_valid[None, :]
+    chosen = jnp.zeros((batch * tokens,), dtype=bool).at[flat_indices].set(flat_valid)
+    chosen = chosen.reshape(batch, tokens)
+    # top_k resolves ties deterministically; the global selection above has exactly
+    # min(Q, eligible_count) distinct indices even if random priorities tie.
+    _, indices = jax.lax.top_k(
+        jnp.where(chosen, -jnp.arange(tokens), -tokens), min(query_budget, tokens),
+    )
+    valid = jnp.take_along_axis(chosen, indices, axis=1)
+    return jnp.where(valid, indices, 0), valid
+
 
 def eligibility_position(
     *,

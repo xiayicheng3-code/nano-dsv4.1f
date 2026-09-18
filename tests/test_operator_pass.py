@@ -206,13 +206,14 @@ def test_native_late_loss_and_gradients_match_reference_backbone():
     from nano_dsv41f.training import pretrain_loss
     from nano_dsv41f.tpu_native import install_model_dispatch, tpu_native_context
     cfg = replace(tiny_config(dspark=False), remat=RematConfig(policy='none'))
+    cfg = replace(cfg, indexer_training=replace(cfg.indexer_training, query_budget=16))
     params = init_model(jax.random.key(42), cfg)
     ids = (jnp.arange(128)[None] % cfg.vocab_size).astype(jnp.int32)
     seg = jnp.array([[0] * 64 + [1] * 64], jnp.int32)
     mask = jnp.ones_like(ids, dtype=bool).at[:, 63].set(False)
     def objective(p):
         return pretrain_loss(p, cfg, ids, segment_ids=seg, token_mask=mask,
-                             include_indexer=True, n_segments=2)
+                             include_indexer=True, step=jnp.asarray(17))
     expected, expected_grad = jax.jit(jax.value_and_grad(objective, has_aux=True))(params)
     install_model_dispatch()
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('x',), axis_types=(AxisType.Auto,))
@@ -222,6 +223,7 @@ def test_native_late_loss_and_gradients_match_reference_backbone():
     np.testing.assert_allclose(actual[0], expected[0], atol=2e-5, rtol=2e-5)
     np.testing.assert_allclose(actual[1]['indexer_loss'], expected[1]['indexer_loss'], atol=2e-6, rtol=2e-5)
     assert int(actual[1]['lm_tokens']) == 125
+    assert int(actual[1]['indexer']['active_queries']) == 48
     assert np.asarray(actual[1]['router_loads']).sum() == 127 * cfg.experts_per_token * cfg.n_layers
     for a, b in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad)):
         np.testing.assert_allclose(a, b, atol=2e-5, rtol=3e-3)

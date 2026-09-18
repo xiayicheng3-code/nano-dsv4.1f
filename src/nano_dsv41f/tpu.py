@@ -405,15 +405,17 @@ def compile_pretrain_step(
     mesh: Mesh,
     *,
     include_indexer: bool,
-    n_segments: int | None,
+    n_segments: int | None = None,
 ):
     """Compile one static base or late-indexer step for the v5e mesh.
 
     We intentionally compile two executables rather than branch on the training step inside
     XLA. That keeps selected-row teacher work out of the base executable.
     """
-    if include_indexer and n_segments is None:
-        raise ValueError("n_segments is required for the late-indexer executable")
+    if (include_indexer and config.indexer_training.enabled
+            and config.indexer_training.teacher_queries == "latest_eligible"
+            and (n_segments is None or n_segments <= 0)):
+        raise ValueError("latest_eligible requires a positive static n_segments")
     param_shardings = named_shardings(param_specs, mesh)
     state_shardings = optimizer_state_named_shardings(
         params, param_specs, config, mesh

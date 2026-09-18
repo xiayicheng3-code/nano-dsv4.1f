@@ -157,9 +157,13 @@ def test_v5e_sequence_guardrails():
         validate_sequence_length(4097, cfg, mesh)
 
 
-def test_single_device_ci_can_compile_mixed_precision_sharded_pretrain_step():
+@pytest.mark.parametrize("include_indexer", [False, True])
+def test_single_device_ci_can_compile_mixed_precision_sharded_pretrain_step(include_indexer):
+    from dataclasses import replace
+    from nano_dsv41f.indexer import budgeted_teacher_indices
     cfg = tiny_single_device_config()
-    train_cfg = TrainConfig(total_steps=8, seq_len=8, warmup_steps=1)
+    cfg = replace(cfg, indexer_training=replace(cfg.indexer_training, query_budget=2))
+    train_cfg = TrainConfig(total_steps=8, seq_len=16, warmup_steps=1)
     mesh = make_v5e_mesh(strict=False)
 
     params, specs, _ = init_model_sharded_mixed_precision(
@@ -179,11 +183,11 @@ def test_single_device_ci_can_compile_mixed_precision_sharded_pretrain_step():
         cfg,
         train_cfg,
         mesh,
-        include_indexer=False,
+        include_indexer=include_indexer,
         n_segments=None,
     )
 
-    ids = jnp.arange(8, dtype=jnp.int32)[None, :] % cfg.vocab_size
+    ids = jnp.arange(16, dtype=jnp.int32)[None, :] % cfg.vocab_size
     segments = jnp.zeros_like(ids)
     mask = jnp.ones_like(ids, dtype=bool)
     ids, segments, mask = put_training_batch(ids, segments, mask, cfg, mesh)
@@ -201,3 +205,12 @@ def test_single_device_ci_can_compile_mixed_precision_sharded_pretrain_step():
     assert new_params["embed"].dtype == jnp.bfloat16
     assert jax.tree_util.tree_structure(new_params) == jax.tree_util.tree_structure(params)
     assert jax.tree_util.tree_structure(new_state) == jax.tree_util.tree_structure(opt_state)
+    if include_indexer:
+        for step in (0, 1):
+            if step:
+                new_params, new_state, metrics = step_fn(
+                    new_params, new_state, ids, segments, jnp.asarray(step, jnp.int32), mask)
+            assert int(metrics["indexer"]["active_queries"]) == 6
+            expected, _ = budgeted_teacher_indices(
+                segments, query_budget=2, min_local_position=12, token_mask=mask, step=step)
+            np.testing.assert_array_equal(metrics["indexer"]["teacher_query_indices"]["L5"], expected)

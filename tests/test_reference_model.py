@@ -196,7 +196,7 @@ def test_reference_model_diagnostic_indexer_exercises_reindex_state_machine():
     )
 
 
-def test_selective_distillation_scores_one_query_slot_per_packed_segment():
+def test_selective_distillation_uses_all_eligible_rows_when_budget_covers_them():
     cfg = tiny_config(dspark=False)
     params = init_model(jax.random.PRNGKey(41), cfg)
     ids = jnp.arange(28, dtype=jnp.int32)[None, :] % cfg.vocab_size
@@ -206,11 +206,12 @@ def test_selective_distillation_scores_one_query_slot_per_packed_segment():
         params, cfg, ids, segment_ids=segments, n_segments=2
     )
     assert jnp.isfinite(loss)
-    assert int(aux["active_queries"]) == 6
-    assert tuple(aux["student_score_shapes"]["L1"]) == (1, 2, 14)
-    assert tuple(aux["student_score_shapes"]["L3"]) == (1, 2, 28)
-    assert tuple(aux["student_score_shapes"]["L5"]) == (1, 2, 28)
-    assert int(aux["student_score_shapes"]["L3"][1]) == 2
+    assert int(aux["active_queries"]) == 12
+    assert tuple(aux["student_score_shapes"]["L1"]) == (1, 28, 14)
+    assert tuple(aux["student_score_shapes"]["L3"]) == (1, 28, 28)
+    assert tuple(aux["student_score_shapes"]["L5"]) == (1, 28, 28)
+    for key, indices in aux["teacher_query_indices"].items():
+        assert set(map(int, indices[aux["teacher_query_valid"][key]])) == {12, 13, 26, 27}
 
 
 def test_ratio_aware_indexer_eligibility_delays_r2_encoder_only():
@@ -240,7 +241,7 @@ def test_ratio_aware_indexer_eligibility_delays_r2_encoder_only():
         params, ratio_cfg, ids, segment_ids=segments, n_segments=2
     )
     assert jnp.isfinite(loss)
-    assert int(aux["active_queries"]) == 4
+    assert int(aux["active_queries"]) == 8
 
 
 def test_reference_model_can_be_jitted():

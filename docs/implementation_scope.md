@@ -86,12 +86,14 @@ Ordinary dense LM pretraining calls `apply_model(..., compute_indexer=False)`. I
 
 This is **not claimed as DeepSeek's private training recipe**. `training.py` implements:
 
-- one fixed query slot per packed segment (`latest_eligible`);
+- a configurable global-batch query budget (default 128 per retrieval group), sampled
+  without replacement from all eligible real positions and refreshed each optimizer step;
 - index-K built once from the owning compressed source latent;
-- student scoring only for selected query rows, shape `[B, packed_segments, K]` rather than `[B,T,K]`;
+- student scoring in fixed buffers `[B,min(query_budget,T),K]`, including masked padding slots;
 - teacher mass reconstructed from selected main-attention Q/K rows and the **complete local + global + sink LSE**;
 - all served layers as teachers by default (two layers per nano retrieval lifetime);
-- L5 distillation restricted by the hierarchical candidate pool produced by L3;
+- L5 distillation over full legal history by default; L3 candidate restriction is an
+  opt-in training ablation (`apply_candidate_mask=True`), with evaluation hierarchy preserved;
 - teacher branch always stop-gradient;
 - student backbone inputs detached by default while indexer-specific `wk/k_norm/wq_b/weights_proj` remain trainable. This gradient-isolation choice is configurable and is ours, not a report claim.
 

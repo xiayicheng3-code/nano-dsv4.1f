@@ -118,7 +118,7 @@ Late in pre/mid-training, `training.py` runs a separate selective auxiliary obje
 
 ```text
 for each index source (L1, L3, L5):
-  one fixed query slot per packed segment
+  sample up to query_budget eligible positions across the batch
   -> build shared index-K once
   -> score only selected student Q rows
   -> reconstruct teacher mass from served layers' main Q/K + complete LSE
@@ -126,6 +126,15 @@ for each index source (L1, L3, L5):
 ```
 
 The default follows the proposed `local_window + top_k` eligibility rule: `128 + 512 = 640` raw-token query position. A ratio-aware ablation, `local_window + r * top_k`, waits until roughly `1152` raw positions for encoder `r=2`, when a 512-entry retrieval limit actually becomes selective.
+
+`IndexerTrainingConfig(query_budget=128, query_seed=0, apply_candidate_mask=False)`
+is the default: sample without replacement, refresh using the optimizer step, and
+train L5 over full legal compressed history. The budget caps **positions across the
+global batch per retriever**, not positions per document. Equal eligibility rules
+share the selected positions; three retrievers with 128 positions each mean 384
+query/group evaluations. Set `apply_candidate_mask=True` to test L3-restricted L5
+distillation. Evaluation/inference keeps the hierarchical candidate mask. See
+[query selection and ablations](docs/indexer_training.md) for shapes and cost limits.
 
 Nano retrievers serve only two layers by default, so `all_served` and `Full + last` use the same teacher set. Teacher attention is always stop-gradient. By default student inputs from the backbone are detached too, so the auxiliary loss trains the indexer-specific parameters without perturbing the backbone. This is an educational/stability choice, not a claimed DeepSeek recipe, and is configurable.
 

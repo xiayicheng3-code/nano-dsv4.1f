@@ -185,7 +185,12 @@ class IndexerTrainingConfig:
     enabled: bool = True
     start_fraction: float = 0.55
     end_fraction: float = 0.90
-    teacher_queries: Literal["latest_eligible", "all_eligible"] = "latest_eligible"
+    teacher_queries: Literal["sampled", "latest_eligible", "all_eligible"] = "sampled"
+    # Global batch budget per retrieval group, shared across equal eligibility rules.
+    query_budget: int = 128
+    query_seed: int = 0
+    # Training ablation only; evaluation/inference retains hierarchical retrieval.
+    apply_candidate_mask: bool = False
     teacher_layers: Literal["full_only", "full_last", "all_served"] = "all_served"
     # User-proposed cheap warmup starts after local_window + top_k raw history (640 with
     # 128+512). `ratio_aware` waits until Top-K is actually selective for compressed r>1,
@@ -200,6 +205,12 @@ class IndexerTrainingConfig:
     loss_weight: float = 0.05
 
     def __post_init__(self) -> None:
+        if self.teacher_queries not in ("sampled", "latest_eligible", "all_eligible"):
+            raise ValueError("unknown teacher_queries policy")
+        if type(self.query_budget) is not int or self.query_budget <= 0:
+            raise ValueError("query_budget must be a positive static integer")
+        if type(self.query_seed) is not int or not 0 <= self.query_seed < 2**32:
+            raise ValueError("query_seed must be a uint32 integer")
         if not (0.0 <= self.start_fraction <= self.end_fraction <= 1.0):
             raise ValueError("require 0 <= start_fraction <= end_fraction <= 1")
         if self.loss_weight < 0:

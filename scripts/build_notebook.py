@@ -26,8 +26,8 @@ def build(output: Path, *, combined=False):
             nbf.v4.new_code_cell("subprocess.run([sys.executable, '-u', 'scripts/benchmark_tpu_operators.py', '--output', '/kaggle/working/operator-benchmark.json'], check=True)"),
         ]
     nb.cells += [
-        nbf.v4.new_markdown_cell('## Packed, multi-expert and late-indexer smoke\n\nOne Pallas preflight, then 10 base + 10 late steps. Report includes synchronized timing, compiler memory, collectives, utilization and loss trajectories.'),
-        nbf.v4.new_code_cell("subprocess.run([sys.executable, '-u', 'scripts/run_combined_tpu_smoke.py', '--output', '/kaggle/working/combined-smoke.json'], check=True)"),
+        nbf.v4.new_markdown_cell('## Packed, multi-expert and late-indexer smoke\n\nOne Pallas preflight, then 10 base + 10 late steps. Set the query budget below: it caps eligible positions across the batch per retriever. L5 training uses full legal history by default. Report includes synchronized timing, compiler memory, collectives, query coverage and loss trajectories.'),
+        nbf.v4.new_code_cell("QUERY_BUDGET = 128\nQUERY_SEED = 0\nAPPLY_CANDIDATE_MASK = False\ncommand = [sys.executable, '-u', 'scripts/run_combined_tpu_smoke.py',\n           '--query-budget', str(QUERY_BUDGET), '--query-seed', str(QUERY_SEED),\n           '--output', '/kaggle/working/combined-smoke.json']\nif APPLY_CANDIDATE_MASK:\n    command.append('--apply-candidate-mask')\nsubprocess.run(command, check=True)"),
     ]
     output.parent.mkdir(parents=True, exist_ok=True)
     nbf.write(nb, output)
