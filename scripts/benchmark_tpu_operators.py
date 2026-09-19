@@ -19,6 +19,30 @@ from nano_dsv41f.tpu_native import _moe_param_specs, manual_v5e_mesh
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
+def parity_diagnostics(actual, expected, *, dtype):
+    """Name every output/gradient leaf and retain evidence before failing a gate."""
+    atol, rtol = (2e-3, .06) if dtype == jnp.bfloat16 else (2e-6, 5e-4)
+    relative_limit = .06 if dtype == jnp.bfloat16 else .001
+    leaves, structure = jax.tree_util.tree_flatten_with_path(actual)
+    ref_leaves, ref_structure = jax.tree_util.tree_flatten_with_path(expected)
+    if structure != ref_structure:
+        raise ValueError('Native/reference result trees differ')
+    diagnostics = []
+    for (path, a), (_, b) in zip(leaves, ref_leaves):
+        af, bf = np.asarray(a, np.float32), np.asarray(b, np.float32)
+        finite = bool(np.isfinite(af).all() and np.isfinite(bf).all())
+        difference = float(np.max(np.abs(af - bf))) if finite else None
+        relative = float(np.linalg.norm(af - bf) / max(np.linalg.norm(bf), 1e-12)) if finite else None
+        mismatches = int(np.count_nonzero(~np.isclose(af, bf, atol=atol, rtol=rtol)))
+        diagnostics.append({'path': jax.tree_util.keystr(path), 'shape': list(af.shape),
+                            'finite': finite, 'max_abs_error': difference,
+                            'relative_l2_error': relative, 'mismatched_elements': mismatches,
+                            'passed': finite and mismatches == 0 and relative < relative_limit})
+    return {'parity': 'PASS' if all(d['passed'] for d in diagnostics) else 'FAIL',
+            'atol': atol, 'rtol': rtol, 'relative_l2_limit': relative_limit,
+            'leaves': diagnostics}
+
+
 def measure(fn, args, *, steps):
     start = time.perf_counter()
     compiled = jax.jit(fn).lower(*args).compile()
@@ -52,6 +76,8 @@ def main():
     kwargs = dict(top_k=2, route_scale=1.5, swiglu_limit=10., eps=1e-20)
     report = {'runtime': runtime,
               'native_backend': 'tokamax-0.0.12/mosaic/ragged_dot',
+              'precision_policy': {'float32_payload': 'HIGHEST', 'bfloat16_payload': 'DEFAULT',
+                                   'router': 'HIGHEST'},
               'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'shape': {'batch': 1, 'tokens': 256, 'dim': 128, 'expert_dim': 128, 'experts': 16, 'top_k': 2},
               'cases': {}}
@@ -74,21 +100,15 @@ def main():
                 return jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)
             expected, rt = measure(with_grad(ref), (xp, pp), steps=args.steps)
             actual, nt = measure(with_grad(native), (xp, pp), steps=args.steps)
-            errors = []
-            relative_errors = []
-            atol, rtol = (2e-3, .06) if dtype == jnp.bfloat16 else (2e-6, 5e-4)
-            for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
-                af, bf = np.asarray(a, dtype=np.float32), np.asarray(b, dtype=np.float32)
-                np.testing.assert_allclose(af, bf, atol=atol, rtol=rtol)
-                errors.append(float(np.max(np.abs(af - bf))))
-                relative = float(np.linalg.norm(af - bf) / max(np.linalg.norm(bf), 1e-12))
-                assert relative < (.06 if dtype == jnp.bfloat16 else .001), relative
-                relative_errors.append(relative)
             name = f'{jnp.dtype(dtype)}_skew={skew}'
-            report['cases'][name] = {'parity': 'PASS', 'max_abs_error': max(errors),
-                                      'max_relative_l2_error': max(relative_errors),
-                                      'reference': rt, 'native': nt,
-                                      'reference_over_native': rt['median_seconds'] / nt['median_seconds']}
+            parity = parity_diagnostics(actual, expected, dtype=dtype)
+            report['cases'][name] = {**parity, 'reference': rt, 'native': nt,
+                                    'reference_over_native': rt['median_seconds'] / nt['median_seconds']}
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+            if parity['parity'] != 'PASS':
+                failed = [leaf['path'] for leaf in parity['leaves'] if not leaf['passed']]
+                raise AssertionError(f'{name}: parity failed at {failed}; diagnostics saved to {args.output}')
             print(name, report['cases'][name], flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')

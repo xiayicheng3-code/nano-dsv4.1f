@@ -53,6 +53,20 @@ NaNs during nonlinear operations or backward.
 
 ## Controls and diagnostics
 
+FP32 expert products explicitly use `Precision.HIGHEST` in both the dense oracle
+and Tokamax (including its VJPs); BF16 products use `DEFAULT`. The FP32 router also
+requests `HIGHEST`. In Tokamax 0.0.12, TPU FP32 `DEFAULT` maps to a single
+`BF16_BF16_F32` product, while `HIGHEST` maps to `BF16_BF16_F32_X6`. FP32 storage
+alone does not request FP32-quality multiplication. See the
+[versioned precision mapping](https://github.com/openxla/tokamax/blob/964354016004720905931f1249706a1772706752/tokamax/_src/precision.py).
+
+Log (9), at `cbcd430`, passed Splash and the original BF16-only ragged preflight,
+then failed the first FP32 full-MoE comparison (maximum absolute discrepancy
+0.00011235). Training never started. Explicit precision fixes this integration
+mistake without loosening the parity thresholds; a physical TPU rerun is still
+required. The preflight now tests random FP32 and BF16 operands, and benchmark
+failures save named per-output/per-gradient diagnostics to JSON before stopping.
+
 `TPUNativeConfig.moe_ragged_implementation` accepts:
 
 - `auto` (default): explicit Mosaic on TPU; Tokamax XLA on CPU.

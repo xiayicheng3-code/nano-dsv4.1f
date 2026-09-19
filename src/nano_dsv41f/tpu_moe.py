@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from .moe import _expert_forward_fused, _router_loads, route_tokens
+from .moe import _expert_forward_fused, _router_loads, expert_dot_precision, route_tokens
 from .tpu_native import TPUNativeState, _moe_param_specs, manual_v5e_mesh
 
 
@@ -48,7 +48,12 @@ def _ragged_dot(lhs, rhs, group_sizes, *, implementation):
     # Mosaic can leave rows beyond sum(group_sizes) unwritten. Mask both sides
     # of EVERY dot, including its input gradient, before any nonlinear operation.
     lhs = jnp.where(valid[:, None], lhs, 0)
-    out = tokamax.ragged_dot(lhs, rhs, group_sizes, implementation=implementation)
+    # Tokamax DEFAULT maps FP32 operands to a single BF16 product on TPU.
+    # Explicit precision also propagates through Tokamax's input/weight VJPs.
+    out = tokamax.ragged_dot(
+        lhs, rhs, group_sizes, precision=expert_dot_precision(rhs.dtype),
+        implementation=implementation,
+    )
     return jnp.where(valid[:, None], out, 0)[:rows, :outputs]
 
 

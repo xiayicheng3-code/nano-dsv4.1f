@@ -4,6 +4,11 @@ import jax
 import jax.numpy as jnp
 
 
+def expert_dot_precision(dtype):
+    """FP32 payload needs FP32-quality products; BF16 keeps native MXU compute."""
+    return jax.lax.Precision.HIGHEST if dtype == jnp.float32 else jax.lax.Precision.DEFAULT
+
+
 def _init_expert_stack(
     key: jax.Array,
     n: int,
@@ -51,8 +56,9 @@ def _expert_forward(
     """Expert payload follows expert matrix dtype (BF16 on the v5e path)."""
     compute_dtype = w1.dtype
     x_compute = x.astype(compute_dtype)
-    gate = jnp.einsum("...d,...df->...f", x_compute, w1)
-    up = jnp.einsum("...d,...df->...f", x_compute, w3)
+    precision = expert_dot_precision(compute_dtype)
+    gate = jnp.einsum("...d,...df->...f", x_compute, w1, precision=precision)
+    up = jnp.einsum("...d,...df->...f", x_compute, w3, precision=precision)
     if swiglu_limit > 0:
         gate = jnp.minimum(gate, jnp.asarray(swiglu_limit, dtype=gate.dtype))
         up = jnp.clip(
@@ -61,17 +67,18 @@ def _expert_forward(
             jnp.asarray(swiglu_limit, dtype=up.dtype),
         )
     hidden = jax.nn.silu(gate) * up
-    return jnp.einsum("...f,...fd->...d", hidden, w2)
+    return jnp.einsum("...f,...fd->...d", hidden, w2, precision=precision)
 
 
 def _expert_forward_fused(x, w1, w2, w3, swiglu_limit):
     """Resident-weight expert: one wide gate/up GEMM, then one down GEMM."""
-    gate_up = x.astype(w1.dtype) @ jnp.concatenate((w1, w3), axis=-1)
+    precision = expert_dot_precision(w1.dtype)
+    gate_up = jnp.matmul(x.astype(w1.dtype), jnp.concatenate((w1, w3), axis=-1), precision=precision)
     gate, up = jnp.split(gate_up, 2, axis=-1)
     if swiglu_limit > 0:
         gate = jnp.minimum(gate, jnp.asarray(swiglu_limit, gate.dtype))
         up = jnp.clip(up, -swiglu_limit, swiglu_limit)
-    return (jax.nn.silu(gate) * up) @ w2
+    return jnp.matmul(jax.nn.silu(gate) * up, w2, precision=precision)
 
 
 def route_tokens(
@@ -87,6 +94,7 @@ def route_tokens(
         "...d,de->...e",
         x.astype(jnp.float32),
         params["router_weight"].astype(jnp.float32),
+        precision=jax.lax.Precision.HIGHEST,
     )
     raw = jnp.sqrt(jax.nn.softplus(logits))
     selection = raw + params["router_bias"].astype(jnp.float32)

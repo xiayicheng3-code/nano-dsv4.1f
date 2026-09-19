@@ -66,6 +66,34 @@ def test_mosaic_runtime_preflight(mosaic_interpreter):
     assert ragged_dot_preflight()["parity"] == "PASS"
 
 
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+def test_mosaic_precision_reaches_forward_and_both_vjps(mosaic_interpreter, monkeypatch, dtype):
+    # CPU dot numerics do not emulate TPU DEFAULT's BF16 truncation. Inspect the
+    # actual Mosaic forward/dlhs/drhs calls so CPU parity cannot hide this again.
+    from functools import wraps
+    from tokamax._src.ops.ragged_dot.pallas_mosaic_tpu import PallasMosaicTpuRaggedDot
+    from nano_dsv41f.tpu_moe import _ragged_dot
+    original = PallasMosaicTpuRaggedDot._fwd
+    seen = []
+    @wraps(original)
+    def record(self, *args, **kwargs):
+        seen.append((kwargs['precision'], str(kwargs['ragged_dot_dimension_numbers'])))
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(PallasMosaicTpuRaggedDot, '_fwd', record)
+    x = jnp.ones((31, 16), dtype)
+    w = jnp.ones((3, 16, 24), dtype)
+    sizes = jnp.array([7, 0, 11], jnp.int32)
+    with jax.default_matmul_precision('bfloat16'):
+        result = jax.jit(jax.value_and_grad(
+            lambda x, w: _ragged_dot(x, w, sizes, implementation='mosaic').astype(jnp.float32).sum(),
+            argnums=(0, 1),
+        ))(x, w)
+    assert all(np.isfinite(a).all() for a in jax.tree.leaves(result))
+    expected = jax.lax.Precision.HIGHEST if dtype == jnp.float32 else jax.lax.Precision.DEFAULT
+    assert len({dimensions for _, dimensions in seen}) == 3
+    assert all(precision == (expected, expected) for precision, _ in seen)
+
+
 @pytest.mark.parametrize("n_experts", [8, 16])
 @pytest.mark.parametrize("skewed", [False, True])
 def test_ragged_ep_bf16_input_and_all_parameter_gradients(n_experts, skewed):
