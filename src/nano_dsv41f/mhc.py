@@ -10,10 +10,12 @@ def sinkhorn(
     eps: float = 1e-6,
 ) -> jnp.ndarray:
     """Differentiable doubly-stochastic normalization for the mHC reference."""
-    x = jnp.exp(matrix.astype(jnp.float32) - jnp.max(matrix, axis=(-2, -1), keepdims=True))
-    for _ in range(iters):
-        x = x / jnp.maximum(jnp.sum(x, axis=-1, keepdims=True), eps)
-        x = x / jnp.maximum(jnp.sum(x, axis=-2, keepdims=True), eps)
+    # Released hc_split_sinkhorn: row softmax + eps, then column normalization.
+    x = jax.nn.softmax(matrix.astype(jnp.float32), axis=-1) + eps
+    x = x / (jnp.sum(x, axis=-2, keepdims=True) + eps)
+    for _ in range(iters - 1):
+        x = x / (jnp.sum(x, axis=-1, keepdims=True) + eps)
+        x = x / (jnp.sum(x, axis=-2, keepdims=True) + eps)
     return x
 
 
@@ -24,7 +26,7 @@ def pre_mix(streams: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:
     residual dtype so a BF16 TPU residual stream does not turn every following matmul FP32.
     """
     return jnp.einsum(
-        "...s,...sd->...d", weights.astype(streams.dtype), streams
+        "...s,...sd->...d", weights.astype(jnp.float32), streams.astype(jnp.float32)
     ).astype(streams.dtype)
 
 
@@ -37,11 +39,11 @@ def post_mix(
     """Mix old streams and distribute one branch output back to all streams."""
     dtype = streams.dtype
     mixed_old = jnp.einsum(
-        "...ij,...jd->...id", combine.astype(dtype), streams
+        "...ij,...id->...jd", combine.astype(jnp.float32), streams.astype(jnp.float32)
     )
     branch = (
-        branch_weights.astype(dtype)[..., :, None]
-        * branch_output.astype(dtype)[..., None, :]
+        branch_weights.astype(jnp.float32)[..., :, None]
+        * branch_output.astype(jnp.float32)[..., None, :]
     )
     return (mixed_old + branch).astype(dtype)
 
@@ -83,6 +85,7 @@ def mhc_mixes(
     *,
     sinkhorn_iters: int = 4,
     eps: float = 1e-6,
+    norm_eps: float = 1e-20,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Generate pre/post/comb coefficients from the current multi-stream residual.
 
@@ -92,25 +95,24 @@ def mhc_mixes(
     n_streams = streams.shape[-2]
     flat = streams.astype(jnp.float32).reshape(*streams.shape[:-2], -1)
     flat = flat * jax.lax.rsqrt(
-        jnp.mean(jnp.square(flat), axis=-1, keepdims=True) + eps
+        jnp.mean(jnp.square(flat), axis=-1, keepdims=True) + norm_eps
     )
     raw = (
         jnp.einsum(
             "...d,do->...o", flat, params["weight"].astype(jnp.float32)
         )
-        + params["base"].astype(jnp.float32)
     )
 
-    pre_raw = raw[..., :n_streams] * params["scale"][0].astype(jnp.float32)
-    post_raw = raw[..., n_streams : 2 * n_streams] * params["scale"][1].astype(jnp.float32)
-    comb_raw = raw[..., 2 * n_streams :].reshape(
+    base = params["base"].astype(jnp.float32)
+    pre_raw = raw[..., :n_streams] * params["scale"][0] + base[:n_streams]
+    post_raw = raw[..., n_streams : 2 * n_streams] * params["scale"][1] + base[n_streams:2*n_streams]
+    comb_raw = (raw[..., 2 * n_streams :] * params["scale"][2] + base[2*n_streams:]).reshape(
         *raw.shape[:-1], n_streams, n_streams
     )
-    comb_raw = comb_raw * params["scale"][2].astype(jnp.float32)
 
     return (
-        jax.nn.softmax(pre_raw, axis=-1),
-        jax.nn.softmax(post_raw, axis=-1),
+        jax.nn.sigmoid(pre_raw) + eps,
+        2 * jax.nn.sigmoid(post_raw),
         sinkhorn(comb_raw, iters=sinkhorn_iters, eps=eps),
     )
 

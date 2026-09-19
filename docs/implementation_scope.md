@@ -86,12 +86,14 @@ Ordinary dense LM pretraining calls `apply_model(..., compute_indexer=False)`. I
 
 This is **not claimed as DeepSeek's private training recipe**. `training.py` implements:
 
-- one fixed query slot per packed segment (`latest_eligible`);
+- a configurable global-batch query budget (default 128 per retrieval group), sampled
+  without replacement from all eligible real positions and refreshed each optimizer step;
 - index-K built once from the owning compressed source latent;
-- student scoring only for selected query rows, shape `[B, packed_segments, K]` rather than `[B,T,K]`;
+- student scoring in fixed buffers `[B,min(query_budget,T),K]`, including masked padding slots;
 - teacher mass reconstructed from selected main-attention Q/K rows and the **complete local + global + sink LSE**;
 - all served layers as teachers by default (two layers per nano retrieval lifetime);
-- L5 distillation restricted by the hierarchical candidate pool produced by L3;
+- L5 distillation over full legal history by default; L3 candidate restriction is an
+  opt-in training ablation (`apply_candidate_mask=True`), with evaluation hierarchy preserved;
 - teacher branch always stop-gradient;
 - student backbone inputs detached by default while indexer-specific `wk/k_norm/wq_b/weights_proj` remain trainable. This gradient-isolation choice is configurable and is ours, not a report claim.
 
@@ -155,7 +157,13 @@ Production Mega-mHC fusion/checkpoint-identical initialization are not goals of 
 
 Backbone reference preserves routed experts + one shared expert, `sqrt(softplus(logit))` routing, selection-only correction bias, normalized unbiased selected weights, route scaling, and clipped SwiGLU. DSpark has its own routed-expert count and Top-K.
 
-Expert-parallel all-to-all/dispatch kernels and the distributed no-aux correction-bias controller remain deferred.
+The native backend uses Tokamax 0.0.12 ragged-dot forward/backward with resident
+expert matrices, a grouped gate/up projection and grouped down projection. Sorted
+local assignments are dropless, including under extreme imbalance. All-gather and
+reduce-scatter remain the communication path. A globally aggregated text-only
+no-aux correction-bias controller updates by 0.001 per step (padding excluded).
+The report's separate image controller and sequence-level auxiliary balance loss
+are not implemented. Ragged all-to-all dispatch remains deferred.
 
 ## Engram
 
@@ -187,7 +195,7 @@ Production speculative verification/scheduler integration and cache-efficient de
 - ordinary matrix/batched-matrix weights -> Muon;
 - head-concatenated Q projections -> head-wise Muon.
 
-Muon exposes hybrid Newton-Schulz iterations, Nesterov momentum, decay and update-RMS scaling. Sinkhorn uses the disclosed Nesterov form, 11 alternating row/column normalizations, final dimension scaling and gamma multiplier. Constants not fully pinned by public material remain explicit experiment hyperparameters.
+Muon exposes hybrid Newton-Schulz iterations, Nesterov momentum, decay and update-RMS scaling. Sinkhorn uses the disclosed Nesterov form, 11 alternating row/column normalizations, final dimension scaling and gamma multiplier. The report section 4.2.2 pins gamma=0.18, K=11, tau=1e-3 and epsilon=1e-20. Engram learning rates are multiplied by five, and biases/scales have no AdamW decay. Other experiment constants remain explicit hyperparameters.
 
 ## Activation rematerialization
 
@@ -213,7 +221,7 @@ We avoid one overloaded global `TP`. Config names tensor semantics:
 - `attention_head_shard`
 - `indexer_context_shard`
 
-The same physical TPU mesh axis may represent different logical sharding dimensions in different modules. Actual `NamedSharding`/collectives are still a TPU milestone.
+The same physical TPU mesh axis may represent different logical sharding dimensions in different modules. The native backend implements NamedSharding plus context/expert collectives; real TPU performance validation remains a milestone.
 
 ## Still intentionally omitted / deferred
 
@@ -223,10 +231,12 @@ The same physical TPU mesh axis may represent different logical sharding dimensi
 - exact enormous Engram normalized-vocabulary/prime-bucket assets;
 - production sparse-attention backward kernels on TPU;
 - packed MXFP4/Pallas cache kernel;
-- real context/expert/table distributed sharding and collectives;
-- no-aux routing-bias distributed controller;
 - production DSpark verification/server integration;
 - full checkpoint compatibility and benchmark parity;
 - proprietary cluster/training infrastructure.
 
 Those omissions are deliberate: the project aims to make V4.1's architectural and training ideas small enough to read, modify, train and profile on a Kaggle TPU, not to impersonate the production stack.
+
+## September 17 operator/fidelity audit
+
+See [tpu_operator_pass.md](tpu_operator_pass.md) for pinned primary sources, the mHC formula correction, validation and explicit remaining recipe gaps.

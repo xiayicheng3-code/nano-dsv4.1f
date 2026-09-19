@@ -185,7 +185,12 @@ class IndexerTrainingConfig:
     enabled: bool = True
     start_fraction: float = 0.55
     end_fraction: float = 0.90
-    teacher_queries: Literal["latest_eligible", "all_eligible"] = "latest_eligible"
+    teacher_queries: Literal["sampled", "latest_eligible", "all_eligible"] = "sampled"
+    # Global batch budget per retrieval group, shared across equal eligibility rules.
+    query_budget: int = 128
+    query_seed: int = 0
+    # Training ablation only; evaluation/inference retains hierarchical retrieval.
+    apply_candidate_mask: bool = False
     teacher_layers: Literal["full_only", "full_last", "all_served"] = "all_served"
     # User-proposed cheap warmup starts after local_window + top_k raw history (640 with
     # 128+512). `ratio_aware` waits until Top-K is actually selective for compressed r>1,
@@ -200,6 +205,12 @@ class IndexerTrainingConfig:
     loss_weight: float = 0.05
 
     def __post_init__(self) -> None:
+        if self.teacher_queries not in ("sampled", "latest_eligible", "all_eligible"):
+            raise ValueError("unknown teacher_queries policy")
+        if type(self.query_budget) is not int or self.query_budget <= 0:
+            raise ValueError("query_budget must be a positive static integer")
+        if type(self.query_seed) is not int or not 0 <= self.query_seed < 2**32:
+            raise ValueError("query_seed must be a uint32 integer")
         if not (0.0 <= self.start_fraction <= self.end_fraction <= 1.0):
             raise ValueError("require 0 <= start_fraction <= end_fraction <= 1")
         if self.loss_weight < 0:
@@ -222,9 +233,10 @@ class OptimizerConfig:
     # gamma in the V4.1 Sinkhorn-balanced update algorithm.
     sinkhorn_gamma: float = 0.18
     sinkhorn_iters: int = 11
-    sinkhorn_eps: float = 1e-12
-    # Report describes the threshold structurally but does not publish tau; keep explicit.
+    sinkhorn_eps: float = 1e-20
+    # V4.1 report section 4.2.2 specifies tau=1e-3.
     sinkhorn_row_mask_tau: float = 1e-3
+    engram_lr_multiplier: float = 5.0
     headwise_qk_muon: bool = True
 
 
@@ -270,6 +282,7 @@ class ModelConfig:
     experts_per_token: int = 2
     route_scale: float = 1.5
     route_eps: float = 1e-20
+    router_bias_update_speed: float = 1e-3
     # Production V4.1 clips SwiGLU activations at 10; still fully notebook-configurable.
     swiglu_limit: float = 10.0
     mhc_streams: int = 4
@@ -295,6 +308,8 @@ class ModelConfig:
             raise ValueError("model dimensions must be positive")
         if self.n_experts < self.experts_per_token or self.experts_per_token <= 0:
             raise ValueError("require n_experts >= experts_per_token > 0")
+        if self.router_bias_update_speed < 0:
+            raise ValueError("router_bias_update_speed must be non-negative")
         if self.mhc_streams <= 0 or self.mhc_sinkhorn_iters <= 0:
             raise ValueError("mHC settings must be positive")
         if self.indexer.head_dim < self.attention.rope.rope_head_dim:
