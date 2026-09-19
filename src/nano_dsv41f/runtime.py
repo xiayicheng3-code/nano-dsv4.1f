@@ -11,7 +11,38 @@ def package_versions():
             return version(name)
         except PackageNotFoundError:
             return None
-    return {name: get(name) for name in ('jax', 'jaxlib', 'libtpu')}
+    return {name: get(name) for name in ('jax', 'jaxlib', 'libtpu', 'tokamax')}
+
+
+def ragged_dot_preflight():
+    """Exercise the actual Tokamax TPU kernel and both VJPs before model init."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from .tpu_moe import _ragged_dot
+
+    # Uneven groups, an empty expert and an unused suffix exercise masking too.
+    groups = jnp.array([37, 0, 22], jnp.int32)
+    x = jnp.ones((128, 128), jnp.bfloat16) * .01
+    w = jnp.ones((3, 128, 128), jnp.bfloat16) * .02
+
+    def run(implementation):
+        def loss(x, w):
+            y = _ragged_dot(x, w, groups, implementation=implementation)
+            return jnp.square(y.astype(jnp.float32)).mean(), y
+        return jax.jit(jax.value_and_grad(loss, argnums=(0, 1), has_aux=True))(x, w)
+
+    actual, expected = run('mosaic'), run('xla')
+    jax.block_until_ready((actual, expected))
+    for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+        a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+        if not np.isfinite(a).all():
+            raise RuntimeError('Tokamax Mosaic forward/backward returned non-finite values')
+        np.testing.assert_allclose(a, b, atol=2e-4, rtol=.03)
+    assert np.all(np.asarray(actual[1][1][1]) == 0), 'empty-expert gradient must be zero'
+    assert np.all(np.asarray(actual[1][0][59:]) == 0), 'unused-row gradient must be zero'
+    print('Tokamax 0.0.12 Mosaic ragged-dot forward + input/weight gradients: PASS', flush=True)
+    return {'implementation': 'mosaic', 'parity': 'PASS', 'group_sizes': [37, 0, 22]}
 
 
 def pallas_preflight(*, require_eight_chips=True):
@@ -51,4 +82,5 @@ def pallas_preflight(*, require_eight_chips=True):
             'metadata, and any custom TPU_LIBRARY_PATH override. Original error: ' + str(exc)
         ) from exc
     print('Splash forward + backward + packed segments + sink: PASS', flush=True)
+    report['ragged_dot_preflight'] = ragged_dot_preflight()
     return report

@@ -70,8 +70,7 @@ def main() -> None:
         cosine_decay_start_fraction=1.0,
     )
     native_config = TPUNativeConfig(
-        moe_capacity_factor=2.0,
-        moe_capacity_multiple=128,
+        moe_ragged_implementation="mosaic",
         force_block_remat=True,
     )
     print("semantic axes:", semantic_axes(config, mesh))
@@ -171,6 +170,7 @@ def main() -> None:
         if step_i == 0:
             assert int(jax.device_get(metrics["lm_tokens"])) == packed.lm_tokens
             assert int(jax.device_get(metrics["native_moe_layers"])) == config.n_layers
+            assert int(jax.device_get(metrics["moe_mosaic_layers"])) == config.n_layers
             assert int(jax.device_get(metrics["experts_per_chip"])) == 2
             loads = np.asarray(jax.device_get(metrics["expert_loads"]))
             overflow = np.asarray(jax.device_get(metrics["expert_overflow"]))
@@ -182,8 +182,9 @@ def main() -> None:
             )
             assert int(loads.sum()) == expected_assignments
             print("expert loads across all backbone layers:", loads.tolist())
-            print("expert overflow across all backbone layers:", overflow.tolist())
-            print("per-expert capacity per layer:", int(jax.device_get(metrics["expert_capacity"])))
+            assert not overflow.any()
+            print("MoE backend: Tokamax 0.0.12 Mosaic ragged_dot")
+            print("packed assignment buffer rows per chip:", int(jax.device_get(metrics["expert_packed_rows"])))
         assert np.isfinite(loss), (step_i, loss)
         print(f"base step {step_i:02d}: lm_loss={loss:.6f} seconds={base_seconds[-1]:.4f}")
 
@@ -267,6 +268,8 @@ def main() -> None:
         'base_lm_tokens_per_second': packed.lm_tokens / float(np.median(base_seconds[2:])),
         'late_lm_tokens_per_second': packed.lm_tokens / float(np.median(late_seconds[2:])),
         'expert_dropped': int(jax.device_get(metrics['expert_dropped'].sum())),
+        'moe_mosaic_layers': int(jax.device_get(metrics['moe_mosaic_layers'])),
+        'expert_packed_rows': int(jax.device_get(metrics['expert_packed_rows'])),
         'timing_note': 'Synchronized complete steps; first two steps per phase excluded from medians. Physical packing utilization is not Splash block utilization.',
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

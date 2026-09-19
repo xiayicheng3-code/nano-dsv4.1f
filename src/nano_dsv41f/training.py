@@ -204,6 +204,8 @@ def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
             "expert_overflow": jnp.zeros((config.n_experts,), dtype=jnp.int32),
             "expert_dropped": jnp.zeros((config.n_experts,), dtype=jnp.int32),
             "expert_capacity": jnp.asarray(0, dtype=jnp.int32),
+            "expert_packed_rows": jnp.asarray(0, dtype=jnp.int32),
+            "moe_mosaic_layers": jnp.asarray(0, dtype=jnp.int32),
             "experts_per_chip": jnp.asarray(0, dtype=jnp.int32),
         }
     loads = jnp.sum(
@@ -220,6 +222,8 @@ def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
         "expert_overflow": overflow,
         "expert_dropped": jnp.sum(jnp.stack(tuple(layer["expert_dropped"] for layer in native_layers)), axis=0),
         "expert_capacity": native_layers[0]["expert_capacity"],
+        "expert_packed_rows": native_layers[0]["expert_packed_rows"],
+        "moe_mosaic_layers": sum(layer["moe_mosaic"] for layer in native_layers),
         "experts_per_chip": native_layers[0].get(
             "experts_per_chip", jnp.asarray(1, dtype=jnp.int32)
         ),

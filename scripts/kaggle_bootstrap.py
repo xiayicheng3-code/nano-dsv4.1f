@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-if any(name in sys.modules for name in ("jax", "jaxlib", "libtpu", "nano_dsv41f")):
+if any(name in sys.modules for name in ("jax", "jaxlib", "libtpu", "tokamax", "nano_dsv41f")):
     raise RuntimeError("Restart the Kaggle session and run this cell first: JAX/TPU was already imported.")
 
 ROOT = Path('/kaggle/working/nano-dsv4.1f')
@@ -31,5 +31,5 @@ os.environ['JAX_PLATFORMS'] = 'tpu'
 print('repo:', ROOT)
 print('requested ref:', REPO_REF)
 print('commit:', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
-print('packages:', {p: version(p) for p in ('jax', 'jaxlib', 'libtpu')})
+print('packages:', {p: version(p) for p in ('jax', 'jaxlib', 'libtpu', 'tokamax')})
 # Execution cells run fresh Python processes. Never retain an old TPU client in IPython.

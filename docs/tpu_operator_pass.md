@@ -1,5 +1,9 @@
 # TPU v5e operator pass — 2026-09-17
 
+The tiled MoE described below is the historical first pass. It has since been
+replaced by [Tokamax 0.0.12 ragged dots](tokamax_moe.md); that page documents the
+current dispatch, backward kernels and diagnostics.
+
 ## Regression diagnosis
 
 The supplied `nano-dsv4-1f (6).log` runs commit `8a89bf6`, JAX 0.10.2, and a TPU

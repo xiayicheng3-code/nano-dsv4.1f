@@ -15,7 +15,7 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: Install
-        run: pip install -e '.[dev]'
+        run: pip install -e '.[dev]' 'jax==0.10.2' 'jaxlib==0.10.2'
       - name: Test reference implementation
         env:
           JAX_PLATFORMS: cpu
@@ -25,8 +25,8 @@ jobs:
           JAX_PLATFORMS: cpu
           XLA_FLAGS: --xla_force_host_platform_device_count=8
         run: >-
-          pytest -q tests/test_operator_pass.py tests/test_indexer_query_budget.py
-          -k "dropless_expert_forward_and_backward or router_loads_cross_outer_2x4_into_flat_tp or context_sharded_query_budget"
+          pytest -q tests/test_operator_pass.py tests/test_indexer_query_budget.py tests/test_tokamax_moe.py
+          -k "dropless_expert_forward_and_backward or router_loads_cross_outer_2x4_into_flat_tp or context_sharded_query_budget or ragged_ep or invalid_expert_mesh"
       - name: Build and parse Kaggle notebook
         env:
           JAX_PLATFORMS: cpu

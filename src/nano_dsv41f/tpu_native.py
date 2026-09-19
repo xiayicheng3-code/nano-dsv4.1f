@@ -19,7 +19,7 @@ from .csa2 import (
     segment_local_positions,
 )
 from .layers import linear, rms_norm
-from .moe import _expert_forward, apply_moe as apply_moe_reference, route_tokens
+from .moe import apply_moe as apply_moe_reference
 from .quantization import fake_fp8_e4m3
 from .rope import apply_partial_rope
 from .splash import _splash_modules
@@ -32,6 +32,8 @@ class TPUNativeConfig:
     use_splash_attention: bool = True
     use_expert_parallel_moe: bool = True
     force_block_remat: bool = True
+    moe_ragged_implementation: Literal["auto", "mosaic", "xla"] = "auto"
+    # Deprecated compatibility fields; Tokamax ragged dispatch has no capacity cap.
     moe_capacity_factor: float = 1.5
     moe_capacity_multiple: int = 128
     manual_axis_name: str = "tp"
@@ -39,6 +41,8 @@ class TPUNativeConfig:
     need_teacher_lse: bool = False
 
     def __post_init__(self) -> None:
+        if self.moe_ragged_implementation not in ("auto", "mosaic", "xla"):
+            raise ValueError("moe_ragged_implementation must be auto, mosaic or xla")
         if self.moe_capacity_factor < 1.0:
             raise ValueError("moe_capacity_factor must be >= 1")
         if self.moe_capacity_multiple <= 0:
@@ -88,21 +92,6 @@ def manual_v5e_mesh(mesh: Mesh, axis_name: str = "tp") -> Mesh:
     manual = Mesh(devices, (axis_name,), axis_types=(AxisType.Auto,))
     _MANUAL_MESH_CACHE[key] = manual
     return manual
-
-
-def moe_capacity(
-    n_tokens: int,
-    *,
-    top_k: int,
-    n_experts: int,
-    capacity_factor: float,
-    multiple: int,
-) -> int:
-    if min(n_tokens, top_k, n_experts, multiple) <= 0:
-        raise ValueError("MoE capacity inputs must be positive")
-    raw = math.ceil(n_tokens * top_k / n_experts * capacity_factor)
-    rounded = math.ceil(raw / multiple) * multiple
-    return min(n_tokens * top_k, rounded)
 
 
 def _moe_param_specs(axis_name: str):

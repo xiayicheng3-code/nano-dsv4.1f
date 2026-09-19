@@ -157,7 +157,13 @@ Production Mega-mHC fusion/checkpoint-identical initialization are not goals of 
 
 Backbone reference preserves routed experts + one shared expert, `sqrt(softplus(logit))` routing, selection-only correction bias, normalized unbiased selected weights, route scaling, and clipped SwiGLU. DSpark has its own routed-expert count and Top-K.
 
-The native backend now uses dropless, static-tile expert dispatch with resident matrices, fused gate/up projection and reduce-scatter. A globally aggregated text-only no-aux correction-bias controller updates by 0.001 per step (padding excluded). The report's separate image controller and sequence-level auxiliary balance loss are not implemented. Ragged all-to-all dispatch remains deferred.
+The native backend uses Tokamax 0.0.12 ragged-dot forward/backward with resident
+expert matrices, a grouped gate/up projection and grouped down projection. Sorted
+local assignments are dropless, including under extreme imbalance. All-gather and
+reduce-scatter remain the communication path. A globally aggregated text-only
+no-aux correction-bias controller updates by 0.001 per step (padding excluded).
+The report's separate image controller and sequence-level auxiliary balance loss
+are not implemented. Ragged all-to-all dispatch remains deferred.
 
 ## Engram
 

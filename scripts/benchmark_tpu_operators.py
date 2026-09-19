@@ -45,12 +45,13 @@ def main():
         parser.error('--steps must be positive')
     runtime = pallas_preflight()
     mesh = make_v5e_mesh()
-    state = TPUNativeState(mesh, TPUNativeConfig(moe_capacity_factor=1.0))
+    state = TPUNativeState(mesh, TPUNativeConfig(moe_ragged_implementation='mosaic'))
     # Small enough for the deliberately inefficient reference to be a safe oracle.
     x = jax.random.normal(jax.random.key(17), (1, 256, 128), dtype=jnp.float32) * .1
     params = init_moe(jax.random.key(18), 128, 128, 16)
     kwargs = dict(top_k=2, route_scale=1.5, swiglu_limit=10., eps=1e-20)
     report = {'runtime': runtime,
+              'native_backend': 'tokamax-0.0.12/mosaic/ragged_dot',
               'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'shape': {'batch': 1, 'tokens': 256, 'dim': 128, 'expert_dim': 128, 'experts': 16, 'top_k': 2},
               'cases': {}}

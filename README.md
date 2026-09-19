@@ -18,7 +18,7 @@ This is **not** a checkpoint-compatible miniature of the 552B production model, 
 | Attention | MLA-style shared latent K/V, partial + inverse RoPE, attention sink, grouped low-rank `wo_a`, dense reference path + TPU-native Splash path |
 | Sparse retrieval | Cross-layer index-K reuse, dynamic multi-head indexer scoring, hierarchical candidate blocks, late selective distillation |
 | Residual / FFN | Single-Pass mHC + routed/shared-expert MoE + clipped SwiGLU |
-| TPU MoE | 8-way expert parallelism, multiple resident experts per chip, dropless tiled dispatch and reduce-scatter |
+| TPU MoE | Tokamax 0.0.12 ragged-dot forward/backward, resident expert shards, dropless dispatch and reduce-scatter |
 | Memory | Engram-style hashed n-gram memory with packed-sequence-safe hashing |
 | Speculation | One-stage DSpark reference with separate MoE, Markov correction and confidence prediction |
 | Optimizer | Inspectable AdamW / Muon / head-wise Muon / Sinkhorn-balanced parameter rules |
@@ -160,7 +160,9 @@ The native backend lives in `tpu_native.py` and specializes only the operations 
 
 ## TPU-native Phase A — expert-parallel MoE
 
-The nano backbone has exactly **8 routed experts** and Kaggle v5e-8 exposes **8 TPU chips**, so the native execution path maps one routed expert to each chip.
+The default backbone has **8 routed experts** on **8 TPU chips**. The native path
+also supports multiple resident experts per chip; the combined smoke uses 16 experts.
+Expert counts must divide evenly over the expert mesh.
 
 Conceptually:
 
@@ -169,22 +171,32 @@ context-sharded token activations
         ↓
 FP32 router / top-k
         ↓
-fixed-capacity expert assignments
+all-gather token activations and routing metadata
         ↓
-compact token payload communication
+sort assignments into contiguous local expert groups
         ↓
-one resident expert per TPU
+Tokamax ragged gate/up projection
         ↓
-local BF16 SwiGLU GEMMs
+clipped SwiGLU + Tokamax ragged down projection
         ↓
-combine routed contributions
+FP32 weighted scatter + reduce-scatter
         ↓
 original context shard
 ```
 
 The critical property is that **expert matrices remain resident**. The native path never evaluates `expert_weights[per_token_indices]`, so whole `[D,F]` matrices are no longer duplicated once per token assignment.
 
-The current implementation intentionally favors a simple, static-shape first backend: it uses fixed-capacity routing and collective token exchange/reduction rather than a fully ragged all-to-all kernel. This is designed to make memory bounded and autodiff straightforward first. Once real TPU profiles exist, the communication path can be upgraded to ragged all-to-all or a ring-of-experts style design if bandwidth dominates.
+`tokamax==0.0.12` now owns the routed expert GEMMs and their input/weight backward
+kernels. TPU execution explicitly selects Mosaic, so unsupported kernels fail
+instead of silently using a dense fallback. CPU tests use Tokamax's XLA path.
+Dynamic group sizes cover every assignment, including extreme routing imbalance;
+unused rows are masked before and after each dot. The old custom tile loop is removed.
+
+Communication remains all-gather plus reduce-scatter. Packed buffers use a static
+worst-case bound, while ragged GEMM work follows group sizes. This change does not
+implement ragged all-to-all. The shared expert stays a local dense GEMM. See
+[Tokamax integration and validation](docs/tokamax_moe.md) for runtime pins, controls,
+memory tradeoffs, and physical TPU benchmark instructions.
 
 The always-on shared expert remains replicated and is computed locally on each context shard.
 
@@ -282,6 +294,7 @@ src/nano_dsv41f/
   model.py           end-to-end semantic backbone + DSpark wiring
   tpu.py             v5e Auto mesh, PartitionSpecs, direct-to-shard init
   tpu_native.py      active v5e Splash + expert-parallel training backend
+  tpu_moe.py         Tokamax ragged expert products and assignment packing
   precision.py       BF16 payload / FP32 control parameter policy
   profiling.py       AOT memory/cost/collective diagnostics
   splash.py          low-level Splash helpers/reference experiments
@@ -295,7 +308,7 @@ The remaining milestones are deliberately driven by real hardware/data evidence:
 
 - finish the current Kaggle v5e-8 run and record native compile memory, StableHLO collectives and steady-state step time;
 - compare native vs reference memory behavior on the smallest sequence lengths where both compile;
-- profile the dropless tiled expert path and replace it with ragged all-to-all / ring-of-experts style dispatch only if communication is the bottleneck;
+- profile Tokamax ragged GEMMs and dispatch; consider ragged all-to-all / ring-of-experts if communication dominates;
 - implement packed MXFP4 main-KV/index storage with on-chip software dequantization instead of materializing dequantized caches in HBM;
 - decide whether vocab-parallel cross-entropy is worthwhile once the 32K LM head is measured on hardware;
 - attach a pretrained tokenizer + packed corpus and publish training curves / retrieval diagnostics;

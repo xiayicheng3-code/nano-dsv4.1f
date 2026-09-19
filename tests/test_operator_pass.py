@@ -19,7 +19,7 @@ def test_dropless_expert_forward_and_backward(shards, skewed):
     if len(jax.devices()) < shards:
         pytest.skip('Run with XLA_FLAGS=--xla_force_host_platform_device_count=8')
     mesh = Mesh(np.asarray(jax.devices()[:shards]), ('x',), axis_types=(AxisType.Auto,))
-    state = TPUNativeState(mesh, TPUNativeConfig(moe_capacity_factor=1.0, moe_capacity_multiple=2))
+    state = TPUNativeState(mesh, TPUNativeConfig())
     x = jax.random.normal(jax.random.key(1), (2, 16, 4)) * 0.3
     p = init_moe(jax.random.key(2), 4, 8, 16)
     if skewed:
@@ -32,8 +32,9 @@ def test_dropless_expert_forward_and_backward(shards, skewed):
     np.testing.assert_allclose(got, ref_y, atol=2e-6, rtol=2e-5)
     assert int(aux['expert_loads'].sum()) == 64
     assert int(aux['expert_dropped'].sum()) == 0
+    assert int(aux['expert_overflow'].sum()) == 0
     if skewed:
-        assert int(aux['expert_overflow'].sum()) > 0
+        assert int(aux['expert_loads'].max()) == 32
     def objective(fn, x, p): return jnp.sum(jnp.sin(fn(x, p)))
     expected = jax.jit(jax.grad(lambda x, p: objective(ref, x, p), argnums=(0, 1)))(x, p)
     actual = jax.jit(jax.grad(lambda x, p: objective(native, x, p), argnums=(0, 1)))(x, p)
@@ -48,7 +49,7 @@ def test_router_loads_cross_outer_2x4_into_flat_tp():
     devices = np.asarray(jax.devices()[:8], dtype=object).reshape(2, 4)
     outer = Mesh(devices, ('x', 'y'), axis_types=(AxisType.Auto, AxisType.Auto))
     state = TPUNativeState(
-        outer, TPUNativeConfig(moe_capacity_factor=1.0, moe_capacity_multiple=2)
+        outer, TPUNativeConfig()
     )
     x_host = jax.random.normal(jax.random.key(21), (1, 16, 4)) * .2
     mask_host = jnp.array([[1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0]], bool)
@@ -217,8 +218,7 @@ def test_native_late_loss_and_gradients_match_reference_backbone():
     expected, expected_grad = jax.jit(jax.value_and_grad(objective, has_aux=True))(params)
     install_model_dispatch()
     mesh = Mesh(np.asarray(jax.devices()[:1]), ('x',), axis_types=(AxisType.Auto,))
-    with tpu_native_context(mesh, TPUNativeConfig(splash_interpret=True, need_teacher_lse=True,
-                                                moe_capacity_factor=1., moe_capacity_multiple=8)):
+    with tpu_native_context(mesh, TPUNativeConfig(splash_interpret=True, need_teacher_lse=True)):
         actual, actual_grad = jax.jit(jax.value_and_grad(objective, has_aux=True))(params)
     np.testing.assert_allclose(actual[0], expected[0], atol=2e-5, rtol=2e-5)
     np.testing.assert_allclose(actual[1]['indexer_loss'], expected[1]['indexer_loss'], atol=2e-6, rtol=2e-5)
