@@ -65,7 +65,7 @@ buffer or introduce a new MoE communication algorithm.
 |---|---:|---:|---:|---:|---:|
 | baseline | 8 | 768 | 2 | 1536 | 122,069,260 |
 | narrow24 | 24 | 256 | 2 | 512 | 112,689,532 |
-| narrow48 | 48 | 128 | 2 | 256 | 110,416,420 |
+| narrow48 | 48 | 128 | 4 | 512 | 110,416,420 |
 
 All preserve E×F=6144 and the routed SwiGLU weight capacity per layer
 (3×D×E×F). Total parameters differ because the current config shares `d_ff` with
@@ -76,13 +76,20 @@ For a moderate narrowing start with 24×256; 48×128 is the stronger sparsity
 candidate. Width 128 meets the current ragged kernel's tile dimensions, while
 widths below 128 require padding and do not guarantee proportional speedups.
 More experts mean fewer assignments per expert and potentially worse kernel
-utilization. With global B=4, T=8192 and K=2, uniform routing gives about 1365
-assignments per expert at E=48, versus 8192 at E=8, before packing masks.
+utilization. With global B=4 and T=8192, uniform routing gives about 2731 assignments per
+expert at E=48/K=4, versus 8192 at E=8/K=2, before packing masks.
 
-At top-2 the narrow candidates execute much less routed FFN compute. Faster steps
-cannot be interpreted as equal quality. `--top-k` can test wider selection, but
-increasing K also enlarges dispatch/sort work and worst-case packed buffers.
-`--experts` and `--width` expose explicit alternatives without changing defaults.
+The narrow48 profile now defaults to top-4, matching narrow24/top-2 in routed
+active width (512) and routed weight capacity. Their shared-expert width and
+routing/dispatch costs still differ, so this is not an equal-total-compute comparison.
+Both execute less routed FFN work than the baseline. Faster steps cannot establish
+equal learning quality. Override `--top-k 2` to repeat the old narrow48 experiment.
+
+The current EP adapter allocates `B*T*min(K, local_experts)` packed rows per chip.
+At E=48/EP8 there are six local experts, so top-4 uses `4*B*T` packed rows versus
+`2*B*T` for top-2. This doubles those dispatch buffers, not the entire model HBM
+footprint. Re-measure capacity after changing K. `--experts` and `--width` expose
+explicit alternatives without changing the baseline.
 
 ## Measurement and failures
 
@@ -123,3 +130,35 @@ XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m pytest \
   tests/test_attention_parallelism.py tests/test_pretrain_stress.py -q
 python scripts/build_stress_notebook.py
 ```
+
+
+## Automatic row-capacity search
+
+The final notebook section enables a bounded search for one selected model/layout.
+It is opt-in because every batch size needs a fresh full-model compilation. Default
+search candidate: 48×128/top-4, CP2/DP4, start B=4, cap B=32, both phases, long rows.
+The cap is user-configurable and is not a predicted TPU capacity.
+
+The supervisor's `--capacity-max-rows N` flag doubles batch size until an explicit
+HBM/device-memory failure or the cap, then bisects in DP-sized increments. Starting
+above the fitting range also searches down to the smallest legal microbatch. A
+passing cap reports `cap_reached`; it does not claim a maximum. Adjacent observed
+pass/OOM sizes report `boundary_observed`. Non-memory failures, host kills, VMEM
+kernel errors and timeouts stop with `inconclusive`, preserving prior evidence.
+The method assumes fit is monotonic with rows for this workload; shape-dependent
+compiler choices can violate that assumption. Every attempted row count is saved.
+
+A fixed-row test alone establishes that row count fits, not an accurate maximum.
+The automatic search measures a boundary under the tested runtime, remat, precision,
+packing, routing, objectives and executable-retention policy. A short synthetic run
+cannot guarantee the same boundary for all trained router distributions, checkpoint
+or evaluation buffers, or longer runs. Validate the chosen batch with more steps,
+representative packed data and forced skew. Keep the training microbatch below the
+observed failure boundary with measured headroom. Compare tokens/s separately:
+maximum fitting rows and fastest rows per second need not coincide.
+
+All row counts are global microbatch rows. Gradient accumulation increases the
+number of rows per optimizer update without retaining every microbatch's forward
+activations simultaneously; its accumulator buffers still require memory. This
+stress worker performs one microbatch per optimizer update and does not benchmark
+gradient accumulation.

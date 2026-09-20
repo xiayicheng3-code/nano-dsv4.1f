@@ -23,7 +23,7 @@ the frozen tokenizer's PAD/noise IDs. The default architecture is the current ba
 narrow expert profiles are candidates, not a silently changed training decision.
 
 Default: compare CP8/DP1 against CP2/DP4 at the **same four-row global batch**, then test
-48 width-128 experts. EP remains 8 and its reshards are included in end-to-end timings.
+48 width-128 experts with top-4 routing. EP remains 8 and its reshards are included in end-to-end timings.
 Each case runs two warmup + ten measured steps per phase. Compilation can take minutes.
 Real TPU timings and HBM cannot be inferred from CPU validation."""),
         nbf.v4.new_code_cell("import os\nos.environ.setdefault('NANO_DSV41F_REF', 'codex/pretrain-stress-8k')"),
@@ -34,8 +34,9 @@ Every case uses the full model and 8K rows. `batch_rows` is the global microbatc
 per chip; it must divide evenly over DP. CP2/DP2 would use four devices and is rejected on
 this eight-device recipe. Try CP4/DP2 if you want two data replicas using all eight.
 
-`baseline=8×768`, `narrow24=24×256`, `narrow48=48×128`, all top-2. They have equal routed
-expert parameters but different active compute and shared-expert/DSpark sizes. Use
+`baseline=8×768, top-2`, `narrow24=24×256, top-2`, `narrow48=48×128, top-4`.
+They have equal routed expert parameters; narrow24 and narrow48 each activate 512 routed
+FFN units/token, with different dispatch costs and shared-expert/DSpark sizes. Use
 `experts`, `width`, `top_k` for explicit alternatives. A lower step time does not establish
 equal learning quality.
 
@@ -51,7 +52,7 @@ from datetime import datetime, timezone
 CASES = [
     dict(profile='baseline', cp=8, dp=1, batch_rows=4),
     dict(profile='baseline', cp=2, dp=4, batch_rows=4),
-    dict(profile='narrow48', cp=2, dp=4, batch_rows=4),
+    dict(profile='narrow48', top_k=4, cp=2, dp=4, batch_rows=4),
     # dict(profile='baseline', cp=4, dp=2, batch_rows=4),
     # dict(profile='narrow24', cp=2, dp=4, batch_rows=4),
     # dict(profile='narrow48', cp=2, dp=4, batch_rows=8),
@@ -114,6 +115,48 @@ if summary_path.exists():
     display(FileLink(str(summary_path)))
 else:
     print('No suite summary yet; inspect per-case JSON/logs:', list(OUTPUT.glob('*')))"""),
+        nbf.v4.new_markdown_cell("""## Optional: find the row-capacity boundary
+
+Set `RUN_CAPACITY_SEARCH=True` for the selected recipe. Each probe runs both training
+phases in a fresh process. It tries 4, 8, 16, ... rows up to the chosen cap, then bisects
+between a passing batch and an explicit HBM/device-memory failure in DP-sized increments.
+Every different batch shape requires compilation, so this can take substantially longer
+than the comparison above. `MAX_ROWS=32` is a search cap, not a prediction that 32 fits.
+
+`capacity.json` reports the largest observed passing batch and smallest explicit device
+OOM. Timeouts, host kills, numerical failures and unidentified compiler errors stop with
+an **inconclusive** result; they are not treated as HBM evidence. A reached cap establishes
+only that the cap passed. Bisection assumes fit is monotonic with rows for this workload;
+compiler algorithm changes can violate that assumption.
+
+This measures **global microbatch capacity**, before gradient accumulation. The largest
+fitting batch may not maximize tokens/s. Validate the chosen training batch with longer
+normal and skewed runs and representative packed data; allow headroom for checkpointing
+or evaluation buffers that the training loop may retain. Synthetic long rows exercise
+long-history attention but do not cover every future routing distribution."""),
+        nbf.v4.new_code_cell("""RUN_CAPACITY_SEARCH = False
+MAX_ROWS = 32
+CAPACITY_CASE = dict(profile='narrow48', top_k=4, cp=2, dp=4, batch_rows=4,
+                     phase='both', layout='long', routing='normal', warmup=2, steps=10)
+
+if RUN_CAPACITY_SEARCH:
+    CAPACITY_OUTPUT = Path('/kaggle/working') / ('capacity-' + datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S'))
+    CAPACITY_OUTPUT.mkdir(parents=True, exist_ok=False)
+    capacity_plan = CAPACITY_OUTPUT / 'plan.json'
+    capacity_plan.write_text(json.dumps([CAPACITY_CASE], indent=2))
+    result = subprocess.run([
+        sys.executable, '-u', 'scripts/run_stress_suite.py', '--plan', str(capacity_plan),
+        '--output-dir', str(CAPACITY_OUTPUT), '--capacity-max-rows', str(MAX_ROWS),
+        '--timeout-seconds', '3600',
+    ], check=False)
+    capacity_report = CAPACITY_OUTPUT / 'capacity.json'
+    if capacity_report.exists():
+        capacity = json.loads(capacity_report.read_text())
+        display(Markdown(f\"**{capacity['status']}** — largest passed: {capacity['largest_passed_rows']} rows; smallest explicit device OOM: {capacity['smallest_device_oom_rows']} rows.\"))
+        display(FileLink(str(capacity_report)))
+    print('capacity return code:', result.returncode, 'reports:', CAPACITY_OUTPUT)
+else:
+    print('Capacity search is disabled; enable it after choosing a recipe/layout.')"""),
     ]
     for index, cell in enumerate(nb.cells):
         cell.id = f"pretrain-stress-{index:02d}"

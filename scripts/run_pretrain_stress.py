@@ -189,7 +189,7 @@ def main():
     parser.add_argument("--profile", choices=("baseline", "narrow24", "narrow48"), default="baseline")
     parser.add_argument("--experts", type=int)
     parser.add_argument("--width", type=int)
-    parser.add_argument("--top-k", type=int, default=2)
+    parser.add_argument("--top-k", type=int, help="Override profile default (narrow48: 4; others: 2)")
     parser.add_argument("--cp", type=int, default=8)
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--batch-rows", type=int, default=4)

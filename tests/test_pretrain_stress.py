@@ -31,7 +31,8 @@ def test_recipe_keeps_full_architecture_and_training_schedule():
     for name in ("narrow24", "narrow48"):
         candidate, _, _ = pretrain_recipe(profile=name)
         assert candidate.n_experts * candidate.d_ff == baseline.n_experts * baseline.d_ff
-        assert candidate.experts_per_token == 2
+        assert candidate.experts_per_token == (4 if name == "narrow48" else 2)
+    assert pretrain_recipe(profile="narrow48", top_k=2)[0].experts_per_token == 2
     assert recipe_manifest(baseline, train, native)["sha256"] == recipe_manifest(*pretrain_recipe())["sha256"]
 
 
@@ -61,12 +62,14 @@ def test_stress_notebook_is_valid_and_uses_canonical_bootstrap():
         ast.parse(source)
 
 
-def test_failure_report_is_saved_before_tpu_required(tmp_path):
+@pytest.mark.parametrize("profile,top_k", [("baseline", 2), ("narrow48", 4)])
+def test_failure_report_is_saved_before_tpu_required(tmp_path, profile, top_k):
     import os
     import subprocess
     import sys
     path = tmp_path / "failed.json"
-    result = subprocess.run([sys.executable, "scripts/run_pretrain_stress.py", "--output", str(path)],
+    result = subprocess.run([sys.executable, "scripts/run_pretrain_stress.py", "--output", str(path),
+                             "--profile", profile],
                             cwd=ROOT, env=dict(os.environ, JAX_PLATFORMS="cpu",
                                                PYTHONPATH=str(ROOT / "src")), capture_output=True)
     assert result.returncode != 0
@@ -74,3 +77,4 @@ def test_failure_report_is_saved_before_tpu_required(tmp_path):
     assert report["status"] == "failed" and report["stage"] == "runtime"
     assert "expected a TPU runtime" in report["exception"]
     assert report["recipe"]["train"]["seq_len"] == 8192
+    assert report["recipe"]["model"]["experts_per_token"] == top_k

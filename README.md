@@ -251,7 +251,8 @@ This is now a real accelerator-specific execution path, but **it is still under 
 For full **8192-token pretraining stress tests**, use
 [`notebooks/nano_dsv41f_pretrain_stress.ipynb`](notebooks/nano_dsv41f_pretrain_stress.ipynb).
 It compares the seven-layer baseline at attention CP8/DP1 and CP2/DP4, then a
-48-expert/128-width candidate, all at the same global batch. Native attention now
+48-expert/128-width/top-4 candidate, all at the same global batch. An optional
+bounded search measures the observed batch-capacity boundary in DP-sized increments. Native attention now
 honors these layouts; MoE remains EP8. It records base and late-indexer compile times,
 synchronized optimizer-step timings, compiler/device memory, and incremental failure
 reports. See [the stress-test recipe and interpretation](docs/pretrain_stress.md).
