@@ -263,6 +263,7 @@ class ParallelismConfig:
     # dimension rather than pretending four experts can be eight-way expert-parallel.
     dspark_expert_shard: int = 4
     attention_context_shard: int = 8
+    attention_data_shard: int = 1
     attention_head_shard: int = 1
     indexer_context_shard: int = 8
 
@@ -273,6 +274,7 @@ class ParallelismConfig:
             self.expert_shard,
             self.dspark_expert_shard,
             self.attention_context_shard,
+            self.attention_data_shard,
             self.attention_head_shard,
             self.indexer_context_shard,
         )

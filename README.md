@@ -248,6 +248,15 @@ This is now a real accelerator-specific execution path, but **it is still under 
 
 ## Try it on Kaggle
 
+For full **8192-token pretraining stress tests**, use
+[`notebooks/nano_dsv41f_pretrain_stress.ipynb`](notebooks/nano_dsv41f_pretrain_stress.ipynb).
+It compares the seven-layer baseline at attention CP8/DP1 and CP2/DP4, then a
+48-expert/128-width candidate, all at the same global batch. Native attention now
+honors these layouts; MoE remains EP8. It records base and late-indexer compile times,
+synchronized optimizer-step timings, compiler/device memory, and incremental failure
+reports. See [the stress-test recipe and interpretation](docs/pretrain_stress.md).
+Regenerate this notebook with `python scripts/build_stress_notebook.py`.
+
 A lightweight notebook is checked in at [`notebooks/nano_dsv41f_kaggle.ipynb`](notebooks/nano_dsv41f_kaggle.ipynb). From a blank Kaggle session, select TPU, enable Internet, and run top-to-bottom. The notebook fetches the requested Git ref and prints the exact commit SHA for reproducibility.
 
 Regenerate both maintained notebook entry points with:
