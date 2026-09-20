@@ -7,11 +7,12 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .chat_protocol import ASSISTANT_TOKEN_ID, EOS_TOKEN_ID
+from .chat_protocol import ASSISTANT_TOKEN, EOS_TOKEN_ID, SPECIAL_TOKENS
 
 
 DEFAULT_TRACE_SEQ_LEN = 8192
 DEFAULT_TRACE_Q_BANDS = (640, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+ASSISTANT_TOKEN_ID = SPECIAL_TOKENS.index(ASSISTANT_TOKEN)
 _REASONING_EFFORT_75 = (
     "Reasoning Effort: 75 (range 1-100, the higher the value, "
     "the more thorough the reasoning)\n\n"
@@ -144,8 +145,12 @@ def render_case_v41(case: dict[str, Any]) -> str:
     return prompt[: -len(generation_suffix)]
 
 
-def assistant_sft_loss_mask(token_ids: Sequence[int], *, assistant_token_id: int = ASSISTANT_TOKEN_ID,
-                            eos_token_id: int = EOS_TOKEN_ID) -> np.ndarray:
+def assistant_sft_loss_mask(
+    token_ids: Sequence[int],
+    *,
+    assistant_token_id: int = ASSISTANT_TOKEN_ID,
+    eos_token_id: int = EOS_TOKEN_ID,
+) -> np.ndarray:
     """Mark completed assistant spans in a rendered V4.1 training history.
 
     The atomic assistant marker itself is context. Reasoning, DSML tool calls, assistant
@@ -167,7 +172,9 @@ def assistant_sft_loss_mask(token_ids: Sequence[int], *, assistant_token_id: int
 
 def strip_xml_tag(text: str, tag: str) -> str:
     text = str(text).strip()
-    match = re.fullmatch(rf"\s*<{re.escape(tag)}>(.*)</{re.escape(tag)}>\s*", text, re.DOTALL)
+    match = re.fullmatch(
+        rf"\s*<{re.escape(tag)}>(.*)</{re.escape(tag)}>\s*", text, re.DOTALL
+    )
     return match.group(1).strip() if match else text
 
 
@@ -185,8 +192,17 @@ def parse_tagged_json(text: str, tag: str) -> dict[str, Any]:
     return value
 
 
-def truncate_text(value: Any, limit: int, *, marker: str = "\n...[observation truncated]") -> str:
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+def truncate_text(
+    value: Any,
+    limit: int,
+    *,
+    marker: str = "\n...[observation truncated]",
+) -> str:
+    text = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    )
     text = text.replace("\x00", "")
     if limit > 0 and len(text) > limit:
         return text[:limit] + marker
