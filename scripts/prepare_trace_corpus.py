@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import random
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -50,31 +51,32 @@ class TraceSource:
 REASONING_SOURCES = (
     TraceSource(
         "mot_math", "reasoning", "open-r1/Mixture-of-Thoughts", "train", 0.45,
-        "mixture_of_thoughts", "apache-2.0", config="math",
+        "mixture_of_thoughts", "component-dependent; see upstream dataset cards", config="math",
     ),
     TraceSource(
         "mot_science", "reasoning", "open-r1/Mixture-of-Thoughts", "train", 0.30,
-        "mixture_of_thoughts", "apache-2.0", config="science",
+        "mixture_of_thoughts", "component-dependent; see upstream dataset cards", config="science",
     ),
     TraceSource(
         "mot_code", "reasoning", "open-r1/Mixture-of-Thoughts", "train", 0.25,
-        "mixture_of_thoughts", "apache-2.0", config="code",
+        "mixture_of_thoughts", "component-dependent; see upstream dataset cards", config="code",
     ),
 )
 
 AGENT_SOURCES = (
     TraceSource(
         "swe_success", "agent", "nebius/SWE-agent-trajectories", "train", 0.40,
-        "swe_agent", "cc-by-4.0 + source-repository terms", max_observation_chars=6000,
+        "swe_agent", "cc-by-4.0 + source-repository terms + upstream model-output notice",
+        max_observation_chars=6000,
     ),
     TraceSource(
         "nemotron_interactive", "agent", "nvidia/Nemotron-SFT-Agentic-v2",
-        "interactive_agent", 0.25, "nemotron", "cc-by-4.0/apache-2.0/mit",
+        "interactive_agent", 0.25, "nemotron", "cc-by-4.0; additional apache-2.0/mit",
         max_observation_chars=4000,
     ),
     TraceSource(
         "nemotron_search", "agent", "nvidia/Nemotron-SFT-Agentic-v2", "search",
-        0.15, "nemotron", "cc-by-4.0/apache-2.0/mit", max_observation_chars=1800,
+        0.15, "nemotron", "cc-by-4.0; additional apache-2.0/mit", max_observation_chars=1800,
     ),
     TraceSource(
         "openseeker_correct", "agent",
@@ -117,9 +119,7 @@ def _split_think(text: str) -> tuple[str, str] | None:
         return None
     reasoning = text[start + 7 : end].strip()
     final = (text[:start] + "\n" + text[end + 8 :]).strip()
-    if not reasoning or not final:
-        return None
-    return reasoning, final
+    return (reasoning, final) if reasoning and final else None
 
 
 def adapt_mixture_of_thoughts(
@@ -130,38 +130,42 @@ def adapt_mixture_of_thoughts(
         return None
     if messages[0].get("role") != "user" or messages[1].get("role") != "assistant":
         return None
-    user = messages[0].get("content")
-    answer = messages[1].get("content")
+    user, answer = messages[0].get("content"), messages[1].get("content")
     if not isinstance(user, str) or not isinstance(answer, str):
         return None
     split = _split_think(answer)
     if split is None:
         return None
     reasoning, final = split
-    case = {
-        "messages": [
-            {"role": "user", "content": user},
-            {"role": "assistant", "reasoning_content": reasoning, "content": final},
-        ],
-        "thinking_mode": "thinking",
-        "metadata": {
-            "id": _identity(source, row, row_index),
-            "dataset": source.dataset,
-            "source": source.key,
-            "upstream_source": row.get("source"),
-            "upstream_num_tokens": row.get("num_tokens"),
+    return normalize_agent_trace(
+        {
+            "messages": [
+                {"role": "user", "content": user},
+                {"role": "assistant", "reasoning_content": reasoning, "content": final},
+            ],
+            "thinking_mode": "thinking",
+            "metadata": {
+                "id": _identity(source, row, row_index),
+                "dataset": source.dataset,
+                "source": source.key,
+                "upstream_source": row.get("source"),
+                "upstream_num_tokens": row.get("num_tokens"),
+            },
         },
-    }
-    return normalize_agent_trace(case, default_reasoning_effort=75)
+        default_reasoning_effort=75,
+    )
 
 
-def _swe_shell_tool() -> list[dict[str, Any]]:
+def _swe_tool() -> list[dict[str, Any]]:
     return [
         {
             "type": "function",
             "function": {
-                "name": "shell",
-                "description": "Execute a command in the software-engineering environment.",
+                "name": "swe_environment",
+                "description": (
+                    "Execute one command in the SWE-agent repository environment. The command may "
+                    "be bash or one of the environment's documented navigation/editing commands."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {"cmd": {"type": "string"}},
@@ -172,12 +176,18 @@ def _swe_shell_tool() -> list[dict[str, Any]]:
     ]
 
 
-def _swe_content(item: dict[str, Any], *names: str) -> str:
-    for name in names:
-        value = item.get(name)
-        if value not in (None, ""):
-            return str(value)
-    return ""
+_FENCE_RE = re.compile(r"```(?:[^\n]*\n)?(.*?)```", re.DOTALL)
+
+
+def _split_swe_ai_turn(text: str) -> tuple[str, str | None]:
+    """Split Nebius' AI text into reasoning and its final fenced environment command."""
+    matches = list(_FENCE_RE.finditer(text))
+    if not matches:
+        return text.strip(), None
+    last = matches[-1]
+    action = last.group(1).strip()
+    reasoning = (text[: last.start()] + text[last.end() :]).strip()
+    return reasoning, action or None
 
 
 def adapt_swe_agent(
@@ -198,129 +208,78 @@ def adapt_swe_agent(
     pending_call: str | None = None
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
-            continue
+            return None
         role = str(item.get("role", "")).lower()
-
-        # Some exports store each SWE-agent step directly as thought/action/observation.
-        if not role and any(key in item for key in ("thought", "action", "observation")):
-            thought = _swe_content(item, "thought", "reasoning")
-            action = _swe_content(item, "action")
-            if action:
-                call_id = f"swe_{row_index}_{i}"
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": thought or None,
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": "shell",
-                                    "arguments": json.dumps({"cmd": action}),
-                                },
-                            }
-                        ],
-                    }
-                )
-                observation = _swe_content(item, "observation")
-                if observation:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": truncate_text(
-                                observation, source.max_observation_chars
-                            ),
-                        }
-                    )
-            continue
-
         if role == "system":
+            system = item.get("system_prompt") or item.get("text") or ""
             messages.append(
-                {"role": "system", "content": _swe_content(item, "content", "message", "text", "observation")}
+                {
+                    "role": "system",
+                    "content": (
+                        "This successful SWE-agent demonstration originally wrote environment commands "
+                        "in fenced blocks. In this DeepSeek training view, invoke the same commands "
+                        "through the swe_environment tool instead.\n\n" + str(system)
+                    ),
+                }
             )
             continue
-        if role in ("ai", "assistant", "agent"):
-            thought = _swe_content(item, "thought", "reasoning", "analysis")
-            action = _swe_content(item, "action")
-            response = _swe_content(item, "content", "message", "response", "text")
-            if action:
-                call_id = f"swe_{row_index}_{i}"
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": thought or None,
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": "shell",
-                                    "arguments": json.dumps({"cmd": action}),
-                                },
-                            }
-                        ],
-                    }
-                )
-                observation = _swe_content(item, "observation")
-                if observation:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": truncate_text(
-                                observation, source.max_observation_chars
-                            ),
-                        }
-                    )
-                    pending_call = None
-                else:
-                    pending_call = call_id
-            elif response or thought:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response,
-                        "reasoning_content": thought or None,
-                    }
-                )
-            continue
-        if role in ("user", "observation", "environment", "tool"):
-            content = _swe_content(item, "content", "message", "observation", "text")
-            if pending_call:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": pending_call,
-                        "content": truncate_text(content, source.max_observation_chars),
-                    }
-                )
+        if role == "user":
+            text = truncate_text(item.get("text") or "", source.max_observation_chars)
+            if pending_call is not None:
+                messages.append({"role": "tool", "tool_call_id": pending_call, "content": text})
                 pending_call = None
-            elif content:
-                messages.append({"role": "user", "content": content})
-
-    if len(messages) < 2 or not any(m.get("role") == "assistant" for m in messages):
+            elif text:
+                messages.append({"role": "user", "content": text})
+            continue
+        if role in ("ai", "assistant"):
+            if pending_call is not None:
+                return None
+            text = str(item.get("text") or "")
+            reasoning, action = _split_swe_ai_turn(text)
+            if action is None:
+                if text.strip():
+                    messages.append({"role": "assistant", "content": text.strip()})
+                continue
+            call_id = f"swe_{row_index}_{i}"
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": reasoning or None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "swe_environment",
+                                "arguments": json.dumps({"cmd": action}, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                }
+            )
+            pending_call = call_id
+            continue
         return None
-    case = {
-        "messages": messages,
-        "tools": _swe_shell_tool(),
-        "thinking_mode": "thinking",
-        "metadata": {
-            "id": _identity(source, row, row_index),
-            "dataset": source.dataset,
-            "source": source.key,
-            "instance_id": row.get("instance_id"),
-            "model_name": row.get("model_name"),
-            "target": True,
-            "exit_status": row.get("exit_status"),
-        },
-    }
+
+    if pending_call is not None or len(messages) < 3:
+        return None
     try:
         return normalize_agent_trace(
-            case,
+            {
+                "messages": messages,
+                "tools": _swe_tool(),
+                "thinking_mode": "thinking",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "instance_id": row.get("instance_id"),
+                    "model_name": row.get("model_name"),
+                    "target": True,
+                    "exit_status": row.get("exit_status"),
+                },
+            },
             default_reasoning_effort=75,
             policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
         )
@@ -331,29 +290,25 @@ def adapt_swe_agent(
 def adapt_nemotron(
     source: TraceSource, row: dict[str, Any], row_index: int
 ) -> dict[str, Any] | None:
-    messages = row.get("messages")
-    tools = row.get("tools", [])
+    messages, tools = row.get("messages"), row.get("tools", [])
     if not isinstance(messages, list) or not messages:
         return None
-    thinking_flag = True
     kwargs = row.get("chat_template_kwargs")
-    if isinstance(kwargs, dict) and "thinking" in kwargs:
-        thinking_flag = bool(kwargs["thinking"])
-    case = {
-        "messages": messages,
-        "tools": tools if isinstance(tools, (list, dict)) else [],
-        "thinking_mode": "thinking" if thinking_flag else "chat",
-        "metadata": {
-            "id": _identity(source, row, row_index),
-            "dataset": source.dataset,
-            "source": source.key,
-            "model": row.get("model"),
-            "domain": row.get("domain"),
-        },
-    }
+    thinking = bool(kwargs.get("thinking", True)) if isinstance(kwargs, dict) else True
     try:
         return normalize_agent_trace(
-            case,
+            {
+                "messages": messages,
+                "tools": tools if isinstance(tools, (list, dict)) else [],
+                "thinking_mode": "thinking" if thinking else "chat",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "model": row.get("model"),
+                    "domain": row.get("domain"),
+                },
+            },
             default_reasoning_effort=75,
             policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
         )
@@ -362,25 +317,30 @@ def adapt_nemotron(
 
 
 def _openseeker_tools() -> list[dict[str, Any]]:
-    generic_object = {"type": "object", "additionalProperties": True}
     return [
         {
             "type": "function",
             "function": {
-                "name": "search",
-                "description": "Search the web for relevant sources.",
-                "parameters": generic_object,
+                "name": name,
+                "description": description,
+                "parameters": {"type": "object", "additionalProperties": True},
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "visit",
-                "description": "Visit and read a webpage for a research goal.",
-                "parameters": generic_object,
-            },
-        },
+        }
+        for name, description in (
+            ("search", "Search the web for relevant sources."),
+            ("visit", "Visit and read a webpage for a research goal."),
+        )
     ]
+
+
+def _json_arguments(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+            return value
+        except json.JSONDecodeError:
+            return json.dumps({"input": value}, ensure_ascii=False)
+    return json.dumps(value if value is not None else {}, ensure_ascii=False, separators=(",", ":"))
 
 
 def adapt_openseeker(
@@ -403,19 +363,15 @@ def adapt_openseeker(
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             return None
-        role = item.get("role")
-        content = str(item.get("content", ""))
+        role, content = item.get("role"), str(item.get("content", ""))
         if role == "system":
-            # The upstream system prompt describes its own <tool_call> serialization.
-            # Replace only that protocol wrapper; the trajectory semantics remain intact,
-            # while DeepSeek's official renderer supplies the DSML tool instructions.
             if not messages:
                 messages.append(
                     {
                         "role": "system",
                         "content": (
-                            "You are a deep-research assistant. Use the provided search and "
-                            "visit tools to gather evidence and synthesize an accurate answer."
+                            "You are a deep-research assistant. Use the provided search and visit "
+                            "tools to gather evidence and synthesize an accurate answer."
                         ),
                     }
                 )
@@ -429,7 +385,6 @@ def adapt_openseeker(
             except Exception:
                 return None
             name = payload.get("name")
-            arguments = payload.get("arguments", payload.get("parameters", {}))
             if not isinstance(name, str) or not name:
                 return None
             call_id = f"search_{row_index}_{i}"
@@ -444,16 +399,15 @@ def adapt_openseeker(
                             "type": "function",
                             "function": {
                                 "name": name,
-                                "arguments": json.dumps(
-                                    arguments, ensure_ascii=False, separators=(",", ":")
+                                "arguments": _json_arguments(
+                                    payload.get("arguments", payload.get("parameters", {}))
                                 ),
                             },
                         }
                     ],
                 }
             )
-            pending_reasoning = None
-            pending_call_id = call_id
+            pending_reasoning, pending_call_id = None, call_id
         elif role == "tool_output":
             if pending_call_id is None:
                 return None
@@ -462,8 +416,7 @@ def adapt_openseeker(
                     "role": "tool",
                     "tool_call_id": pending_call_id,
                     "content": truncate_text(
-                        strip_xml_tag(content, "tool_response"),
-                        source.max_observation_chars,
+                        strip_xml_tag(content, "tool_response"), source.max_observation_chars
                     ),
                 }
             )
@@ -482,19 +435,21 @@ def adapt_openseeker(
 
     if pending_call_id is not None or not any(m.get("role") == "assistant" for m in messages):
         return None
-    case = {
-        "messages": messages,
-        "tools": _openseeker_tools(),
-        "thinking_mode": "thinking",
-        "metadata": {
-            "id": _identity(source, row, row_index),
-            "dataset": source.dataset,
-            "source": source.key,
-            "trajectory_correctness": "Correct",
-        },
-    }
     try:
-        return normalize_agent_trace(case, default_reasoning_effort=75)
+        return normalize_agent_trace(
+            {
+                "messages": messages,
+                "tools": _openseeker_tools(),
+                "thinking_mode": "thinking",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "trajectory_correctness": "Correct",
+                },
+            },
+            default_reasoning_effort=75,
+        )
     except Exception:
         return None
 
@@ -512,15 +467,10 @@ def load_stream(source: TraceSource, *, seed: int, shuffle_buffer: int):
         from datasets import load_dataset
     except ImportError as exc:
         raise SystemExit("Trace preparation requires pip install -e '.[data]'") from exc
-    kwargs: dict[str, Any] = {
-        "path": source.dataset,
-        "split": source.split,
-        "streaming": True,
-    }
+    kwargs: dict[str, Any] = {"path": source.dataset, "split": source.split, "streaming": True}
     if source.config is not None:
         kwargs["name"] = source.config
-    stream = load_dataset(**kwargs)
-    return stream.shuffle(seed=seed, buffer_size=shuffle_buffer)
+    return load_dataset(**kwargs).shuffle(seed=seed, buffer_size=shuffle_buffer)
 
 
 def _batch_encode(tokenizer, texts: list[str]):
@@ -528,55 +478,36 @@ def _batch_encode(tokenizer, texts: list[str]):
 
 
 def _prepare_collection_batch(
-    cases: list[dict[str, Any]],
-    *,
-    tokenizer,
-    seq_len: int,
-    seen_prompts: set[bytes],
-) -> tuple[list[tuple[dict[str, Any], int]], dict[str, int]]:
-    if not cases:
-        return [], {"duplicate": 0, "too_long": 0, "no_supervision": 0, "render_error": 0}
-    rendered: list[str] = []
-    rendered_cases: list[dict[str, Any]] = []
-    render_error = 0
+    cases: list[dict[str, Any]], *, tokenizer, seq_len: int, seen_prompts: set[bytes]
+) -> tuple[list[tuple[dict[str, Any], int]], Counter[str]]:
+    stats: Counter[str] = Counter()
+    rendered, rendered_cases = [], []
     for case in cases:
         try:
             rendered.append(render_case_v41(case))
             rendered_cases.append(case)
         except Exception:
-            render_error += 1
+            stats["render_error"] += 1
     if not rendered:
-        return [], {"duplicate": 0, "too_long": 0, "no_supervision": 0, "render_error": render_error}
-
+        return [], stats
     encodings = _batch_encode(tokenizer, rendered)
-    reasoning_strings = [reasoning_text(case) for case in rendered_cases]
-    reasoning_encodings = _batch_encode(tokenizer, reasoning_strings)
+    reasoning_encodings = _batch_encode(tokenizer, [reasoning_text(case) for case in rendered_cases])
     accepted: list[tuple[dict[str, Any], int]] = []
-    duplicate = too_long = no_supervision = 0
-    for case, prompt, enc, renc in zip(
-        rendered_cases, rendered, encodings, reasoning_encodings
-    ):
+    for case, prompt, enc, renc in zip(rendered_cases, rendered, encodings, reasoning_encodings):
         digest = hashlib.blake2b(prompt.encode("utf-8"), digest_size=16).digest()
         if digest in seen_prompts:
-            duplicate += 1
+            stats["duplicate"] += 1
             continue
-        ids = enc.ids
-        if len(ids) > seq_len:
-            too_long += 1
+        if len(enc.ids) > seq_len:
+            stats["too_long"] += 1
             continue
-        loss_mask = assistant_sft_loss_mask(ids)
-        if not loss_mask.any():
-            no_supervision += 1
+        if not assistant_sft_loss_mask(enc.ids).any():
+            stats["no_supervision"] += 1
             continue
         seen_prompts.add(digest)
         case.setdefault("metadata", {})["_reasoning_tokens"] = len(renc.ids)
-        accepted.append((case, len(ids)))
-    return accepted, {
-        "duplicate": duplicate,
-        "too_long": too_long,
-        "no_supervision": no_supervision,
-        "render_error": render_error,
-    }
+        accepted.append((case, len(enc.ids)))
+    return accepted, stats
 
 
 def collect_source_cases(
@@ -590,16 +521,13 @@ def collect_source_cases(
     tokenize_batch_size: int,
     seen_prompts: set[bytes],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    stream = load_stream(source, seed=seed, shuffle_buffer=shuffle_buffer)
-    adapter = ADAPTERS[source.adapter]
-    cases: list[dict[str, Any]] = []
-    batch: list[dict[str, Any]] = []
-    accepted_tokens = 0
-    rows_seen = rows_rejected = 0
-    drops = Counter()
+    stream, adapter = load_stream(source, seed=seed, shuffle_buffer=shuffle_buffer), ADAPTERS[source.adapter]
+    cases, batch = [], []
+    accepted_tokens = rows_seen = rows_rejected = 0
+    drops: Counter[str] = Counter()
 
     def flush() -> bool:
-        nonlocal accepted_tokens, batch
+        nonlocal batch, accepted_tokens
         prepared, stats = _prepare_collection_batch(
             batch, tokenizer=tokenizer, seq_len=seq_len, seen_prompts=seen_prompts
         )
@@ -627,26 +555,20 @@ def collect_source_cases(
 
     if accepted_tokens < target_tokens:
         raise RuntimeError(
-            f"{source.key} exhausted at {accepted_tokens:,} accepted tokens; "
-            f"target was {target_tokens:,}. stats={dict(drops)}"
+            f"{source.key} exhausted at {accepted_tokens:,} tokens; target={target_tokens:,}; "
+            f"drops={dict(drops)}"
         )
     return cases, {
         "rows_seen": rows_seen,
         "rows_adapter_rejected": rows_rejected,
         "accepted_cases": len(cases),
         "accepted_tokens_before_effort_relabel": accepted_tokens,
-        **{f"dropped_{key}": int(value) for key, value in drops.items()},
+        **{f"dropped_{k}": int(v) for k, v in drops.items()},
     }
 
 
 def assign_efforts_and_tokenize(
-    cases: list[dict[str, Any]],
-    *,
-    tokenizer,
-    seq_len: int,
-    batch_size: int,
-    seed: int,
-    jitter: int,
+    cases: list[dict[str, Any]], *, tokenizer, seq_len: int, batch_size: int, seed: int, jitter: int
 ) -> tuple[list[TokenizedTrace], dict[str, int]]:
     cases = assign_length_guided_reasoning_effort(
         cases,
@@ -657,24 +579,22 @@ def assign_efforts_and_tokenize(
         preserve_existing=False,
     )
     traces: list[TokenizedTrace] = []
-    dropped_after_effort = render_error = 0
+    dropped_after_effort = render_errors = 0
     for start in range(0, len(cases), batch_size):
         group = cases[start : start + batch_size]
-        prompts: list[str] = []
-        valid_cases: list[dict[str, Any]] = []
+        prompts, valid_cases = [], []
         for case in group:
             try:
                 prompts.append(render_case_v41(case))
                 valid_cases.append(case)
             except Exception:
-                render_error += 1
+                render_errors += 1
         encodings = _batch_encode(tokenizer, prompts) if prompts else []
         for case, enc in zip(valid_cases, encodings):
-            ids = enc.ids
-            if len(ids) > seq_len:
+            if len(enc.ids) > seq_len:
                 dropped_after_effort += 1
                 continue
-            loss_mask = assistant_sft_loss_mask(ids)
+            loss_mask = assistant_sft_loss_mask(enc.ids)
             if not loss_mask.any():
                 continue
             metadata = dict(case.get("metadata", {}))
@@ -687,7 +607,7 @@ def assign_efforts_and_tokenize(
             thinking = case.get("thinking_mode") == "thinking"
             traces.append(
                 TokenizedTrace(
-                    tokens=np.asarray(ids, dtype=np.uint16),
+                    tokens=np.asarray(enc.ids, dtype=np.uint16),
                     sft_loss_mask=loss_mask,
                     source=str(metadata.get("source", "unknown")),
                     reasoning_effort=int(case.get("reasoning_effort", 75)) if thinking else 0,
@@ -697,7 +617,7 @@ def assign_efforts_and_tokenize(
             )
     return traces, {
         "dropped_after_effort_relabel": dropped_after_effort,
-        "render_errors_after_effort_relabel": render_error,
+        "render_errors_after_effort_relabel": render_errors,
     }
 
 
@@ -725,24 +645,18 @@ def write_trace_shards(
         candidate_window=256,
         seed=seed,
     )
-    rng = random.Random(seed + 91)
-    rng.shuffle(rows)
+    random.Random(seed + 91).shuffle(rows)
     source_names = sorted({trace.source for trace in traces})
     source_id = {name: i + 1 for i, name in enumerate(source_names)}
     q_summary = aggregate_q_metrics(
-        rows,
-        lengths,
-        query_budget=query_budget,
-        q_threshold=q_threshold,
-        band_edges=q_band_edges,
+        rows, lengths, query_budget=query_budget, q_threshold=q_threshold, band_edges=q_band_edges
     )
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    shard_meta: list[dict[str, Any]] = []
     save = np.savez_compressed if compress else np.savez
+    shard_meta: list[dict[str, Any]] = []
+
     for shard_index, start in enumerate(range(0, len(rows), shard_rows)):
-        row_group = rows[start : start + shard_rows]
-        n = len(row_group)
+        row_group, n = rows[start : start + shard_rows], len(rows[start : start + shard_rows])
         input_ids = np.full((n, seq_len), PAD_TOKEN_ID, dtype=np.uint16)
         segment_ids = np.zeros((n, seq_len), dtype=np.uint16)
         token_mask = np.zeros((n, seq_len), dtype=np.uint8)
@@ -759,10 +673,8 @@ def write_trace_shards(
 
         for local_row, row in enumerate(row_group):
             packed = pack_token_sequences(
-                [traces[i].tokens for i in row],
-                seq_len=seq_len,
-                pad_token_id=PAD_TOKEN_ID,
-                compression_ratio=2,
+                [traces[i].tokens for i in row], seq_len=seq_len,
+                pad_token_id=PAD_TOKEN_ID, compression_ratio=2,
             )
             input_ids[local_row] = packed.input_ids[0].astype(np.uint16)
             segment_ids[local_row] = packed.segment_ids[0].astype(np.uint16)
@@ -770,8 +682,7 @@ def write_trace_shards(
             cursor = 0
             for physical_len, trace_index in zip(packed.physical_lengths, row):
                 trace = traces[trace_index]
-                real_len = trace.tokens.size
-                stop = cursor + real_len
+                stop = cursor + trace.tokens.size
                 sft_loss_mask[local_row, cursor:stop] = trace.sft_loss_mask
                 source_ids[local_row, cursor:stop] = source_id[trace.source]
                 if trace.reasoning_effort:
@@ -779,13 +690,10 @@ def write_trace_shards(
                 tool_calls[local_row] += trace.tool_calls
                 cursor += physical_len
             metrics = q_row_metrics(
-                packed.real_lengths,
-                query_budget=query_budget,
-                q_threshold=q_threshold,
-                band_edges=q_band_edges,
+                packed.real_lengths, query_budget=query_budget,
+                q_threshold=q_threshold, band_edges=q_band_edges,
             )
-            eligible_q[local_row] = metrics.eligible_q
-            selected_q[local_row] = metrics.selected_q
+            eligible_q[local_row], selected_q[local_row] = metrics.eligible_q, metrics.selected_q
             q_budget_utilization[local_row] = metrics.budget_utilization
             q_eligible_coverage[local_row] = metrics.eligible_coverage
             q_band_counts[local_row] = metrics.band_counts
@@ -809,18 +717,9 @@ def write_trace_shards(
             q_expected_selected=q_expected_selected,
         )
         shard_meta.append(
-            {
-                "file": path.name,
-                "rows": n,
-                "bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
+            {"file": path.name, "rows": n, "bytes": path.stat().st_size, "sha256": sha256_file(path)}
         )
-    return shard_meta, {
-        "rows": len(rows),
-        "source_ids": source_id,
-        "query": q_summary,
-    }
+    return shard_meta, {"rows": len(rows), "source_ids": source_id, "query": q_summary}
 
 
 def prepare_pool(
@@ -843,8 +742,7 @@ def prepare_pool(
     compress_shards: bool,
 ) -> dict[str, Any]:
     seen_prompts: set[bytes] = set()
-    cases: list[dict[str, Any]] = []
-    collection: dict[str, Any] = {}
+    cases, collection = [], {}
     for offset, source in enumerate(sources):
         source_target = round(target_tokens * source.weight)
         source_cases, stats = collect_source_cases(
@@ -862,16 +760,11 @@ def prepare_pool(
         print(pool_name, source.key, stats)
 
     traces, relabel_stats = assign_efforts_and_tokenize(
-        cases,
-        tokenizer=tokenizer,
-        seq_len=seq_len,
-        batch_size=tokenize_batch_size,
-        seed=seed,
-        jitter=jitter,
+        cases, tokenizer=tokenizer, seq_len=seq_len,
+        batch_size=tokenize_batch_size, seed=seed, jitter=jitter,
     )
     if not traces:
         raise RuntimeError(f"{pool_name}: no traces survived final tokenization")
-
     pool_dir = output_dir / pool_name
     shards, packed = write_trace_shards(
         pool_dir,
@@ -884,25 +777,23 @@ def prepare_pool(
         seed=seed,
         compress=compress_shards,
     )
-    source_counts = Counter(trace.source for trace in traces)
-    source_tokens = Counter()
+    source_counts, source_tokens = Counter(), Counter()
     for trace in traces:
+        source_counts[trace.source] += 1
         source_tokens[trace.source] += int(trace.tokens.size)
-    histogram = reasoning_effort_histogram(
-        [
-            {"reasoning_effort": trace.reasoning_effort}
-            for trace in traces
-            if trace.reasoning_effort
-        ]
-    )
-    total_tokens = sum(trace.tokens.size for trace in traces)
+    effort_rows = [
+        {"reasoning_effort": trace.reasoning_effort}
+        for trace in traces if trace.reasoning_effort
+    ]
+    histogram = reasoning_effort_histogram(effort_rows)
+    total_tokens = sum(int(trace.tokens.size) for trace in traces)
     supervised_tokens = sum(int(trace.sft_loss_mask.sum()) for trace in traces)
     manifest = {
-        "format": "nano-dsv41f-packed-traces-v1",
+        "format": "nano-dsv41f-packed-traces-v2",
         "pool": pool_name,
         "seq_len": seq_len,
         "target_tokens": target_tokens,
-        "actual_trace_tokens": int(total_tokens),
+        "actual_trace_tokens": total_tokens,
         "trace_records": len(traces),
         "sft_supervised_tokens": supervised_tokens,
         "sft_supervised_fraction": supervised_tokens / total_tokens,
@@ -916,9 +807,7 @@ def prepare_pool(
             "method": "reasoning_length_percentile_v1",
             "jitter": jitter,
             "covered_values": sum(1 for count in histogram.values() if count),
-            "missing_values": list(missing_reasoning_efforts(
-                [{"reasoning_effort": trace.reasoning_effort} for trace in traces if trace.reasoning_effort]
-            )),
+            "missing_values": list(missing_reasoning_efforts(effort_rows)),
             "histogram": histogram,
         },
         "sources": {
@@ -949,24 +838,20 @@ def prepare_pool(
     (pool_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    print(
-        {
-            "pool": pool_name,
-            "records": len(traces),
-            "tokens": int(total_tokens),
-            "packed_rows": packed["rows"],
-            "sft_fraction": round(manifest["sft_supervised_fraction"], 4),
-            "q_budget_utilization": round(packed["query"]["mean_budget_utilization"], 4),
-        }
-    )
+    print({
+        "pool": pool_name, "records": len(traces), "tokens": total_tokens,
+        "packed_rows": packed["rows"],
+        "sft_fraction": round(manifest["sft_supervised_fraction"], 4),
+        "q_budget_utilization": round(packed["query"]["mean_budget_utilization"], 4),
+    })
     return manifest
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Build 8K DeepSeek-V4.1-rendered reasoning and agent trace pools with "
-            "integer reasoning effort, assistant-only SFT masks and Q-aware packing."
+            "Build 8K V4.1-rendered reasoning and agent pools with integer effort, "
+            "assistant SFT masks and Q-aware packing."
         )
     )
     parser.add_argument("--tokenizer", type=Path, required=True)
@@ -980,10 +865,7 @@ def main() -> None:
     parser.add_argument("--shard-rows", type=int, default=128)
     parser.add_argument("--query-budget", type=int, default=128)
     parser.add_argument("--q-threshold", type=int, default=640)
-    parser.add_argument(
-        "--q-band-edges",
-        default=",".join(map(str, DEFAULT_TRACE_Q_BANDS)),
-    )
+    parser.add_argument("--q-band-edges", default=",".join(map(str, DEFAULT_TRACE_Q_BANDS)))
     parser.add_argument("--jitter", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1701)
     parser.add_argument("--compress-shards", action="store_true")
@@ -1012,58 +894,40 @@ def main() -> None:
     if args.pool in ("all", "reasoning"):
         manifests.append(
             prepare_pool(
-                "reasoning",
-                REASONING_SOURCES,
+                "reasoning", REASONING_SOURCES,
                 target_tokens=args.reasoning_target_tokens,
-                tokenizer=tokenizer,
-                tokenizer_path=args.tokenizer,
-                output_dir=args.output_dir,
-                seq_len=args.seq_len,
-                shard_rows=args.shard_rows,
-                tokenize_batch_size=args.tokenize_batch_size,
-                shuffle_buffer=args.shuffle_buffer,
-                query_budget=args.query_budget,
-                q_threshold=args.q_threshold,
-                q_band_edges=q_band_edges,
-                seed=args.seed,
-                jitter=args.jitter,
+                tokenizer=tokenizer, tokenizer_path=args.tokenizer, output_dir=args.output_dir,
+                seq_len=args.seq_len, shard_rows=args.shard_rows,
+                tokenize_batch_size=args.tokenize_batch_size, shuffle_buffer=args.shuffle_buffer,
+                query_budget=args.query_budget, q_threshold=args.q_threshold,
+                q_band_edges=q_band_edges, seed=args.seed, jitter=args.jitter,
                 compress_shards=args.compress_shards,
             )
         )
     if args.pool in ("all", "agent"):
         manifests.append(
             prepare_pool(
-                "agent",
-                AGENT_SOURCES,
+                "agent", AGENT_SOURCES,
                 target_tokens=args.agent_target_tokens,
-                tokenizer=tokenizer,
-                tokenizer_path=args.tokenizer,
-                output_dir=args.output_dir,
-                seq_len=args.seq_len,
-                shard_rows=args.shard_rows,
-                tokenize_batch_size=args.tokenize_batch_size,
-                shuffle_buffer=args.shuffle_buffer,
-                query_budget=args.query_budget,
-                q_threshold=args.q_threshold,
-                q_band_edges=q_band_edges,
-                seed=args.seed + 41,
-                jitter=args.jitter,
+                tokenizer=tokenizer, tokenizer_path=args.tokenizer, output_dir=args.output_dir,
+                seq_len=args.seq_len, shard_rows=args.shard_rows,
+                tokenize_batch_size=args.tokenize_batch_size, shuffle_buffer=args.shuffle_buffer,
+                query_budget=args.query_budget, q_threshold=args.q_threshold,
+                q_band_edges=q_band_edges, seed=args.seed + 41, jitter=args.jitter,
                 compress_shards=args.compress_shards,
             )
         )
 
     summary = {
-        "format": "nano-dsv41f-trace-curriculum-v1",
+        "format": "nano-dsv41f-trace-curriculum-v2",
         "seq_len": args.seq_len,
         "pools": [
             {
-                "name": manifest["pool"],
-                "records": manifest["trace_records"],
-                "tokens": manifest["actual_trace_tokens"],
-                "rows": manifest["packing"]["rows"],
-                "manifest": f"{manifest['pool']}/manifest.json",
+                "name": m["pool"], "records": m["trace_records"],
+                "tokens": m["actual_trace_tokens"], "rows": m["packing"]["rows"],
+                "manifest": f"{m['pool']}/manifest.json",
             }
-            for manifest in manifests
+            for m in manifests
         ],
         "recommended_training_mix": {
             "early": {"document": 1.00, "reasoning": 0.00, "agent": 0.00},
@@ -1072,7 +936,7 @@ def main() -> None:
         },
         "views": {
             "midtrain": "use token_mask/segment_ids for ordinary causal LM",
-            "sft": "add sft_loss_mask so only assistant reasoning/tool-call/content/EOS targets train",
+            "sft": "also apply sft_loss_mask so only assistant reasoning/tool-call/content/EOS targets train",
         },
     }
     (args.output_dir / "trace_manifest.json").write_text(
