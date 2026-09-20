@@ -1,0 +1,5 @@
+# CPU-only preparation; use a dedicated virtual environment, no JAX/TPU extras.
+numpy>=1.26,<3
+tokenizers>=0.21,<0.23
+datasets>=3.5,<5
+kagglehub>=0.3,<2
