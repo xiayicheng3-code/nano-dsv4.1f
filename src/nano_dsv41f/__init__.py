@@ -70,7 +70,6 @@ from .tpu import (
 )
 from .tpu_native import TPUNativeConfig, compile_pretrain_step_native
 from .tpu_moe import apply_moe_v5e_multi
-from . import tpu_native as _tpu_native
 from . import tpu_native_trace_safety as _tpu_native_trace_safety
 from .training import (
     build_indexer_groups,
@@ -80,11 +79,6 @@ from .training import (
     pretrain_step,
     selective_indexer_distillation_loss,
 )
-
-# Keep the communication-heavy TPU native attention backend intact while swapping only the
-# routed expert kernel. apply_moe_dispatch resolves apply_moe_v5e dynamically at call time,
-# so this isolates the E/chips generalization without duplicating the rest of tpu_native.py.
-_tpu_native.apply_moe_v5e = apply_moe_v5e_multi
 
 # Kaggle/v5e callers get the memory-bounded native executable by default. The old
 # auto-sharded dense compiler remains explicitly available for reference/ablation work.

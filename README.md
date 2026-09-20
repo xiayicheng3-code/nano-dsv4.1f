@@ -18,7 +18,7 @@ This is **not** a checkpoint-compatible miniature of the 552B production model, 
 | Attention | MLA-style shared latent K/V, partial + inverse RoPE, attention sink, grouped low-rank `wo_a`, dense reference path + TPU-native Splash path |
 | Sparse retrieval | Cross-layer index-K reuse, dynamic multi-head indexer scoring, hierarchical candidate blocks, late selective distillation |
 | Residual / FFN | Single-Pass mHC + routed/shared-expert MoE + clipped SwiGLU |
-| TPU MoE | 8-way expert-parallel native path with one routed expert resident per v5e chip and fixed-capacity token dispatch |
+| TPU MoE | Tokamax 0.0.12 ragged-dot forward/backward, resident expert shards, dropless dispatch and reduce-scatter |
 | Memory | Engram-style hashed n-gram memory with packed-sequence-safe hashing |
 | Speculation | One-stage DSpark reference with separate MoE, Markov correction and confidence prediction |
 | Optimizer | Inspectable AdamW / Muon / head-wise Muon / Sinkhorn-balanced parameter rules |
@@ -56,7 +56,7 @@ The goal is therefore as much **ML systems / accelerator engineering** as model 
 - [x] 8-device CPU/SPMD regression tests for native MoE and Splash forward/backward behavior
 - [x] Checked-in Kaggle v5e smoke notebook that defaults to the native backend
 - [ ] First recorded native Kaggle v5e-8 HBM / compile / step-time profile
-- [ ] Replace fixed-capacity gather/reduce MoE communication with ragged all-to-all / ring-style dispatch if profiling justifies it
+- [ ] Replace gather/reduce-scatter MoE communication with ragged all-to-all / ring-style dispatch if profiling justifies it
 - [ ] Packed MXFP4 storage/dequant kernels for main KV and index caches
 - [ ] Real training dataset + pretrained tokenizer pipeline
 - [ ] Training curves, retrieval diagnostics and DSpark acceptance measurements
@@ -118,7 +118,7 @@ Late in pre/mid-training, `training.py` runs a separate selective auxiliary obje
 
 ```text
 for each index source (L1, L3, L5):
-  one fixed query slot per packed segment
+  sample up to query_budget eligible positions across the batch
   -> build shared index-K once
   -> score only selected student Q rows
   -> reconstruct teacher mass from served layers' main Q/K + complete LSE
@@ -126,6 +126,15 @@ for each index source (L1, L3, L5):
 ```
 
 The default follows the proposed `local_window + top_k` eligibility rule: `128 + 512 = 640` raw-token query position. A ratio-aware ablation, `local_window + r * top_k`, waits until roughly `1152` raw positions for encoder `r=2`, when a 512-entry retrieval limit actually becomes selective.
+
+`IndexerTrainingConfig(query_budget=128, query_seed=0, apply_candidate_mask=False)`
+is the default: sample without replacement, refresh using the optimizer step, and
+train L5 over full legal compressed history. The budget caps **positions across the
+global batch per retriever**, not positions per document. Equal eligibility rules
+share the selected positions; three retrievers with 128 positions each mean 384
+query/group evaluations. Set `apply_candidate_mask=True` to test L3-restricted L5
+distillation. Evaluation/inference keeps the hierarchical candidate mask. See
+[query selection and ablations](docs/indexer_training.md) for shapes and cost limits.
 
 Nano retrievers serve only two layers by default, so `all_served` and `Full + last` use the same teacher set. Teacher attention is always stop-gradient. By default student inputs from the backbone are detached too, so the auxiliary loss trains the indexer-specific parameters without perturbing the backbone. This is an educational/stability choice, not a claimed DeepSeek recipe, and is configurable.
 
@@ -151,7 +160,9 @@ The native backend lives in `tpu_native.py` and specializes only the operations 
 
 ## TPU-native Phase A — expert-parallel MoE
 
-The nano backbone has exactly **8 routed experts** and Kaggle v5e-8 exposes **8 TPU chips**, so the native execution path maps one routed expert to each chip.
+The default backbone has **8 routed experts** on **8 TPU chips**. The native path
+also supports multiple resident experts per chip; the combined smoke uses 16 experts.
+Expert counts must divide evenly over the expert mesh.
 
 Conceptually:
 
@@ -160,22 +171,32 @@ context-sharded token activations
         ↓
 FP32 router / top-k
         ↓
-fixed-capacity expert assignments
+all-gather token activations and routing metadata
         ↓
-compact token payload communication
+sort assignments into contiguous local expert groups
         ↓
-one resident expert per TPU
+Tokamax ragged gate/up projection
         ↓
-local BF16 SwiGLU GEMMs
+clipped SwiGLU + Tokamax ragged down projection
         ↓
-combine routed contributions
+FP32 weighted scatter + reduce-scatter
         ↓
 original context shard
 ```
 
 The critical property is that **expert matrices remain resident**. The native path never evaluates `expert_weights[per_token_indices]`, so whole `[D,F]` matrices are no longer duplicated once per token assignment.
 
-The current implementation intentionally favors a simple, static-shape first backend: it uses fixed-capacity routing and collective token exchange/reduction rather than a fully ragged all-to-all kernel. This is designed to make memory bounded and autodiff straightforward first. Once real TPU profiles exist, the communication path can be upgraded to ragged all-to-all or a ring-of-experts style design if bandwidth dominates.
+`tokamax==0.0.12` now owns the routed expert GEMMs and their input/weight backward
+kernels. TPU execution explicitly selects Mosaic, so unsupported kernels fail
+instead of silently using a dense fallback. CPU tests use Tokamax's XLA path.
+Dynamic group sizes cover every assignment, including extreme routing imbalance;
+unused rows are masked before and after each dot. The old custom tile loop is removed.
+
+Communication remains all-gather plus reduce-scatter. Packed buffers use a static
+worst-case bound, while ragged GEMM work follows group sizes. This change does not
+implement ragged all-to-all. The shared expert stays a local dense GEMM. See
+[Tokamax integration and validation](docs/tokamax_moe.md) for runtime pins, controls,
+memory tradeoffs, and physical TPU benchmark instructions.
 
 The always-on shared expert remains replicated and is computed locally on each context shard.
 
@@ -215,7 +236,7 @@ The target is a single-host **2×4 v5e-8** mesh.
 - the outer model uses a topology-aware Auto mesh so XLA can legally reshard ordinary JAX operations;
 - token/context positions are distributed over all eight chips;
 - attention parameters remain comparatively simple while Splash owns sequence-parallel attention execution;
-- backbone routed experts are sharded one expert per chip in the native MoE primitive;
+- backbone routed experts stay resident with one or more experts per chip;
 - large matrix/table payload parameters initialize directly into final shards as **BF16**;
 - norm, bias, sink, router/control vectors and optimizer accumulators remain FP32;
 - block rematerialization is the native training default to trade extra compute for lower activation HBM;
@@ -229,23 +250,24 @@ This is now a real accelerator-specific execution path, but **it is still under 
 
 A lightweight notebook is checked in at [`notebooks/nano_dsv41f_kaggle.ipynb`](notebooks/nano_dsv41f_kaggle.ipynb). From a blank Kaggle session, select TPU, enable Internet, and run top-to-bottom. The notebook fetches the requested Git ref and prints the exact commit SHA for reproducibility.
 
-For a single-file self-contained notebook, generate one with:
+Regenerate both maintained notebook entry points with:
 
 ```bash
 python scripts/build_notebook.py
 ```
 
-The current smoke notebook is intentionally hardware-first rather than dataset-first. It:
+Both notebooks install `requirements-tpu.txt` (JAX/jaxlib 0.10.2, libtpu 0.0.42.1)
+before importing JAX. They run the model in fresh Python processes. The combined notebook
+runs only the 20-step packed smoke; the main notebook first runs operator parity/timing.
+A real Splash forward/backward preflight fails before model initialization if the loaded
+TPU client is stale. The smoke uses `T=2048`, 16 experts, three odd-length documents,
+10 base steps and 10 late-indexer steps. JSON reports include the commit, runtime build,
+compiler memory, collectives, all losses and synchronized timings (first two steps of
+each phase excluded from the timing median).
 
-1. clones/fetches the current repo **before JAX starts**;
-2. verifies all eight v5e devices and constructs the topology-aware 2×4 mesh;
-3. initializes BF16 payload / FP32 control parameters directly into final shards;
-4. initializes sharded optimizer state;
-5. builds the **native Splash + expert-parallel MoE** base executable;
-6. runs a `T=1024` synthetic packed batch so each context shard receives 128 query tokens;
-7. attempts compile diagnostics and reports memory / cost / collectives;
-8. executes the first training step and checks for a finite loss;
-9. only after the base path succeeds, prepares the late-indexer executable.
+For an unmerged branch, set `os.environ["NANO_DSV41F_REF"]` before the bootstrap cell.
+See [the operator pass and fidelity audit](docs/tpu_operator_pass.md) for exact commands,
+validation scope, changes to mHC checkpoint semantics and remaining reproduction gaps.
 
 Once this smoke test is stable, the next layer is a pretrained ~32K tokenizer plus packed real data. Token efficiency is deliberately secondary to keeping embeddings/softmax and HBM reasonable for the nano model.
 
@@ -272,11 +294,12 @@ src/nano_dsv41f/
   model.py           end-to-end semantic backbone + DSpark wiring
   tpu.py             v5e Auto mesh, PartitionSpecs, direct-to-shard init
   tpu_native.py      active v5e Splash + expert-parallel training backend
+  tpu_moe.py         Tokamax ragged expert products and assignment packing
   precision.py       BF16 payload / FP32 control parameter policy
   profiling.py       AOT memory/cost/collective diagnostics
   splash.py          low-level Splash helpers/reference experiments
 scripts/
-  build_notebook.py  generate the self-contained Kaggle TPU notebook
+  build_notebook.py  generate both Kaggle notebooks from one bootstrap
 ```
 
 ## Next experiments
@@ -285,7 +308,7 @@ The remaining milestones are deliberately driven by real hardware/data evidence:
 
 - finish the current Kaggle v5e-8 run and record native compile memory, StableHLO collectives and steady-state step time;
 - compare native vs reference memory behavior on the smallest sequence lengths where both compile;
-- profile the fixed-capacity expert path and replace it with ragged all-to-all / ring-of-experts style dispatch only if communication is the bottleneck;
+- profile Tokamax ragged GEMMs and dispatch; consider ragged all-to-all / ring-of-experts if communication dominates;
 - implement packed MXFP4 main-KV/index storage with on-chip software dequantization instead of materializing dequantized caches in HBM;
 - decide whether vocab-parallel cross-entropy is worthwhile once the 32K LM head is measured on hardware;
 - attach a pretrained tokenizer + packed corpus and publish training curves / retrieval diagnostics;

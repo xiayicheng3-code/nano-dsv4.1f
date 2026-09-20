@@ -7,7 +7,9 @@ import jax.numpy as jnp
 
 from .csa2 import segment_local_positions
 from .indexer import (
+    budgeted_teacher_indices,
     dense_teacher_mass,
+    eligible_teacher_queries,
     eligibility_position,
     indexer_cross_entropy_from_mass,
     latest_teacher_indices_batched,
@@ -133,13 +135,61 @@ def _selected_teacher_mass(
     *,
     indices: jax.Array,
     main_kv: jax.Array,
+    indices_valid: jax.Array | None = None,
+    segment_ids: jax.Array | None = None,
+    local_window: int | None = None,
 ) -> jax.Array:
     q = jax.lax.stop_gradient(_batched_gather_tokens(layer_aux["q"], indices))
+    if layer_aux["total_lse"] is None:
+        return selected_teacher_mass_native(
+            q, main_kv, jax.lax.stop_gradient(layer_aux["local_kv"]),
+            indices, segment_ids, indices_valid, local_window=local_window,
+            sink=layer_aux.get("attn_sink"),
+        )
     lse = jax.lax.stop_gradient(
         _batched_gather_tokens(layer_aux["total_lse"], indices)
     )
     valid = _batched_gather_tokens(layer_aux["global_valid"], indices)
     return jax.lax.stop_gradient(dense_teacher_mass(q, main_kv, lse, valid))
+
+
+def selected_global_valid(layer_aux, indices, segment_ids, local_window):
+    """Construct only selected rows of the compressed-history mask."""
+    q_pos = _batched_gather_tokens(segment_local_positions(segment_ids), indices)
+    q_seg = _batched_gather_tokens(segment_ids, indices)
+    return (
+        (q_seg[..., None] == layer_aux["global_segment_ids"][:, None, :])
+        & (layer_aux["global_positions"][:, None, :] <= q_pos[..., None] - local_window)
+    )
+
+
+def selected_teacher_mass_native(q, main_kv, local_kv, indices, segment_ids, valid,
+                                 *, local_window, sink):
+    """Exact selected-row local + global + sink denominator, FP32 accumulation.
+
+    q is already RoPE/QAT transformed, as are both KV banks. Only W recent local
+    tokens are gathered; global logits are reused for both LSE and teacher mass.
+    """
+    local_indices = indices[..., None] - jnp.arange(local_window - 1, -1, -1)
+    safe = jnp.maximum(local_indices, 0)
+    local_keys = jax.vmap(lambda kv, ix: kv[ix])(local_kv, safe)
+    local_segments = jax.vmap(lambda seg, ix: seg[ix])(segment_ids, safe)
+    q_segments = _batched_gather_tokens(segment_ids, indices)
+    local_valid = (local_indices >= 0) & (local_segments == q_segments[..., None])
+    # Splash scales Q before its FP32 dot accumulation; mirror that rounding.
+    scaled_q = q * jnp.asarray(q.shape[-1] ** -0.5, dtype=q.dtype)
+    local_logits = jnp.einsum("bqhd,bqwd->bqhw", scaled_q, local_keys,
+                             preferred_element_type=jnp.float32)
+    global_logits = jnp.einsum("bqhd,bkd->bqhk", scaled_q, main_kv,
+                              preferred_element_type=jnp.float32)
+    local_lse = jax.nn.logsumexp(jnp.where(local_valid[:, :, None, :], local_logits, -jnp.inf), axis=-1)
+    global_lse = jax.nn.logsumexp(jnp.where(valid[:, :, None, :], global_logits, -jnp.inf), axis=-1)
+    total = jnp.logaddexp(local_lse, global_lse)
+    if sink is not None:
+        total = jnp.logaddexp(total, sink.astype(jnp.float32))
+    mass = jnp.sum(jnp.where(valid[:, :, None, :],
+                            jnp.exp(global_logits - total[..., None]), 0.0), axis=-2)
+    return jax.lax.stop_gradient(mass)
 
 
 def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
@@ -152,7 +202,10 @@ def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
             "native_moe_layers": jnp.asarray(0, dtype=jnp.int32),
             "expert_loads": jnp.zeros((config.n_experts,), dtype=jnp.int32),
             "expert_overflow": jnp.zeros((config.n_experts,), dtype=jnp.int32),
+            "expert_dropped": jnp.zeros((config.n_experts,), dtype=jnp.int32),
             "expert_capacity": jnp.asarray(0, dtype=jnp.int32),
+            "expert_packed_rows": jnp.asarray(0, dtype=jnp.int32),
+            "moe_mosaic_layers": jnp.asarray(0, dtype=jnp.int32),
             "experts_per_chip": jnp.asarray(0, dtype=jnp.int32),
         }
     loads = jnp.sum(
@@ -167,7 +220,10 @@ def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
         "native_moe_layers": jnp.asarray(len(native_layers), dtype=jnp.int32),
         "expert_loads": loads,
         "expert_overflow": overflow,
+        "expert_dropped": jnp.sum(jnp.stack(tuple(layer["expert_dropped"] for layer in native_layers)), axis=0),
         "expert_capacity": native_layers[0]["expert_capacity"],
+        "expert_packed_rows": native_layers[0]["expert_packed_rows"],
+        "moe_mosaic_layers": sum(layer["moe_mosaic"] for layer in native_layers),
         "experts_per_chip": native_layers[0].get(
             "experts_per_chip", jnp.asarray(1, dtype=jnp.int32)
         ),
@@ -194,8 +250,9 @@ def causal_lm_loss(
     valid = segment_ids[:, :-1] == segment_ids[:, 1:]
     if token_mask is not None:
         valid = valid & token_mask[:, :-1] & token_mask[:, 1:]
-    logp = jax.nn.log_softmax(pred, axis=-1)
-    nll = -jnp.take_along_axis(logp, labels[..., None], axis=-1)[..., 0]
+    # Avoid materializing a second full [B,T,V] log-probability array.
+    target = jnp.take_along_axis(pred, labels[..., None], axis=-1)[..., 0]
+    nll = jax.nn.logsumexp(pred, axis=-1) - target
     count = jnp.sum(valid.astype(jnp.int32))
     loss = jnp.sum(jnp.where(valid, nll, 0.0)) / jnp.maximum(count, 1)
     return loss, count
@@ -207,8 +264,9 @@ def _selective_indexer_from_backbone_aux(
     *,
     segment_ids: jax.Array,
     token_mask: jax.Array | None,
-    n_segments: int,
+    n_segments: int | None,
     backbone_aux: dict[str, object],
+    step: jax.Array | int = 0,
 ) -> tuple[jax.Array, dict[str, object]]:
     """Compute selected-row indexer loss from an already executed dense backbone."""
     tc = config.indexer_training
@@ -218,28 +276,30 @@ def _selective_indexer_from_backbone_aux(
             "raw_loss": zero,
             "group_losses": {},
             "query_counts": {},
+            "eligible_query_counts": {},
+            "student_key_counts": {},
             "teacher_query_indices": {},
             "teacher_query_valid": {},
             "active_queries": jnp.asarray(0, jnp.int32),
             "student_score_shapes": {},
         }
-    if tc.teacher_queries != "latest_eligible":
-        raise NotImplementedError(
-            "selective reference currently implements teacher_queries='latest_eligible'"
-        )
-    if n_segments <= 0:
-        raise ValueError("n_segments must be a positive static integer")
+    if tc.teacher_queries == "latest_eligible" and (n_segments is None or n_segments <= 0):
+        raise ValueError("latest_eligible requires a positive static n_segments")
 
     layers = backbone_aux["layers"]
     local_positions = segment_local_positions(segment_ids)
     group_losses: dict[str, jax.Array] = {}
     query_counts: dict[str, jax.Array] = {}
+    eligible_query_counts: dict[str, jax.Array] = {}
+    student_key_counts: dict[str, jax.Array] = {}
     student_shapes: dict[str, jax.Array] = {}
     teacher_query_indices: dict[str, jax.Array] = {}
     teacher_query_valid: dict[str, jax.Array] = {}
     candidate_pool = None
     candidate_indices = None
     candidate_kv_source = None
+    index_k_cache = {}
+    query_cache = {}
 
     for group in build_indexer_groups(config):
         min_pos = eligibility_position(
@@ -248,12 +308,26 @@ def _selective_indexer_from_backbone_aux(
             compression_ratio=group.compression_ratio,
             rule=tc.eligibility_rule,
         )
-        query_indices, query_valid = latest_teacher_indices_batched(
-            segment_ids,
-            n_segments=n_segments,
-            min_local_position=min_pos,
-            token_mask=token_mask,
-        )
+        if min_pos not in query_cache:
+            eligible = eligible_teacher_queries(
+                segment_ids, min_local_position=min_pos, token_mask=token_mask,
+            )
+            if tc.teacher_queries == "sampled":
+                selected = budgeted_teacher_indices(
+                    segment_ids, query_budget=tc.query_budget,
+                    min_local_position=min_pos, token_mask=token_mask,
+                    step=step, seed=tc.query_seed,
+                )
+            elif tc.teacher_queries == "all_eligible":
+                indices = jnp.broadcast_to(jnp.arange(segment_ids.shape[1]), segment_ids.shape)
+                selected = (jnp.where(eligible, indices, 0), eligible)
+            else:  # Explicit legacy ablation; never the default.
+                selected = latest_teacher_indices_batched(
+                    segment_ids, n_segments=n_segments,
+                    min_local_position=min_pos, token_mask=token_mask,
+                )
+            query_cache[min_pos] = (*selected, jnp.sum(eligible.astype(jnp.int32)))
+        query_indices, query_valid, eligible_count = query_cache[min_pos]
         q_positions = _batched_gather_tokens(local_positions, query_indices)
 
         source_aux = layers[group.index_source_layer]
@@ -269,17 +343,19 @@ def _selective_indexer_from_backbone_aux(
         )
         kv_indexer_params = params["blocks"][group.kv_source_layer]["attn"]["indexer"]
         student_params = params["blocks"][group.index_source_layer]["attn"]["indexer"]
-        index_k = build_index_k(
-            latent_for_student,
-            global_positions,
-            kv_indexer_params,
-            rope_dim=config.attention.rope.rope_head_dim,
-            rope_kwargs=_rope_kwargs(config, group.compression_ratio),
-            norm_eps=config.norm_eps,
-            fp4_qat=config.quantization.indexer_fp4_qat,
-            fp4_block_size=config.quantization.indexer_block_size,
-            fp4_scale_format=config.quantization.indexer_scale_format,
-        )
+        if group.kv_source_layer not in index_k_cache:
+            index_k_cache[group.kv_source_layer] = build_index_k(
+                latent_for_student,
+                global_positions,
+                kv_indexer_params,
+                rope_dim=config.attention.rope.rope_head_dim,
+                rope_kwargs=_rope_kwargs(config, group.compression_ratio),
+                norm_eps=config.norm_eps,
+                fp4_qat=config.quantization.indexer_fp4_qat,
+                fp4_block_size=config.quantization.indexer_block_size,
+                fp4_scale_format=config.quantization.indexer_scale_format,
+            )
+        index_k = index_k_cache[group.kv_source_layer]
 
         qr = _batched_gather_tokens(source_aux["qr"], query_indices)
         hidden = _batched_gather_tokens(source_aux["index_hidden"], query_indices)
@@ -301,18 +377,20 @@ def _selective_indexer_from_backbone_aux(
             fp4_block_size=config.quantization.indexer_block_size,
             fp4_scale_format=config.quantization.indexer_scale_format,
         )
-        student_valid = _batched_gather_tokens(
-            source_aux["global_valid"], query_indices
-        ) & query_valid[..., None]
+        full_history_valid = selected_global_valid(
+            source_aux, query_indices, segment_ids, config.attention.local_window,
+        )
+        student_valid = full_history_valid & query_valid[..., None]
 
         if (
-            candidate_pool is not None
+            tc.apply_candidate_mask
+            and candidate_pool is not None
             and config.indexer.candidate_source_layer < group.index_source_layer
             and candidate_kv_source == group.kv_source_layer
         ):
             if candidate_indices is None:
                 raise AssertionError("candidate indices missing")
-            same_slots = jnp.all(query_indices == candidate_indices, axis=-1)
+            same_slots = query_indices == candidate_indices
             student_valid = student_valid & candidate_pool & same_slots[..., None]
 
         teacher_masses = tuple(
@@ -320,6 +398,9 @@ def _selective_indexer_from_backbone_aux(
                 layers[layer_id],
                 indices=query_indices,
                 main_kv=jax.lax.stop_gradient(main_kv),
+                indices_valid=full_history_valid,
+                segment_ids=segment_ids,
+                local_window=config.attention.local_window,
             )
             for layer_id in _teacher_layers(group, tc.teacher_layers)
         )
@@ -333,11 +414,13 @@ def _selective_indexer_from_backbone_aux(
         key = f"L{group.index_source_layer}"
         group_losses[key] = loss
         query_counts[key] = jnp.sum(query_valid.astype(jnp.int32))
+        eligible_query_counts[key] = eligible_count
+        student_key_counts[key] = jnp.sum(student_valid.astype(jnp.int32), axis=-1)
         student_shapes[key] = jnp.asarray(student_scores.shape, dtype=jnp.int32)
         teacher_query_indices[key] = query_indices
         teacher_query_valid[key] = query_valid
 
-        if group.index_source_layer == config.indexer.candidate_source_layer:
+        if tc.apply_candidate_mask and group.index_source_layer == config.indexer.candidate_source_layer:
             candidate_pool = _candidate_mask_for_selected_queries(
                 student_scores,
                 student_valid,
@@ -361,6 +444,8 @@ def _selective_indexer_from_backbone_aux(
         "raw_loss": raw,
         "group_losses": group_losses,
         "query_counts": query_counts,
+        "eligible_query_counts": eligible_query_counts,
+        "student_key_counts": student_key_counts,
         "teacher_query_indices": teacher_query_indices,
         "teacher_query_valid": teacher_query_valid,
         "active_queries": active_queries,
@@ -374,8 +459,9 @@ def selective_indexer_distillation_loss(
     input_ids: jax.Array,
     *,
     segment_ids: jax.Array,
-    n_segments: int,
+    n_segments: int | None = None,
     token_mask: jax.Array | None = None,
+    step: jax.Array | int = 0,
 ) -> tuple[jax.Array, dict[str, object]]:
     """Standalone selected-row indexer loss; useful for tests and retrieval-only tuning."""
     if segment_ids.shape != input_ids.shape:
@@ -397,6 +483,7 @@ def selective_indexer_distillation_loss(
         token_mask=token_mask,
         n_segments=n_segments,
         backbone_aux=backbone_aux,
+        step=step,
     )
 
 
@@ -409,6 +496,7 @@ def pretrain_loss(
     token_mask: jax.Array | None = None,
     include_indexer: bool = False,
     n_segments: int | None = None,
+    step: jax.Array | int = 0,
 ) -> tuple[jax.Array, dict[str, object]]:
     """One-backbone-pass packed LM objective, optionally with late indexer distillation.
 
@@ -428,8 +516,6 @@ def pretrain_loss(
         logits, input_ids, segment_ids, token_mask=token_mask
     )
     if include_indexer and config.indexer_training.enabled:
-        if n_segments is None:
-            raise ValueError("n_segments is required when include_indexer=True")
         index_loss, index_aux = _selective_indexer_from_backbone_aux(
             params,
             config,
@@ -437,6 +523,7 @@ def pretrain_loss(
             token_mask=token_mask,
             n_segments=n_segments,
             backbone_aux=backbone_aux,
+            step=step,
         )
     else:
         index_loss = jnp.asarray(0.0, dtype=jnp.float32)
@@ -444,17 +531,25 @@ def pretrain_loss(
             "raw_loss": jnp.asarray(0.0, dtype=jnp.float32),
             "group_losses": {},
             "query_counts": {},
+            "eligible_query_counts": {},
+            "student_key_counts": {},
             "teacher_query_indices": {},
             "teacher_query_valid": {},
             "active_queries": jnp.asarray(0, dtype=jnp.int32),
             "student_score_shapes": {},
         }
     total = lm + index_loss
+    # MoE owns token-level routing in its own sharding domain and exports only [E]
+    # real-token counts. Do not combine tp-sharded router indices with x/y masks here.
+    router_loads = jnp.stack(
+        tuple(layer["router_loads"] for layer in backbone_aux["layers"])
+    )
     return total, {
         "lm_loss": lm,
         "lm_tokens": lm_tokens,
         "indexer_loss": index_loss,
         "indexer": index_aux,
+        "router_loads": router_loads,
         **_native_moe_diagnostics(backbone_aux, config),
     }
 
@@ -500,6 +595,7 @@ def pretrain_step(
             token_mask=token_mask,
             include_indexer=include_indexer,
             n_segments=n_segments,
+            step=step,
         )
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -514,8 +610,22 @@ def pretrain_step(
         train_indexer=train_indexer,
         train_dspark=False,
     )
+    new_params = update_router_biases(new_params, metrics["router_loads"],
+                                     speed=config.router_bias_update_speed)
     return new_params, new_state, {
         "loss": loss,
         **metrics,
         **optimizer_metrics,
     }
+
+
+def update_router_biases(params, loads, *, speed):
+    """Aux-loss-free text routing controller; one independent bias per layer/expert."""
+    if not speed:
+        return params
+    blocks = []
+    for i, block in enumerate(params["blocks"]):
+        bias = block["moe"]["router_bias"]
+        correction = speed * jnp.sign(jnp.mean(loads[i].astype(jnp.float32)) - loads[i])
+        blocks.append({**block, "moe": {**block["moe"], "router_bias": bias + correction}})
+    return {**params, "blocks": tuple(blocks)}

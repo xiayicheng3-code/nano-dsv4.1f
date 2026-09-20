@@ -102,7 +102,8 @@ def _ns_matrix(x: jax.Array, fast_steps: int, stable_steps: int) -> jax.Array:
     def step(y, coeff):
         a, b, c = coeff
         gram = y @ y.T
-        return a * y + b * (gram @ y) + c * ((gram @ gram) @ y)
+        # Factor the polynomial: three GEMMs instead of four, same coefficients.
+        return a * y + (b * gram + c * (gram @ gram)) @ y
 
     for _ in range(fast_steps):
         y = step(y, (3.4445, -4.7750, 2.0315))
@@ -187,6 +188,7 @@ def _adamw_update(
     lr: jax.Array,
     step: jax.Array,
     config,
+    apply_weight_decay: bool = True,
 ) -> tuple[jax.Array, OptimizerLeafState]:
     oc = config.optimizer
     g = grad.astype(jnp.float32)
@@ -197,7 +199,7 @@ def _adamw_update(
     vhat = v / (1.0 - oc.adam_beta2**t)
     direction = mhat / (jnp.sqrt(vhat) + oc.adam_eps)
     updated = (
-        param.astype(jnp.float32) * (1.0 - lr * oc.adam_weight_decay)
+        param.astype(jnp.float32) * (1.0 - lr * (oc.adam_weight_decay if apply_weight_decay else 0.0))
         - lr * direction
     )
     return updated.astype(param.dtype), OptimizerLeafState(m, v)
@@ -309,8 +311,10 @@ def optimizer_step(
     new_states = []
     for (path, param), grad, leaf_state in zip(p_items, g_leaves, s_leaves):
         parts = _path_parts(path)
+        leaf_lr = lr * config.optimizer.engram_lr_multiplier if "engram" in parts else lr
         frozen = (
-            (not train_indexer and "indexer" in parts)
+            "router_bias" in parts  # updated from global loads, never by gradient/decay
+            or (not train_indexer and "indexer" in parts)
             or (not train_dspark and bool(parts) and parts[0] == "dspark")
         )
         if frozen:
@@ -321,14 +325,17 @@ def optimizer_step(
         rule = classify_parameter(path, param, config)
         if rule == "adamw":
             p, s = _adamw_update(
-                param, grad, leaf_state, lr=lr, step=step, config=config
+                param, grad, leaf_state, lr=leaf_lr, step=step, config=config,
+                apply_weight_decay=not any(
+                    name in {"router_bias", "attn_sink", "base", "scale", "bias"} for name in parts
+                ),
             )
         elif rule == "sinkhorn":
             p, s = _sinkhorn_update(
                 param,
                 grad,
                 leaf_state,
-                lr=lr,
+                lr=leaf_lr,
                 config=config,
                 transpose_for_rows=bool(parts and parts[0] == "lm_head"),
             )
@@ -341,13 +348,13 @@ def optimizer_step(
                 param,
                 grad,
                 leaf_state,
-                lr=lr,
+                lr=leaf_lr,
                 n_heads=nh,
                 head_dim=hd,
                 config=config,
             )
         else:
-            p, s = _muon_update(param, grad, leaf_state, lr=lr, config=config)
+            p, s = _muon_update(param, grad, leaf_state, lr=leaf_lr, config=config)
         new_params.append(p)
         new_states.append(s)
     return (

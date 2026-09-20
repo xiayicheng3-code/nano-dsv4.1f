@@ -1,0 +1,5 @@
+# Kaggle stack that reached Splash compilation in the prior TPU log (4).
+jax[tpu]==0.10.2
+jaxlib==0.10.2
+libtpu==0.0.42.1
+tokamax==0.0.12

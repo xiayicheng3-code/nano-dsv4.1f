@@ -169,6 +169,7 @@ def _apply_block(
     config: ModelConfig,
     spec: LayerSpec,
     *,
+    token_mask: jax.Array | None = None,
     global_source: jax.Array | None = None,
     compute_indexer: bool = False,
 ) -> tuple[jax.Array, jax.Array, SharedCSA2State | None, dict[str, object]]:
@@ -179,6 +180,7 @@ def _apply_block(
         params["mhc_attn"],
         sinkhorn_iters=config.mhc_sinkhorn_iters,
         eps=config.mhc_eps,
+        norm_eps=config.norm_eps,
     )
     attn_input = rms_norm(
         pre_mix(streams, incoming_pre_mix),
@@ -217,6 +219,7 @@ def _apply_block(
         params["mhc_ffn"],
         sinkhorn_iters=config.mhc_sinkhorn_iters,
         eps=config.mhc_eps,
+        norm_eps=config.norm_eps,
     )
     ffn_input = rms_norm(
         pre_mix(streams, attn_pre),
@@ -230,6 +233,7 @@ def _apply_block(
         route_scale=config.route_scale,
         swiglu_limit=config.swiglu_limit,
         eps=config.route_eps,
+        token_mask=token_mask,
     )
     streams = post_mix(residual, ffn_out, ffn_comb, ffn_post)
     return streams, ffn_pre, state, {**attn_aux, **moe_aux}
@@ -266,6 +270,8 @@ def apply_model(
         segment_ids = jnp.zeros_like(input_ids, dtype=jnp.int32)
     if segment_ids.shape != input_ids.shape:
         raise ValueError("segment_ids must match input_ids")
+    if token_mask is not None and token_mask.shape != input_ids.shape:
+        raise ValueError("token_mask must match input_ids")
 
     specs = build_layer_specs(config)
     streams = params["embed"][input_ids]
@@ -310,7 +316,7 @@ def apply_model(
         if spec.layer_id in target_ids:
             dspark_targets.append(jnp.mean(streams, axis=-2))
 
-        def block_forward(s, pre, block_params, shared_state, ced_source):
+        def block_forward(s, pre, block_params, shared_state, ced_source, valid_tokens):
             return _apply_block(
                 s,
                 pre,
@@ -319,6 +325,7 @@ def apply_model(
                 shared_state,
                 config,
                 spec,
+                token_mask=valid_tokens,
                 global_source=ced_source,
                 compute_indexer=compute_indexer,
             )
@@ -332,6 +339,7 @@ def apply_model(
             block,
             state,
             generation_global_source,
+            token_mask,
         )
         layer_aux.append(aux)
 
