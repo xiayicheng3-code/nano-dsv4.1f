@@ -72,7 +72,7 @@ def tiny_single_device_config() -> ModelConfig:
             head_dim=4,
             top_k=8,
             candidate_source_layer=3,
-            candidate_topk_blocks=2,
+            candidate_topk_blocks=8,
             candidate_block_size=2,
         ),
         engram=EngramConfig(

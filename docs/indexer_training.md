@@ -140,6 +140,15 @@ For every default two-layer group, `all_served == full_last` in teacher count.
 
 ## Hierarchical Reindex
 
+The configured pool holds **128 blocks x 8 KV positions = 1,024 candidates per
+query**, followed by Top-512 selection. These counts are independent of TPU device
+count. Configuration validation requires pool capacity to exceed retrieval Top-K;
+short histories can still provide fewer legal candidates.
+
+The training policy reserves this restriction for **SFT**. Keep it disabled during
+early, middle and late pretraining/mid-training. Increasing the capacity does not
+activate the pool, and there is no automatic SFT stage switch in the current runner.
+
 By default, late-stage L5 distillation uses **all legal compressed history**;
 `apply_candidate_mask=False` also skips L3 candidate-pool construction in this
 auxiliary path. Segment boundaries, causality and the local/global exclusion window

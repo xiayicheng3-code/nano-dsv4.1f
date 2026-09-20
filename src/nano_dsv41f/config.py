@@ -120,7 +120,8 @@ class IndexerConfig:
     # Default L3 is the first decoder Full/index source. It publishes block candidates;
     # later Reindex layers (L5 by default) rescore only inside those candidate blocks.
     candidate_source_layer: int = 3
-    candidate_topk_blocks: int = 16
+    # SFT candidate capacity: 128 blocks x 8 KV positions = 1024, above Top-512.
+    candidate_topk_blocks: int = 128
     candidate_block_size: int = 8
 
     def __post_init__(self) -> None:
@@ -130,6 +131,11 @@ class IndexerConfig:
             self.candidate_topk_blocks, self.candidate_block_size
         ) <= 0:
             raise ValueError("candidate hierarchy sizes must be positive when enabled")
+        if (
+            self.candidate_source_layer >= 0
+            and self.candidate_topk_blocks * self.candidate_block_size <= self.top_k
+        ):
+            raise ValueError("candidate pool capacity must exceed top_k when enabled")
 
 
 @dataclass(frozen=True)
@@ -189,7 +195,8 @@ class IndexerTrainingConfig:
     # Global batch budget per retrieval group, shared across equal eligibility rules.
     query_budget: int = 128
     query_seed: int = 0
-    # Training ablation only; evaluation/inference retains hierarchical retrieval.
+    # Keep off throughout pretraining/mid-training; enable with the SFT recipe.
+    # Diagnostic retrieval can still exercise the hierarchy independently.
     apply_candidate_mask: bool = False
     teacher_layers: Literal["full_only", "full_last", "all_served"] = "all_served"
     # User-proposed cheap warmup starts after local_window + top_k raw history (640 with
