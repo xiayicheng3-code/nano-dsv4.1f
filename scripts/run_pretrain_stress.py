@@ -10,6 +10,7 @@ import resource
 import subprocess
 import time
 import traceback
+from dataclasses import replace
 
 import numpy as np
 
@@ -103,6 +104,8 @@ def run(args, report, checkpoint):
     config, train, native = pretrain_recipe(
         profile=args.profile, cp=args.cp, dp=args.dp,
         experts=args.experts, width=args.width, top_k=args.top_k)
+    native = replace(native, splash_batch_mode=getattr(args, "splash_batch_mode", "vmap"),
+                     splash_block_q_dkv=getattr(args, "splash_block_q_dkv", None))
     if args.batch_rows <= 0 or args.batch_rows % args.dp:
         raise ValueError("batch rows must be positive and divisible by DP")
     if args.trace_steps < 0 or args.data_batches < 1 or (args.trace_steps and args.trace_dir is None):
@@ -260,6 +263,8 @@ def main():
     parser.add_argument("--width", type=int)
     parser.add_argument("--top-k", type=int, help="Override profile default (narrow48: 4; others: 2)")
     parser.add_argument("--cp", type=int, default=8)
+    parser.add_argument("--splash-batch-mode", choices=("vmap", "sequential"), default="vmap")
+    parser.add_argument("--splash-block-q-dkv", type=int, choices=(128, 256))
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--batch-rows", type=int, default=4)
     parser.add_argument("--phase", choices=("both", "base", "late"), default="both")

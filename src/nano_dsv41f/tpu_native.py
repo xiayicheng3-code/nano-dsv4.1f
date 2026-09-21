@@ -41,8 +41,15 @@ class TPUNativeConfig:
     need_teacher_lse: bool = False
     # Set from ModelConfig.parallelism by compile_pretrain_step_native.
     attention_data_shards: int = 1
+    # Experimental controls. Defaults preserve the measured production path.
+    splash_batch_mode: Literal["vmap", "sequential"] = "vmap"
+    splash_block_q_dkv: int | None = None
 
     def __post_init__(self) -> None:
+        if self.splash_batch_mode not in ("vmap", "sequential"):
+            raise ValueError("splash_batch_mode must be vmap or sequential")
+        if self.splash_block_q_dkv is not None and self.splash_block_q_dkv not in (128, 256):
+            raise ValueError("experimental splash_block_q_dkv must be 128 or 256")
         if self.moe_ragged_implementation not in ("auto", "mosaic", "xla"):
             raise ValueError("moe_ragged_implementation must be auto, mosaic or xla")
         if self.moe_capacity_factor < 1.0:
@@ -243,6 +250,8 @@ def _splash_runner(
         hash(mask_array.tobytes()),
         save_residuals,
         state.options.splash_interpret,
+        state.options.splash_batch_mode,
+        state.options.splash_block_q_dkv,
     )
     cached = _SPLASH_RUNNER_CACHE.get(cache_key)
     if cached is not None:
@@ -257,6 +266,9 @@ def _splash_runner(
         q_seq_shards=shards,
         save_residuals=save_residuals,
         interpret=state.options.splash_interpret,
+        **({"block_sizes": replace(splash.BlockSizes.get_default(),
+                                  block_q_dkv=state.options.splash_block_q_dkv)}
+           if state.options.splash_block_q_dkv is not None else {}),
     )
     kernel_spec = kernel.manual_sharding_spec(NamedSharding(manual, P(None, axis)))
     q_spec = P(data_axis, None, axis, None)
@@ -296,13 +308,18 @@ def _splash_runner(
                 return out, lse
             return result
 
-        return jax.vmap(one)(q_bhtd, k_btd, v_btd, q_segments, kv_segments)
+        inputs = (q_bhtd, k_btd, v_btd, q_segments, kv_segments)
+        if state.options.splash_batch_mode == "sequential":
+            return jax.lax.map(lambda xs: one(*xs), inputs)
+        return jax.vmap(one)(*inputs)
 
-    def apply(q, kv, q_segments, kv_segments, sinks):
+    def apply(q, kv, q_segments, kv_segments, sinks, *, value=None):
         if q.shape[0] % dp:
             raise ValueError("Splash batch rows must be divisible by attention DP")
         q_bhtd = jnp.swapaxes(q, 1, 2)
-        result = _mapped(kernel, q_bhtd, kv, kv, q_segments, kv_segments, sinks)
+        # Production uses tied K/V. The replay can also check their separate VJPs.
+        result = _mapped(kernel, q_bhtd, kv, kv if value is None else value,
+                         q_segments, kv_segments, sinks)
         if save_residuals:
             out_bhtd, lse_bht = result
             return jnp.swapaxes(out_bhtd, 1, 2), jnp.swapaxes(lse_bht, 1, 2)

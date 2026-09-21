@@ -3,6 +3,11 @@
 Measured results and the preregistered next experiment are in the
 [2026-09-21 profiling note](experiments/2026-09-21-pretrain-profile.md).
 
+The controlled follow-up is now implemented in
+`notebooks/nano_dsv41f_attention_hypothesis.ipynb`; see the
+[attention experiment guide](attention_hypothesis.md). Physical TPU results for
+that intervention are still pending.
+
 ## Real-corpus profiling follow-up
 
 Use `notebooks/nano_dsv41f_pretrain_profile.ipynb` for the 4/8/24-row throughput

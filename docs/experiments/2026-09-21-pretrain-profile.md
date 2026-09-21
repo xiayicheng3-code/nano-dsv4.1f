@@ -1,8 +1,14 @@
 # 8K pretraining profile: observations and next-experiment hypotheses
 
-Status: **baseline measured; causal interventions below are proposed and unrun**.
+Status: **baseline measured; causal interventions implemented, physical TPU run pending**.
 Recorded after inspecting the 2026-09-21 Kaggle run. This note makes the predictions
 explicit before running the next benchmark. It does not change the training recipe.
+
+Implementation follow-up: [notebook and experiment guide](../attention_hypothesis.md).
+The primary replay preserves the production shared K=V input and its combined
+gradient; independent K/V derivatives are covered by the small dense oracle.
+All three production families currently use `save_residuals=False`. Optional
+H4 varies just `block_q_dkv` from 128 to 256. The thresholds below remain unchanged.
 
 ## Evidence and reproducibility
 

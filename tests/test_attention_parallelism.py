@@ -46,7 +46,8 @@ def test_attention_dp_cp_matches_dense_forward_backward(dp, ratio):
         np.testing.assert_allclose(actual, expected, atol=5e-6, rtol=3e-4)
 
 
-def test_cp2_dp4_full_late_optimizer_step_matches_reference():
+@pytest.mark.parametrize("batch_mode", ["vmap", "sequential"])
+def test_cp2_dp4_full_late_optimizer_step_matches_reference(batch_mode):
     """Exercise DP reduction, EP8 reshards, global query budget, and the optimizer together."""
     if len(jax.devices()) < 8:
         pytest.skip("requires eight CPU devices")
@@ -63,8 +64,9 @@ def test_cp2_dp4_full_late_optimizer_step_matches_reference():
     mesh = make_v5e_mesh()
     params, specs, _ = init_model_sharded(jax.random.key(101), cfg, mesh)
     opt, _ = init_optimizer_state_sharded(params, specs, cfg, mesh)
-    ids = np.random.default_rng(100).integers(0, cfg.vocab_size, (4, 256), dtype=np.int32)
-    segments = np.tile(np.repeat(np.arange(2, dtype=np.int32), 128)[None], (4, 1))
+    batch_rows = 8 if batch_mode == "sequential" else 4
+    ids = np.random.default_rng(100).integers(0, cfg.vocab_size, (batch_rows, 256), dtype=np.int32)
+    segments = np.tile(np.repeat(np.arange(2, dtype=np.int32), 128)[None], (batch_rows, 1))
     mask = np.ones_like(ids, dtype=bool)
     mask[:, 127] = False
     ids, segments, mask = put_training_batch(ids, segments, mask, cfg, mesh)
@@ -78,7 +80,8 @@ def test_cp2_dp4_full_late_optimizer_step_matches_reference():
         token_mask=jnp.asarray(np.asarray(mask)), step=step_id, include_indexer=True))
     expected = ref(host_params, host_opt)
     native = compile_pretrain_step(params, opt, specs, cfg, train, mesh,
-        include_indexer=True, native_config=TPUNativeConfig(splash_interpret=True))
+        include_indexer=True, native_config=TPUNativeConfig(splash_interpret=True,
+                                                           splash_batch_mode=batch_mode))
     actual = native(params, opt, ids, segments, step_id, mask)
     jax.block_until_ready(actual)
     np.testing.assert_allclose(actual[2]["loss"], expected[2]["loss"], atol=2e-5, rtol=2e-5)

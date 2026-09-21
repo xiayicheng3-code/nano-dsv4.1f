@@ -265,6 +265,12 @@ and exports separate warmed-up TPU traces after unprofiled timing.
 See the [measured 4/8/24-row results and testable hypotheses](docs/experiments/2026-09-21-pretrain-profile.md)
 for the next attention-batching experiment.
 
+Run that controlled experiment with
+[`notebooks/nano_dsv41f_attention_hypothesis.ipynb`](notebooks/nano_dsv41f_attention_hypothesis.ipynb).
+It freezes real model attention inputs, checks gradients, compares local `vmap`
+with sequential attention, and offers a tile-pressure probe and full-model A/B.
+See [controls, environment variables and interpretation](docs/attention_hypothesis.md).
+
 A lightweight notebook is checked in at [`notebooks/nano_dsv41f_kaggle.ipynb`](notebooks/nano_dsv41f_kaggle.ipynb). From a blank Kaggle session, select TPU, enable Internet, and run top-to-bottom. The notebook fetches the requested Git ref and prints the exact commit SHA for reproducibility.
 
 Regenerate both maintained notebook entry points with:
