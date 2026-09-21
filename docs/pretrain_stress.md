@@ -1,5 +1,8 @@
 # Full 8K pretraining stress test
 
+Measured results and the preregistered next experiment are in the
+[2026-09-21 profiling note](experiments/2026-09-21-pretrain-profile.md).
+
 ## Real-corpus profiling follow-up
 
 Use `notebooks/nano_dsv41f_pretrain_profile.ipynb` for the 4/8/24-row throughput
