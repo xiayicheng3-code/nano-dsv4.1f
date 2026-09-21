@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from nano_dsv41f.config import IndexerTrainingConfig
+from nano_dsv41f.config import IndexerConfig, IndexerTrainingConfig
 from nano_dsv41f.indexer import budgeted_teacher_indices, eligible_teacher_queries
 from nano_dsv41f.model import apply_model, init_model
 from nano_dsv41f.training import _selective_indexer_from_backbone_aux
@@ -56,6 +56,14 @@ def test_sampling_refreshes_with_step_is_reproducible_and_does_not_recompile():
 def test_invalid_budget_is_rejected(budget):
     with pytest.raises(ValueError, match="query_budget"):
         IndexerTrainingConfig(query_budget=budget)
+
+
+@pytest.mark.parametrize('blocks', [16, 64])
+def test_candidate_pool_must_leave_room_for_topk_selection(blocks):
+    with pytest.raises(ValueError, match='candidate pool capacity must exceed top_k'):
+        IndexerConfig(candidate_topk_blocks=blocks)
+    # An explicitly disabled hierarchy does not constrain retrieval width.
+    IndexerConfig(candidate_source_layer=-1, candidate_topk_blocks=blocks)
 
 
 def test_no_eligible_queries_has_only_safe_dummy_slots():
@@ -125,8 +133,15 @@ def test_budget_covering_all_queries_matches_exhaustive_loss_and_gradients(backb
         assert np.any(actual_grad["blocks"][layer]["attn"]["indexer"]["wk"] != 0)
 
 
-def test_default_l5_uses_full_history_and_candidate_mask_is_opt_in(backbone):
-    cfg, params, segments, mask, aux = backbone
+def test_default_l5_uses_full_history_and_candidate_mask_is_opt_in():
+    cfg = tiny_config(dspark=False)
+    params = init_model(jax.random.key(71), cfg)
+    ids = jnp.arange(28, dtype=jnp.int32)[None, :] % cfg.vocab_size
+    # Enough same-document history to make the corrected pool selective.
+    segments = jnp.zeros_like(ids)
+    mask = jnp.ones_like(ids, dtype=bool)
+    _, aux = apply_model(params, cfg, ids, segment_ids=segments, token_mask=mask,
+                         compute_indexer=False)
     assert not cfg.indexer_training.apply_candidate_mask
     (loss, unmasked), _ = objective(cfg, segments, mask, aux)(params)
     restricted_cfg = replace(cfg, indexer_training=replace(cfg.indexer_training, apply_candidate_mask=True))
@@ -139,7 +154,9 @@ def test_default_l5_uses_full_history_and_candidate_mask_is_opt_in(backbone):
     l3_counts = np.asarray(unmasked["student_key_counts"]["L3"])[valid]
     restricted_counts = np.asarray(restricted["student_key_counts"]["L5"])[valid]
     np.testing.assert_array_equal(full_counts, l3_counts)
-    assert (restricted_counts < full_counts).all()
+    assert (restricted_counts <= full_counts).all()
+    assert (restricted_counts < full_counts).any()
+    assert (restricted_counts <= cfg.indexer.candidate_topk_blocks * cfg.indexer.candidate_block_size).all()
     assert (restricted_counts > 0).all()
     assert all(np.isfinite(x).all() for x in jax.tree.leaves(grads))
 
