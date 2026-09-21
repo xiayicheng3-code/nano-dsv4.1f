@@ -1,5 +1,65 @@
 # Full 8K pretraining stress test
 
+## Real-corpus profiling follow-up
+
+Use `notebooks/nano_dsv41f_pretrain_profile.ipynb` for the 4/8/24-row throughput
+investigation. It runs narrow48/top-4, attention CP2/DP4 and MoE EP8 with the same
+seven-layer training recipe. The existing stress/capacity notebook remains available.
+Regenerate the profiling notebook with `python scripts/build_profile_notebook.py`.
+
+Attach the two Kaggle datasets. The notebook's first cell sets these defaults:
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `NANO_DSV41F_REF` | `codex/pretrain-stress-8k` | Code branch, before bootstrap |
+| `NANO_PROFILE_CORPUS` | `/kaggle/input/datasets/xiayicheng3gmailcom/nanodsv4-1f-pretrain-tokenized` | Dataset mount; nested corpus root is discovered |
+| `NANO_PROFILE_TOKENIZER` | `/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb` | Tokenizer directory or tokenizer.json |
+| `NANO_PROFILE_ROWS` | `4,8,24` | Global rows, positive multiples of DP4 |
+| `NANO_PROFILE_DATA_BATCHES` | `3` | Number of sampled batches cycled on device |
+| `NANO_PROFILE_DATA_SEED` | `1701` | Corpus sampling seed |
+| `NANO_PROFILE_MODEL_SEED` | `7` | Model initialization seed |
+| `NANO_PROFILE_WARMUP` | `3` | Excluded warmup steps per phase |
+| `NANO_PROFILE_STEPS` | `12` | Unprofiled measured steps per phase |
+| `NANO_PROFILE_TRACE_STEPS` | `3` | Additional profiled steps; 0 disables traces |
+| `NANO_PROFILE_PHASE` | `both` | `both`, `base`, or `late` |
+| `NANO_PROFILE_TIMEOUT` | `3600` | Timeout seconds per isolated worker |
+
+No extra XLA/TPU environment flags are required. The canonical bootstrap selects
+`JAX_PLATFORMS=tpu` and installs the pinned stack. Keep the notebook process free
+of a JAX client; preprocessing and training each run in child processes.
+
+The sampler understands `nano-dsv41f-pretrain-compact-v1`: memory-mapped uint16
+tokens plus per-document lengths and row offsets. It validates the completed
+manifest, tokenizer hash/vocabulary/special IDs, segment lengths, BOS/EOS and PAD.
+It samples global training rows uniformly without replacement across shards,
+without reading the full corpus into RAM. Each smaller batch takes a nested prefix
+of the same maximum-size sampled batch. Input NPZs, sample provenance and hashes
+are saved. Every worker preloads its small batch bank on device; transfer and disk
+time are excluded, while the bank's device residency contributes to HBM usage.
+
+Timing precedes trace capture. Median/p95, seconds/row and microseconds/physical
+token exclude both warmup and profiling. LM throughput is the median of per-step
+valid-target throughput because different packed batches can have different masks.
+Per-step routing reports retain [layer, expert] real-token and physical-dispatch
+counts, coefficient of variation, idle experts, chip loads/imbalance and packed
+buffer utilization. Physical dispatch includes padding in the current MoE kernel.
+Six consecutive experts belong to each EP chip in narrow48. Source scopes identify
+backbone layers and MoE gather, sort and combine operations in HLO/profiler views.
+
+Both phases use initialized/briefly updated weights. Late schedule step 6000 does
+not restore a trained checkpoint. These measurements describe early routing on
+real text, not mature specialization or worst-case OOM capacity. Packed corpus
+attention workloads can also differ from synthetic full-document rows.
+
+Download the final ZIP: it includes summary/per-step JSON, worker logs, optimized
+HLO, XPlane traces and sampled input provenance. In a separate analysis environment,
+install `xprof`, then run `xprof --logdir /path/to/extracted/traces --port 8791`.
+Use HLO Op Profile/Stats, roofline and trace views to compare operation time per
+token across shapes. Confirm TPU events are present; a host-only trace cannot
+establish a device bottleneck. Profiling export failures preserve measured timing
+but mark the case failed. Source scopes can be fused and should not be interpreted
+as independent exclusive times. See the [JAX profiling guide](https://docs.jax.dev/en/latest/profiling.html).
+
 Run `notebooks/nano_dsv41f_pretrain_stress.ipynb` on a fresh Kaggle TPU v5e-8
 session with Internet enabled. Its first cell selects the implementation branch;
 the bootstrap prints the resolved commit and installs the existing pinned runtime.

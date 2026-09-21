@@ -258,6 +258,11 @@ synchronized optimizer-step timings, compiler/device memory, and incremental fai
 reports. See [the stress-test recipe and interpretation](docs/pretrain_stress.md).
 Regenerate this notebook with `python scripts/build_stress_notebook.py`.
 
+For the **4/8/24-row throughput investigation with real packed corpus inputs**, use
+[`notebooks/nano_dsv41f_pretrain_profile.ipynb`](notebooks/nano_dsv41f_pretrain_profile.ipynb).
+It checks the attached tokenizer/corpus, records per-layer routing and dispatch loads,
+and exports separate warmed-up TPU traces after unprofiled timing.
+
 A lightweight notebook is checked in at [`notebooks/nano_dsv41f_kaggle.ipynb`](notebooks/nano_dsv41f_kaggle.ipynb). From a blank Kaggle session, select TPU, enable Internet, and run top-to-bottom. The notebook fetches the requested Git ref and prints the exact commit SHA for reproducibility.
 
 Regenerate both maintained notebook entry points with:

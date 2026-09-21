@@ -57,6 +57,7 @@ def _ragged_dot(lhs, rhs, group_sizes, *, implementation):
     return jnp.where(valid[:, None], out, 0)[:rows, :outputs]
 
 
+@jax.named_call
 def ragged_expert_forward(x, experts, group_sizes, *, swiglu_limit, implementation):
     """Two grouped GEMMs with Tokamax's input/weight VJPs and clipped SwiGLU."""
     gate_up = _ragged_dot(
@@ -131,20 +132,22 @@ def apply_moe_v5e_multi(
         router_loads = jax.lax.psum(
             _router_loads(local_indices, local_token_mask, n_experts), axis
         )
-        global_x = jax.lax.all_gather(local_x, axis, axis=1, tiled=True)
-        weights = jax.lax.all_gather(local_weights, axis, axis=1, tiled=True).reshape(-1)
-        indices = jax.lax.all_gather(local_indices, axis, axis=1, tiled=True).reshape(-1)
+        with jax.named_scope("moe_all_gather"):
+            global_x = jax.lax.all_gather(local_x, axis, axis=1, tiled=True)
+            weights = jax.lax.all_gather(local_weights, axis, axis=1, tiled=True).reshape(-1)
+            indices = jax.lax.all_gather(local_indices, axis, axis=1, tiled=True).reshape(-1)
         flat_x = global_x.reshape(n_global, dim)
-        relative_ids = indices - jax.lax.axis_index(axis) * local_experts
-        owned = (relative_ids >= 0) & (relative_ids < local_experts)
-        keys = jnp.where(owned, relative_ids, local_experts)
-        loads = jnp.bincount(keys, length=local_experts + 1)[:local_experts]
-        # Tokamax 0.0.12 rejects group_offset. Compact local groups from row zero
-        # instead, placing non-owned assignments in a masked suffix.
-        _, assignment_ids = jax.lax.sort_key_val(keys, jnp.arange(indices.size), is_stable=True)
-        assignment_ids = assignment_ids[:packed_rows]
-        token_ids = assignment_ids // top_k
-        valid = jnp.arange(packed_rows) < jnp.sum(loads)
+        with jax.named_scope("moe_dispatch_sort"):
+            relative_ids = indices - jax.lax.axis_index(axis) * local_experts
+            owned = (relative_ids >= 0) & (relative_ids < local_experts)
+            keys = jnp.where(owned, relative_ids, local_experts)
+            loads = jnp.bincount(keys, length=local_experts + 1)[:local_experts]
+            # Tokamax 0.0.12 rejects group_offset. Compact local groups from row zero
+            # instead, placing non-owned assignments in a masked suffix.
+            _, assignment_ids = jax.lax.sort_key_val(keys, jnp.arange(indices.size), is_stable=True)
+            assignment_ids = assignment_ids[:packed_rows]
+            token_ids = assignment_ids // top_k
+            valid = jnp.arange(packed_rows) < jnp.sum(loads)
 
         def evaluate(_):
             return ragged_expert_forward(
@@ -158,9 +161,10 @@ def apply_moe_v5e_multi(
             lambda _: jnp.zeros((packed_rows, dim), local_params["experts"]["w2"].dtype),
             operand=None,
         )
-        values = jnp.where(valid[:, None], selected_out.astype(jnp.float32), 0)
-        values *= jnp.where(valid, weights[assignment_ids], 0)[:, None]
-        contribution = jnp.zeros((n_global, dim), jnp.float32).at[token_ids].add(values)
+        with jax.named_scope("moe_combine_scatter"):
+            values = jnp.where(valid[:, None], selected_out.astype(jnp.float32), 0)
+            values *= jnp.where(valid, weights[assignment_ids], 0)[:, None]
+            contribution = jnp.zeros((n_global, dim), jnp.float32).at[token_ids].add(values)
         contribution = contribution.reshape(global_x.shape)
         routed_local = jax.lax.psum_scatter(contribution, axis, scatter_dimension=1, tiled=True)
         shared = local_params["shared"]

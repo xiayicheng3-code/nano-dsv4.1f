@@ -83,6 +83,13 @@ def test_cp2_dp4_full_late_optimizer_step_matches_reference():
     jax.block_until_ready(actual)
     np.testing.assert_allclose(actual[2]["loss"], expected[2]["loss"], atol=2e-5, rtol=2e-5)
     np.testing.assert_array_equal(actual[2]["router_loads"], expected[2]["router_loads"])
+    physical = np.asarray(actual[2]["expert_loads_by_layer"])
+    assert physical.shape == (cfg.n_layers, cfg.n_experts)
+    np.testing.assert_array_equal(physical.sum(axis=0), actual[2]["expert_loads"])
+    np.testing.assert_array_equal(physical.sum(axis=1),
+                                  np.full(cfg.n_layers, ids.size * cfg.experts_per_token))
+    np.testing.assert_array_equal(np.asarray(actual[2]["router_loads"]).sum(axis=1),
+                                  np.full(cfg.n_layers, int(mask.sum()) * cfg.experts_per_token))
     assert int(actual[2]["indexer"]["active_queries"]) == 24
     for a, b in zip(jax.tree.leaves(actual[:2]), jax.tree.leaves(expected[:2])):
         np.testing.assert_allclose(a, b, atol=3e-5, rtol=5e-3)
