@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "prepare_reasoning_sft.py"
 SPEC = importlib.util.spec_from_file_location("prepare_reasoning_sft", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 reasoning_sft = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = reasoning_sft
 SPEC.loader.exec_module(reasoning_sft)
 
 
