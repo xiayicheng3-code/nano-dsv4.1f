@@ -35,6 +35,9 @@ from nano_dsv41f.trace_corpus import (
 )
 
 
+SCIENCE_SUBJECTS = frozenset({"Physics", "Chemistry", "Biology"})
+
+
 @dataclass(frozen=True)
 class TraceSource:
     key: str
@@ -46,20 +49,47 @@ class TraceSource:
     license: str
     config: str | None = None
     max_observation_chars: int = 4000
+    provenance: str = ""
 
 
 REASONING_SOURCES = (
     TraceSource(
-        "mot_math", "reasoning", "open-r1/Mixture-of-Thoughts", "train", 0.45,
-        "mixture_of_thoughts", "component-dependent; see upstream dataset cards", config="math",
+        "openr1_math",
+        "reasoning",
+        "open-r1/OpenR1-Math-220k",
+        "train",
+        0.45,
+        "openr1_math",
+        "apache-2.0",
+        config="default",
+        provenance=(
+            "Apache-2.0 NuminaMath-1.5 problems with DeepSeek-R1 reasoning traces; "
+            "adapter keeps a complete upstream-verified generation."
+        ),
     ),
     TraceSource(
-        "mot_science", "reasoning", "open-r1/Mixture-of-Thoughts", "train", 0.30,
-        "mixture_of_thoughts", "component-dependent; see upstream dataset cards", config="science",
+        "chimera_science",
+        "reasoning",
+        "TianHongZXY/CHIMERA",
+        "train",
+        0.30,
+        "chimera_science",
+        "apache-2.0",
+        config="Qwen3-235B-2507",
+        provenance=(
+            "Fully synthetic CHIMERA; adapter keeps correctness=True rows in Physics, "
+            "Chemistry and Biology only."
+        ),
     ),
     TraceSource(
-        "mot_code", "reasoning", "open-r1/Mixture-of-Thoughts", "train", 0.25,
-        "mixture_of_thoughts", "component-dependent; see upstream dataset cards", config="code",
+        "xcoder",
+        "reasoning",
+        "IIGroup/X-Coder-SFT-376k",
+        "hybrid",
+        0.25,
+        "xcoder",
+        "mit",
+        provenance="Fully synthetic competitive-programming reasoning SFT data.",
     ),
 )
 
@@ -105,7 +135,7 @@ def sha256_file(path: Path) -> str:
 
 
 def _identity(source: TraceSource, row: dict[str, Any], fallback: int) -> str:
-    for key in ("id", "uuid", "instance_id", "qid", "task_id"):
+    for key in ("id", "uuid", "instance_id", "qid", "task_id", "index"):
         value = row.get(key)
         if value not in (None, ""):
             return f"{source.key}:{key}:{value}"
@@ -122,37 +152,125 @@ def _split_think(text: str) -> tuple[str, str] | None:
     return (reasoning, final) if reasoning and final else None
 
 
-def adapt_mixture_of_thoughts(
-    source: TraceSource, row: dict[str, Any], row_index: int
+def _reasoning_case(
+    source: TraceSource,
+    row: dict[str, Any],
+    row_index: int,
+    *,
+    user: Any,
+    reasoning: Any,
+    final: Any,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    messages = row.get("messages")
-    if not isinstance(messages, list) or len(messages) != 2:
+    if not all(isinstance(x, str) and x.strip() for x in (user, reasoning, final)):
         return None
-    if messages[0].get("role") != "user" or messages[1].get("role") != "assistant":
-        return None
-    user, answer = messages[0].get("content"), messages[1].get("content")
-    if not isinstance(user, str) or not isinstance(answer, str):
-        return None
-    split = _split_think(answer)
-    if split is None:
-        return None
-    reasoning, final = split
     return normalize_agent_trace(
         {
             "messages": [
-                {"role": "user", "content": user},
-                {"role": "assistant", "reasoning_content": reasoning, "content": final},
+                {"role": "user", "content": user.strip()},
+                {
+                    "role": "assistant",
+                    "reasoning_content": reasoning.strip(),
+                    "content": final.strip(),
+                },
             ],
             "thinking_mode": "thinking",
             "metadata": {
                 "id": _identity(source, row, row_index),
                 "dataset": source.dataset,
                 "source": source.key,
-                "upstream_source": row.get("source"),
-                "upstream_num_tokens": row.get("num_tokens"),
+                "upstream_license": source.license,
+                **(metadata or {}),
             },
         },
         default_reasoning_effort=75,
+    )
+
+
+def adapt_openr1_math(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    user = row.get("problem")
+    if not isinstance(user, str) or not user.strip():
+        messages = row.get("messages")
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            user = messages[0].get("content")
+    generations = row.get("generations")
+    if not isinstance(user, str) or not isinstance(generations, list):
+        return None
+    complete = row.get("is_reasoning_complete")
+    verified = row.get("correctness_math_verify")
+    if not isinstance(complete, list):
+        complete = [True] * len(generations)
+    if not isinstance(verified, list):
+        verified = [True] * len(generations)
+    for i, generation in enumerate(generations):
+        if i >= len(complete) or not complete[i]:
+            continue
+        if i < len(verified) and verified[i] is False:
+            continue
+        if not isinstance(generation, str):
+            continue
+        split = _split_think(generation)
+        if split is None:
+            continue
+        reasoning, final = split
+        return _reasoning_case(
+            source,
+            row,
+            row_index,
+            user=user,
+            reasoning=reasoning,
+            final=final,
+            metadata={
+                "upstream_source": row.get("source"),
+                "problem_type": row.get("problem_type"),
+                "generation_index": i,
+                "reasoning_complete": True,
+                "math_verify": None if i >= len(verified) else verified[i],
+            },
+        )
+    return None
+
+
+def adapt_chimera_science(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    if row.get("correctness") is not True or row.get("subject") not in SCIENCE_SUBJECTS:
+        return None
+    return _reasoning_case(
+        source,
+        row,
+        row_index,
+        user=row.get("question"),
+        reasoning=row.get("solution"),
+        final=row.get("answer"),
+        metadata={
+            "subject": row.get("subject"),
+            "topic": row.get("topic"),
+            "correctness": True,
+        },
+    )
+
+
+def adapt_xcoder(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    query, response = row.get("query"), row.get("response")
+    if not isinstance(query, str) or not isinstance(response, str):
+        return None
+    split = _split_think(response)
+    if split is None:
+        return None
+    reasoning, final = split
+    return _reasoning_case(
+        source,
+        row,
+        row_index,
+        user=query,
+        reasoning=reasoning,
+        final=final,
+        metadata={"upstream_split": source.split},
     )
 
 
@@ -180,7 +298,6 @@ _FENCE_RE = re.compile(r"```(?:[^\n]*\n)?(.*?)```", re.DOTALL)
 
 
 def _split_swe_ai_turn(text: str) -> tuple[str, str | None]:
-    """Split Nebius' AI text into reasoning and its final fenced environment command."""
     matches = list(_FENCE_RE.finditer(text))
     if not matches:
         return text.strip(), None
@@ -455,7 +572,9 @@ def adapt_openseeker(
 
 
 ADAPTERS: dict[str, Callable[[TraceSource, dict[str, Any], int], dict[str, Any] | None]] = {
-    "mixture_of_thoughts": adapt_mixture_of_thoughts,
+    "openr1_math": adapt_openr1_math,
+    "chimera_science": adapt_chimera_science,
+    "xcoder": adapt_xcoder,
     "swe_agent": adapt_swe_agent,
     "nemotron": adapt_nemotron,
     "openseeker": adapt_openseeker,
@@ -521,8 +640,10 @@ def collect_source_cases(
     tokenize_batch_size: int,
     seen_prompts: set[bytes],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    stream, adapter = load_stream(source, seed=seed, shuffle_buffer=shuffle_buffer), ADAPTERS[source.adapter]
-    cases, batch = [], []
+    stream = load_stream(source, seed=seed, shuffle_buffer=shuffle_buffer)
+    adapter = ADAPTERS[source.adapter]
+    cases: list[dict[str, Any]] = []
+    batch: list[dict[str, Any]] = []
     accepted_tokens = rows_seen = rows_rejected = 0
     drops: Counter[str] = Counter()
 
@@ -560,7 +681,7 @@ def collect_source_cases(
         )
     return cases, {
         "rows_seen": rows_seen,
-        "rows_adapter_rejected": rows_rejected,
+        "rows_adapter_or_quality_rejected": rows_rejected,
         "accepted_cases": len(cases),
         "accepted_tokens_before_effort_relabel": accepted_tokens,
         **{f"dropped_{k}": int(v) for k, v in drops.items()},
@@ -656,7 +777,8 @@ def write_trace_shards(
     shard_meta: list[dict[str, Any]] = []
 
     for shard_index, start in enumerate(range(0, len(rows), shard_rows)):
-        row_group, n = rows[start : start + shard_rows], len(rows[start : start + shard_rows])
+        row_group = rows[start : start + shard_rows]
+        n = len(row_group)
         input_ids = np.full((n, seq_len), PAD_TOKEN_ID, dtype=np.uint16)
         segment_ids = np.zeros((n, seq_len), dtype=np.uint16)
         token_mask = np.zeros((n, seq_len), dtype=np.uint8)
@@ -673,8 +795,10 @@ def write_trace_shards(
 
         for local_row, row in enumerate(row_group):
             packed = pack_token_sequences(
-                [traces[i].tokens for i in row], seq_len=seq_len,
-                pad_token_id=PAD_TOKEN_ID, compression_ratio=2,
+                [traces[i].tokens for i in row],
+                seq_len=seq_len,
+                pad_token_id=PAD_TOKEN_ID,
+                compression_ratio=2,
             )
             input_ids[local_row] = packed.input_ids[0].astype(np.uint16)
             segment_ids[local_row] = packed.segment_ids[0].astype(np.uint16)
@@ -690,8 +814,10 @@ def write_trace_shards(
                 tool_calls[local_row] += trace.tool_calls
                 cursor += physical_len
             metrics = q_row_metrics(
-                packed.real_lengths, query_budget=query_budget,
-                q_threshold=q_threshold, band_edges=q_band_edges,
+                packed.real_lengths,
+                query_budget=query_budget,
+                q_threshold=q_threshold,
+                band_edges=q_band_edges,
             )
             eligible_q[local_row], selected_q[local_row] = metrics.eligible_q, metrics.selected_q
             q_budget_utilization[local_row] = metrics.budget_utilization
@@ -742,7 +868,8 @@ def prepare_pool(
     compress_shards: bool,
 ) -> dict[str, Any]:
     seen_prompts: set[bytes] = set()
-    cases, collection = [], {}
+    cases: list[dict[str, Any]] = []
+    collection: dict[str, Any] = {}
     for offset, source in enumerate(sources):
         source_target = round(target_tokens * source.weight)
         source_cases, stats = collect_source_cases(
@@ -760,8 +887,12 @@ def prepare_pool(
         print(pool_name, source.key, stats)
 
     traces, relabel_stats = assign_efforts_and_tokenize(
-        cases, tokenizer=tokenizer, seq_len=seq_len,
-        batch_size=tokenize_batch_size, seed=seed, jitter=jitter,
+        cases,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        batch_size=tokenize_batch_size,
+        seed=seed,
+        jitter=jitter,
     )
     if not traces:
         raise RuntimeError(f"{pool_name}: no traces survived final tokenization")
@@ -783,13 +914,14 @@ def prepare_pool(
         source_tokens[trace.source] += int(trace.tokens.size)
     effort_rows = [
         {"reasoning_effort": trace.reasoning_effort}
-        for trace in traces if trace.reasoning_effort
+        for trace in traces
+        if trace.reasoning_effort
     ]
     histogram = reasoning_effort_histogram(effort_rows)
     total_tokens = sum(int(trace.tokens.size) for trace in traces)
     supervised_tokens = sum(int(trace.sft_loss_mask.sum()) for trace in traces)
     manifest = {
-        "format": "nano-dsv41f-packed-traces-v2",
+        "format": "nano-dsv41f-packed-traces-v3",
         "pool": pool_name,
         "seq_len": seq_len,
         "target_tokens": target_tokens,
@@ -818,6 +950,7 @@ def prepare_pool(
                 "weight": source.weight,
                 "adapter": source.adapter,
                 "license": source.license,
+                "provenance": source.provenance,
                 "max_observation_chars": source.max_observation_chars,
                 "collection": collection[source.key],
                 "final_records": source_counts[source.key],
@@ -838,12 +971,16 @@ def prepare_pool(
     (pool_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    print({
-        "pool": pool_name, "records": len(traces), "tokens": total_tokens,
-        "packed_rows": packed["rows"],
-        "sft_fraction": round(manifest["sft_supervised_fraction"], 4),
-        "q_budget_utilization": round(packed["query"]["mean_budget_utilization"], 4),
-    })
+    print(
+        {
+            "pool": pool_name,
+            "records": len(traces),
+            "tokens": total_tokens,
+            "packed_rows": packed["rows"],
+            "sft_fraction": round(manifest["sft_supervised_fraction"], 4),
+            "q_budget_utilization": round(packed["query"]["mean_budget_utilization"], 4),
+        }
+    )
     return manifest
 
 
@@ -894,37 +1031,55 @@ def main() -> None:
     if args.pool in ("all", "reasoning"):
         manifests.append(
             prepare_pool(
-                "reasoning", REASONING_SOURCES,
+                "reasoning",
+                REASONING_SOURCES,
                 target_tokens=args.reasoning_target_tokens,
-                tokenizer=tokenizer, tokenizer_path=args.tokenizer, output_dir=args.output_dir,
-                seq_len=args.seq_len, shard_rows=args.shard_rows,
-                tokenize_batch_size=args.tokenize_batch_size, shuffle_buffer=args.shuffle_buffer,
-                query_budget=args.query_budget, q_threshold=args.q_threshold,
-                q_band_edges=q_band_edges, seed=args.seed, jitter=args.jitter,
+                tokenizer=tokenizer,
+                tokenizer_path=args.tokenizer,
+                output_dir=args.output_dir,
+                seq_len=args.seq_len,
+                shard_rows=args.shard_rows,
+                tokenize_batch_size=args.tokenize_batch_size,
+                shuffle_buffer=args.shuffle_buffer,
+                query_budget=args.query_budget,
+                q_threshold=args.q_threshold,
+                q_band_edges=q_band_edges,
+                seed=args.seed,
+                jitter=args.jitter,
                 compress_shards=args.compress_shards,
             )
         )
     if args.pool in ("all", "agent"):
         manifests.append(
             prepare_pool(
-                "agent", AGENT_SOURCES,
+                "agent",
+                AGENT_SOURCES,
                 target_tokens=args.agent_target_tokens,
-                tokenizer=tokenizer, tokenizer_path=args.tokenizer, output_dir=args.output_dir,
-                seq_len=args.seq_len, shard_rows=args.shard_rows,
-                tokenize_batch_size=args.tokenize_batch_size, shuffle_buffer=args.shuffle_buffer,
-                query_budget=args.query_budget, q_threshold=args.q_threshold,
-                q_band_edges=q_band_edges, seed=args.seed + 41, jitter=args.jitter,
+                tokenizer=tokenizer,
+                tokenizer_path=args.tokenizer,
+                output_dir=args.output_dir,
+                seq_len=args.seq_len,
+                shard_rows=args.shard_rows,
+                tokenize_batch_size=args.tokenize_batch_size,
+                shuffle_buffer=args.shuffle_buffer,
+                query_budget=args.query_budget,
+                q_threshold=args.q_threshold,
+                q_band_edges=q_band_edges,
+                seed=args.seed + 41,
+                jitter=args.jitter,
                 compress_shards=args.compress_shards,
             )
         )
 
     summary = {
-        "format": "nano-dsv41f-trace-curriculum-v2",
+        "format": "nano-dsv41f-trace-curriculum-v3",
         "seq_len": args.seq_len,
         "pools": [
             {
-                "name": m["pool"], "records": m["trace_records"],
-                "tokens": m["actual_trace_tokens"], "rows": m["packing"]["rows"],
+                "name": m["pool"],
+                "records": m["trace_records"],
+                "tokens": m["actual_trace_tokens"],
+                "rows": m["packing"]["rows"],
                 "manifest": f"{m['pool']}/manifest.json",
             }
             for m in manifests
