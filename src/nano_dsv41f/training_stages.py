@@ -25,10 +25,10 @@ class TrainingStageSpec:
 
 PRETRAIN_STAGE = TrainingStageSpec(
     name="pretrain",
-    objective="causal_lm",
+    objective="causal_lm_with_configurable_late_indexer_aux",
     data_view="general_pretraining_text",
     q_aware_packing=False,
-    indexer_distillation=False,
+    indexer_distillation=True,
     candidate_mask=False,
     assistant_only_loss=False,
 )
