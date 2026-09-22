@@ -27,6 +27,15 @@ This is **not** a checkpoint-compatible miniature of the 552B production model, 
 
 **Tech:** Python · JAX · XLA/GSPMD · TPU v5e · SplashAttention/Pallas · `shard_map` · MoE · sparse attention · mixed precision · speculative decoding
 
+## Prepare the 3B-token pretraining corpus
+
+Run [the pretraining-only Kaggle CPU notebook](notebooks/nano_dsv41f_prepare_pretrain_3b.ipynb)
+to pre-tokenize FineWeb-Edu with the frozen nano tokenizer into 8K rows. It targets
+3B nonpadding training tokens plus a separate 10M-token validation set, writes
+compact shards with bounded memory, and resumes completed source files. It runs
+independently of mid-training and SFT/agent-trace preparation. See
+[the data guide](docs/pretrain_data.md) for storage, restart, and training-loader details.
+
 ## Why I built it
 
 Large-model architecture papers often make individual ideas look simple in isolation, while the hard part is how they interact in an executable system. This repo reconstructs those interactions explicitly and makes them small enough to inspect:
