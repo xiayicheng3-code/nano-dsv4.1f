@@ -16,9 +16,12 @@ def test_training_stages_are_explicit_and_ordered():
         "sft",
     ]
     assert not stage_by_name("pretrain").q_aware_packing
+    assert stage_by_name("pretrain").indexer_distillation
+    assert not stage_by_name("pretrain").candidate_mask
     assert stage_by_name("midtrain").q_aware_packing
-    assert stage_by_name("sft").assistant_only_loss
+    assert stage_by_name("midtrain").indexer_distillation
     assert not stage_by_name("midtrain").candidate_mask
+    assert stage_by_name("sft").assistant_only_loss
     assert stage_by_name("sft").candidate_mask
 
 
