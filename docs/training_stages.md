@@ -14,11 +14,11 @@ The machine-readable policy is `nano_dsv41f.training_stages.DEFAULT_TRAINING_STA
 
 | Stage | Primary data | Loss view | Q-aware packing | Indexer distillation | Hierarchical candidate mask |
 | --- | --- | --- | --- | --- | --- |
-| pretrain | broad general text | ordinary causal LM | no | off by stage policy | off |
+| pretrain | broad general text | ordinary causal LM | no | late/configurable auxiliary | off |
 | midtrain | curated documents + a minority of reasoning/agent traces | ordinary causal LM + indexer auxiliary loss | yes | on | off |
 | sft | cleaned reasoning/assistant/tool trajectories | assistant-only supervised loss | retained | on | on |
 
-The candidate-mask column is the intended stage policy. The current training runner does not infer the stage from a checkpoint name, so callers must still set the relevant indexer configuration explicitly.
+The candidate-mask column is the intended stage policy. The current training runner does not infer the stage from a checkpoint name, so callers must still set the relevant indexer configuration explicitly. The existing late selective indexer-distillation window may still run during pretraining; the three-stage redesign does not remove that auxiliary objective. It separates **data and supervision regimes** while keeping unrestricted legal history for indexer training until SFT.
 
 ## 1. Pretrain
 
@@ -29,11 +29,12 @@ Use the dedicated pretraining-only pipeline rather than the old staged corpus bu
 - 8192-token packed rows;
 - FineWeb-Edu as the general pretraining source;
 - ordinary best-fit packing with ratio-2 segment alignment;
-- no reasoning/agent mixture and no assistant-only loss mask.
+- no reasoning/agent mixture and no assistant-only loss mask;
+- the existing late selective indexer auxiliary may remain enabled, with candidate masking off.
 
 The implementation currently lives on the pretraining-data line (`codex/pretrain-only-3b`) and should be integrated into the surviving branch history rather than reimplemented here.
 
-Pretraining is deliberately boring. Its job is to acquire broad language/statistical capacity before we spend scarce nano-model capacity on tool syntax, reasoning formats, or the sparse-retrieval curriculum.
+Pretraining is deliberately simple at the data level. Its job is to acquire broad language/statistical capacity before we spend substantial mixture budget on tool syntax and reasoning formats. The configured late indexer auxiliary can still begin training retrieval before the dedicated mid-training stage.
 
 ## 2. Mid-train
 
@@ -62,7 +63,7 @@ These are ablation baselines, not claimed optimal weights. Reasoning and agent t
 
 All mid-training document rows are Q-aware. We keep the existing query-budget diagnostics and expected sampled-Q-density objective so long-context positions are not starved merely because ordinary best-fit packing happens to favor short segments.
 
-Mid-training is also the natural stage to enable the selective indexer-distillation auxiliary objective. The hierarchical L3→L5 candidate restriction remains **off** here so the student can learn against all legal compressed history.
+Mid-training continues the selective indexer-distillation auxiliary objective. The hierarchical L3→L5 candidate restriction remains **off** here so the student can learn against all legal compressed history.
 
 Mid-training has its own `--total-steps` value. That argument means **mid-training steps**, not a fraction of pretraining.
 
@@ -86,7 +87,7 @@ agent      2/3
 
 This ratio should be revisited when the final SFT sources are selected; it is not a reason to preserve any particular upstream dataset. The current reasoning-source catalog uses explicit permissive sources (OpenR1-Math, CHIMERA, and X-Coder); changing those sources does not change the stage contract.
 
-SFT is also where the current architecture intends to turn on the hierarchical candidate mask. This makes the final retrieval/indexer behavior match the inference hierarchy after the unrestricted mid-training distillation stage.
+SFT is also where the current architecture intends to turn on the hierarchical candidate mask. This makes the final retrieval/indexer behavior match the inference hierarchy after unrestricted pretraining/mid-training distillation.
 
 ## Stage-aware preparation
 
