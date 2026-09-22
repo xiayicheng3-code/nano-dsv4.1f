@@ -114,8 +114,7 @@ The cleaner:
 - assigns deterministic tool-call IDs when a simple trajectory omitted them;
 - rejects ambiguous/orphan tool results rather than guessing;
 - retains tool results as structured `role="tool"` messages;
-- removes NUL bytes and optionally truncates huge environment results with an explicit
-  marker;
+- removes NUL bytes and optionally truncates huge environment results with an explicit marker;
 - keeps reward/success/source IDs in metadata;
 - emits message-level supervision metadata outside the OpenAI messages.
 
@@ -134,28 +133,35 @@ truncated, mark the truncation instead of silently rewriting it.
 Do not synthesize hidden reasoning for datasets that do not contain it. An ordinary
 assistant action remains valid SFT data without an invented chain of thought.
 
-## Mid-training and SFT from the same canonical data
+## Canonical pretrain → mid-train → SFT use
 
-One structured dataset can create several training views:
+The training lifecycle is now a strict three-stage **optimization** plan. Data can be reused
+between stages, but the stage objectives are not interleaved into one fractional curriculum.
+See [`training_stages.md`](training_stages.md) for the repository-level contract.
 
-- **continued/mid-training:** causal LM over long mixed documents/trajectories;
-- **agent mid-training:** keep the full environment context but weight assistant reasoning,
-  actions, and answers more heavily;
-- **SFT:** loss only on assistant reasoning/content/tool-call spans; user/system/tool-result
-  tokens are context, not prediction targets.
+### Pretrain
 
-For this ~122M model, avoid switching most of the token budget to agent traces immediately.
-A practical first curriculum is:
+Use the separate large general-text corpus and ordinary causal-LM loss. Agent/reasoning
+traces are not part of the default pretraining mixture.
 
-1. short general/code/education warmup until loss and syntax are stable;
-2. introduce a small agent-trace mixture early;
-3. gradually increase high-quality agent data while keeping general/code data dominant;
-4. run an early small SFT pass as a behavior check, continue mixed training, then do the
-   final SFT later.
+### Mid-train
 
-This is deliberately a curriculum, not a rigid "pretrain completely, then mid-train, then
-SFT" wall. At nano scale, early agent data is useful, but too much too soon tends to teach
-tool syntax and dataset quirks before the model has enough general language/code capacity.
+Use the curated Q-aware document corpus plus a minority of cleaned reasoning/agent traces.
+The trace view is still ordinary causal LM over the complete structured trajectory. The
+starting sampler is 80% documents / 5% reasoning / 15% agent. This is also the stage where
+the selective indexer-distillation objective is enabled while candidate masking remains off.
+
+### SFT
+
+Use cleaned structured reasoning/agent examples with assistant-only supervision. User,
+system, and tool-result tokens remain context rather than prediction targets. Ordinary
+document rows are excluded from the default SFT pool, and the hierarchical candidate mask
+is enabled explicitly for the final retrieval behavior.
+
+The same canonical trace record therefore supports both later stages without duplicate
+cleaning: mid-training uses `token_mask`, while SFT additionally applies `sft_loss_mask`.
+Evaluation/checkpoint probes can happen between stages without turning the training plan back
+into the old early/middle/late-mid curriculum.
 
 ## Portable checkpoint export
 
