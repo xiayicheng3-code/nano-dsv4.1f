@@ -293,20 +293,46 @@ def _splash_runner(
         check_vma=False,
     )
     def _mapped(kernel_arg, q_bhtd, k_btd, v_btd, q_segments, kv_segments, sinks):
-        scale = jnp.asarray(head_dim**-0.5, dtype=q_bhtd.dtype)
+        sink_dtype = sinks.dtype
 
-        def one(qh, k, v, q_seg, kv_seg):
-            result = kernel_arg(
-                qh * scale,
+        def raw_one(row_kernel, qh, k, v, row_sinks, q_seg, kv_seg):
+            result = row_kernel(
+                qh * jnp.asarray(head_dim**-0.5, dtype=qh.dtype),
                 k,
                 v,
                 segment_ids=splash.SegmentIds(q=q_seg, kv=kv_seg),
-                sinks=sinks,
+                sinks=row_sinks,
             )
             if save_residuals:
                 out, (lse,) = result
                 return out, lse
             return result
+
+        # JAX 0.10.2 Splash returns dsinks in the attention output dtype (BF16),
+        # even for FP32 sink inputs. A scan transpose must accumulate it into an
+        # FP32 carry and rejects the mismatched type. Normalize the cotangent at
+        # the custom-VJP boundary, before scan/vmap perform their reductions.
+        # Forward sink values and the Splash kernel are unchanged. Apply this to
+        # both schedules so the experiment uses the same derivative contract.
+        @jax.custom_vjp
+        def typed_one(*args):
+            return raw_one(*args)
+
+        def typed_fwd(*args):
+            result, pullback = jax.vjp(raw_one, *args)
+            return result, pullback
+
+        def typed_bwd(pullback, cotangent):
+            grads = list(pullback(cotangent))
+            grads[4] = grads[4].astype(sink_dtype)
+            return tuple(grads)
+
+        typed_one.defvjp(typed_fwd, typed_bwd)
+
+        def one(qh, k, v, q_seg, kv_seg):
+            # Pass the kernel pytree explicitly: closing over its traced mask
+            # arrays can leak tracers when the full model is rematerialized.
+            return typed_one(kernel_arg, qh, k, v, sinks, q_seg, kv_seg)
 
         inputs = (q_bhtd, k_btd, v_btd, q_segments, kv_segments)
         if state.options.splash_batch_mode == "sequential":

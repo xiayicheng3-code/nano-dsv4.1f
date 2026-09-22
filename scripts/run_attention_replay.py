@@ -119,20 +119,40 @@ def run(a, report, checkpoint):
         if not all(e["passed"] for e in errors.values()):
             checkpoint("numerical_gate_failed")
             raise FloatingPointError(f"{variant} failed the preregistered 0.01 error gate")
-    del outputs, reference
     checkpoint("numerical_gate_passed")
+    components = {}
+    # Compile/check materialized pullbacks too: preflight exercises every path
+    # that the timed run will use, with the captured mixed-precision dtypes.
     for variant in order:
         executable, fwd, prepare, back = compiled[variant]
         result = report["variants"][variant]
-        checkpoint(f"timing:{variant}:combined")
-        result["combined"] = benchmark(executable, (*inputs, ct), a.warmup, a.steps)
-        result["combined"]["microseconds_per_token"] = result["combined"]["median_seconds"] * 1e6 / (a.rows * inputs[0].shape[1])
+        checkpoint(f"compile_and_check_components:{variant}")
         # Materialized VJP residuals are runtime arguments to the backward executable.
         # This is backward-only, not a subtraction of two noisy timing measurements.
         forward_exe = fwd.lower(*inputs).compile()
         _, pullback = prepare(*inputs)
         jax.block_until_ready(pullback)
         backward_exe = back.lower(pullback, ct).compile()
+        separate = (forward_exe(*inputs), backward_exe(pullback, ct))
+        separate = jax.device_get(jax.block_until_ready(separate))
+        errors = [error_metrics(x, y) for x, y in zip(jax.tree.leaves(separate),
+                                                    jax.tree.leaves(outputs[variant]))]
+        result["component_errors"] = errors
+        if not all(e["passed"] for e in errors):
+            raise FloatingPointError(f"{variant} separate forward/backward failed numerical gate")
+        components[variant] = (forward_exe, backward_exe, pullback)
+    del outputs, reference, separate
+    if getattr(a, "preflight_only", False):
+        report["status"] = "passed"
+        checkpoint("preflight_complete")
+        return
+    for variant in order:
+        executable = compiled[variant][0]
+        forward_exe, backward_exe, pullback = components[variant]
+        result = report["variants"][variant]
+        checkpoint(f"timing:{variant}:combined")
+        result["combined"] = benchmark(executable, (*inputs, ct), a.warmup, a.steps)
+        result["combined"]["microseconds_per_token"] = result["combined"]["median_seconds"] * 1e6 / (a.rows * inputs[0].shape[1])
         checkpoint(f"timing:{variant}:forward_backward_separate")
         result["forward"] = benchmark(forward_exe, inputs, a.warmup, a.steps)
         result["backward"] = benchmark(backward_exe, (pullback, ct), a.warmup, a.steps)
@@ -170,6 +190,8 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--steps", type=int, default=12)
     p.add_argument("--trace-steps", type=int, default=3)
+    p.add_argument("--preflight-only", action="store_true",
+                   help="Compile and check all paths with actual dtypes, without timing/tracing")
     a = p.parse_args()
     if a.warmup < 3 or a.steps < 12 or a.trace_steps < 0:
         p.error("require >=3 warmups, >=12 samples and nonnegative trace steps")

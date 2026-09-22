@@ -1,13 +1,18 @@
 # Attention batching and VMEM experiment
 
-Status: implemented and CPU-validated; physical TPU experiment **not yet run**.
+Status: initial TPU attempt failed before timing; mixed-precision correction
+CPU-validated, corrected TPU run pending. See the
+[2026-09-22 failure analysis](experiments/2026-09-22-attention-replay-failure.md).
 Use [the Kaggle notebook](../notebooks/nano_dsv41f_attention_hypothesis.ipynb) on a
 fresh TPU v5e-8 session, with the same two attached datasets as the real-corpus
 profile. Run the default matrix first. The notebook fetches
-`codex/pretrain-stress-8k` and records its resolved commit.
+`codex/attention-replay-mixed-precision` and records its resolved commit.
 
 This implements the [registered H1–H4 protocol](experiments/2026-09-21-pretrain-profile.md).
 The existing `vmap` and default Splash tiles remain the production defaults.
+Both schedules now normalize the returned sink cotangent to the sink input dtype;
+forward values and kernel math are unchanged. The baseline is remeasured with
+this shared correction.
 
 ## What is controlled
 
@@ -46,6 +51,13 @@ Default: 3 families × 2 compositions × 2 shapes × 3 fresh-process repeats =
 36 worker processes. Each process checks and times both variants. Shape order
 and variant order alternate. Workers preserve failures and partial JSON/logs.
 Expect compilation to take substantially longer than the timed samples.
+
+Three untimed TPU preflight workers first check the 8-row shape for each family,
+using the real captured dtypes. Combined, forward-only and backward-only paths
+must all compile and pass numerical checks. A failed preflight stops the sweep,
+saves partial reports and remains visible in the notebook. Preflight results are
+excluded from all timing summaries. The CPU tests also explicitly cover BF16
+Q/K/V with FP32 sink gradients; the earlier all-FP32 checks missed this failure.
 
 Each configuration has at least 3 warmups and 12 synchronized unprofiled samples.
 Combined forward+VJP is the primary S2 metric. Forward-only and backward-only

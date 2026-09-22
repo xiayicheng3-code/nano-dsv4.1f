@@ -28,6 +28,8 @@ A repeats one row on every replica; B uses distinct captured corpus rows.
 At each shape, compare production `vmap` with one-local-row-at-a-time `lax.map`.
 Only attention scheduling changes; this is not gradient accumulation.
 
+A TPU preflight first checks all three families at 8 rows with the captured BF16
+payloads and FP32 sinks. A failure stops before the full sweep.
 Three fresh-process repeats alternate variant and row-count order. Forward and
 Q/shared-KV/sink VJPs must pass the registered numerical gate before timing. Forward,
 backward-only (materialized residuals), and combined forward+VJP are measured
@@ -41,10 +43,12 @@ Inspect compiler placement and usable spill/DMA evidence with the exported HLO
 and traces. Compiler HBM estimates do not measure VMEM occupancy.
 
 Protocol: [registered hypotheses](https://github.com/xiayicheng3-code/nano-dsv4.1f/blob/codex/pretrain-stress-8k/docs/experiments/2026-09-21-pretrain-profile.md).
-This experiment does not change production defaults or launch pretraining.'''),
+The sink-cotangent dtype correction applies to both schedules; forward sink values
+and kernel math are unchanged. The 2026-09-22 failed run collected no timings and
+is not a performance baseline. This experiment does not launch pretraining.'''),
     code('''import os
 DEFAULTS = {
-    'NANO_DSV41F_REF': 'codex/pretrain-stress-8k',
+    'NANO_DSV41F_REF': 'codex/attention-replay-mixed-precision',
     'NANO_PROFILE_CORPUS': '/kaggle/input/datasets/xiayicheng3gmailcom/nanodsv4-1f-pretrain-tokenized',
     'NANO_PROFILE_TOKENIZER': '/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb',
     'NANO_ATTN_ROWS': '4,8',                 # optionally 4,8,24
@@ -72,7 +76,9 @@ the tile intervention, and Q/K/V/sink gradients on eight virtual CPU devices.
 The fixed tolerance is `atol=2e-5, rtol=2e-4`. This validates semantics; it does not
 predict physical TPU performance. Full-size TPU A/B checks additionally require
 finite values and normalized RMS error ≤0.01 for every output/gradient tensor.
-Neither test changes tolerances based on timing results.'''),
+Regression tests also exercise BF16 activations with FP32 sink parameters, including
+the actual replay worker and both one/two-row local batches. Neither test changes
+tolerances based on timing results.'''),
     code('''subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'pytest>=8'], check=True)
 cpu_env = dict(os.environ, JAX_PLATFORMS='cpu',
                XLA_FLAGS='--xla_force_host_platform_device_count=8')
@@ -110,7 +116,7 @@ subprocess.run([
 print('Frozen bank:', OUTPUT / 'bank' / 'manifest.json')'''),
     md('''## Run paired attention experiments
 
-The default matrix has **36 worker processes**: 3 families × 2 compositions ×
+After three untimed TPU preflight workers, the default matrix has **36 worker processes**: 3 families × 2 compositions ×
 2 row counts × 3 repeats. Each worker compiles both schedules, checks equivalence,
 then collects 12 synchronized samples after 3 warmups. Compilation can dominate
 elapsed notebook time. The parent process never initializes a TPU client.
@@ -144,7 +150,11 @@ A successful row loop alone cannot prove VMEM spilling. An isolated result also
 cannot select a training batch size or estimate the maximum fitting rows.'''),
     code('''from IPython.display import display, Markdown, FileLink
 summary = json.loads((OUTPUT / 'replay' / 'summary.json').read_text())
-print(json.dumps({k: v for k, v in summary.items() if k != 'cases'}, indent=2))
+print(json.dumps({k: v for k, v in summary.items() if k not in ('cases', 'preflights')}, indent=2))
+if summary.get('status') == 'preflight_failed':
+    print('PREFLIGHT FAILED — no sweep timings collected. Upload the compact reports ZIP below.')
+    for preflight in summary.get('preflights', []):
+        print(preflight.get('status'), preflight.get('stage'), preflight.get('exception'))
 lines = ['| Family | Inputs | Rows | Repeat | Variant | Combined ms | Forward ms | Backward ms |',
          '|---|---|---:|---:|---|---:|---:|---:|']
 for case in summary['cases']:
@@ -178,8 +188,8 @@ update. Accumulation is not implemented by this experiment. A training implement
 must normalize by valid LM tokens, update optimizer/schedule once, and explicitly
 handle router balancing state across microbatches. Six ordinary optimizer steps
 are not equivalent to one accumulated step.'''),
-    code('''if os.environ['NANO_ATTN_FULL_MODEL'] == '1':
-    if any(case.get('status') != 'passed' for case in summary['cases']):
+    code('''if os.environ['NANO_ATTN_FULL_MODEL'] == '1' and summary.get('status') == 'passed':
+    if summary.get('status') != 'passed' or not summary['cases'] or any(case.get('status') != 'passed' for case in summary['cases']):
         raise RuntimeError('Resolve replay failures before full-model testing.')
     full = OUTPUT / 'full-model'
     full.mkdir(exist_ok=False)
@@ -202,7 +212,7 @@ are not equivalent to one accumulated step.'''),
         '--timeout-seconds', os.environ['NANO_ATTN_FULL_TIMEOUT']], check=False)
     print('Full-model reports:', full / 'summary.json')
 else:
-    print('Optional full-model screen skipped; set NANO_ATTN_FULL_MODEL=1 to run it.')'''),
+    print('Full-model screen skipped: enable NANO_ATTN_FULL_MODEL=1 after replay passes.')'''),
     md('''## Export compact results and upload-sized trace parts
 
 Upload `attention-reports.zip` first: it contains decisions, raw timings, numerical

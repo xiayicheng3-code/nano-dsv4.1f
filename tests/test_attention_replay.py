@@ -75,7 +75,8 @@ def test_row_control_and_decision_require_complete_stable_repeats():
     assert not error_metrics([np.nan],[1])["passed"]
 
 
-def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkeypatch):
+@pytest.mark.parametrize("preflight", [False, True])
+def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkeypatch, preflight):
     if jax.device_count() < 8:
         pytest.skip("requires eight CPU devices")
     import hashlib
@@ -93,22 +94,47 @@ def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkey
     arrays = dict(q=q,k=kv,v=kv,sinks=np.array([.2],dtype="float32"),
                   q_segments=seg,kv_segments=seg,cotangent=q)
     meta = {"local_window":8,"ratio":1,"arrays":{k:{"shape":list(v.shape),"dtype":str(v.dtype)} for k,v in arrays.items()}}
+    for name in ("q", "k", "v", "cotangent"):
+        meta["arrays"][name]["dtype"] = "bfloat16"
     bank = tmp_path / "local.npz"
     np.savez(bank, **arrays)
     meta["file_sha256"] = hashlib.sha256(bank.read_bytes()).hexdigest()
     (tmp_path / "manifest.json").write_text(json.dumps({"families":{"local":meta}}))
     args = SimpleNamespace(bank=tmp_path,family="local",rows=8,composition="repeated",
                            intervention="schedule",repeat=1,output=tmp_path/"case.json",
-                           warmup=3,steps=12,trace_steps=0)
+                           warmup=3,steps=12,trace_steps=0,preflight_only=preflight)
     report = {}
     replay.run(args, report, lambda stage: None)
     assert report["status"] == "passed"
     assert report["order"] == ["sequential","vmap"]
     for v in report["variants"].values():
-        assert len(v["combined"]["seconds"]) == 12
+        if preflight:
+            assert "combined" not in v and "trace_files" not in v
+        else:
+            assert len(v["combined"]["seconds"]) == 12
+            assert v["backward"]["median_seconds"] > 0
         assert all(e["passed"] for e in v["errors"].values())
-        assert v["backward"]["median_seconds"] > 0
+        assert all(e["passed"] for e in v["component_errors"])
     assert len(list(tmp_path.glob("*.hlo.txt.gz"))) == 2
+
+
+def test_failed_hardware_preflight_stops_before_sweep(tmp_path, monkeypatch):
+    import json
+    import run_attention_experiment as supervisor
+    calls = []
+    def fail(command, report_path, timeout):
+        calls.append(command)
+        return {"status":"failed", "exception":"mixed-precision regression"}
+    monkeypatch.setattr(supervisor, "launch", fail)
+    monkeypatch.setattr(sys, "argv", ["experiment", "--bank", str(tmp_path / "bank"),
+                                     "--output", str(tmp_path / "run")])
+    with pytest.raises(SystemExit) as error:
+        supervisor.main()
+    assert error.value.code == 1
+    assert len(calls) == 1 and "--preflight-only" in calls[0]
+    summary = json.loads((tmp_path / "run" / "summary.json").read_text())
+    assert summary["status"] == "preflight_failed"
+    assert summary["cases"] == [] and summary["unrun_cases"] == 36
 
 
 def test_capture_round_trip_preserves_model_dtypes_and_families(tmp_path, monkeypatch):
@@ -145,3 +171,35 @@ def test_capture_round_trip_preserves_model_dtypes_and_families(tmp_path, monkey
             for name,array in stored.items():
                 restored = array.astype(jnp.dtype(spec["arrays"][name]["dtype"]))
                 assert hashlib.sha256(restored.tobytes()).hexdigest() == spec["arrays"][name]["sha256"]
+
+
+@pytest.mark.parametrize('ratio', [0, 1, 2])
+@pytest.mark.parametrize('batch', [4, 8])
+def test_bf16_payload_fp32_sink_vjp_under_sequential_map(ratio, batch):
+    """Regression: the 2026-09-22 TPU run failed on every sequential VJP.
+
+    The old all-FP32 oracle did not exercise Splash's BF16 sink cotangent.
+    Check actual payload/control dtype pairing and one/two local rows.
+    """
+    if jax.device_count() < 8:
+        pytest.skip('requires eight CPU devices')
+    from nano_dsv41f import make_v5e_mesh
+    length, heads, dim = 256, 8, 64
+    kvlen = length + (length // ratio if ratio else 0)
+    meta = {'arrays': {'q': {'shape': [batch,length,heads,dim]},
+                       'k': {'shape': [batch,kvlen,dim]}},
+            'local_window': 128, 'ratio': max(1, ratio)}
+    rng = np.random.default_rng(22)
+    q = jnp.asarray(rng.normal(size=(batch,length,heads,dim))*.1, jnp.bfloat16)
+    kv = jnp.asarray(rng.normal(size=(batch,kvlen,dim))*.1, jnp.bfloat16)
+    ct = jnp.asarray(rng.normal(size=q.shape),jnp.bfloat16)
+    sinks = jnp.linspace(.1234567,.3456789,heads,dtype=jnp.float32)
+    seg = jnp.tile(jnp.repeat(jnp.arange(2),length//2)[None],(batch,1))
+    kvseg = jnp.concatenate((seg,seg[:,::ratio]),1) if ratio else seg
+    args = (q,kv,sinks,seg,kvseg)
+    mesh = make_v5e_mesh()
+    baseline = operations(make_function(mesh,meta,'vmap',interpret=True))[3](*args,ct)
+    actual = operations(make_function(mesh,meta,'sequential',interpret=True))[3](*args,ct)
+    assert baseline[1][-1].dtype == actual[1][-1].dtype == jnp.float32
+    for x,y in zip(jax.tree.leaves(actual),jax.tree.leaves(baseline)):
+        assert error_metrics(x,y)['passed']

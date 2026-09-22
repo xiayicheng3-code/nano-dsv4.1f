@@ -5,8 +5,9 @@ Measured results and the preregistered next experiment are in the
 
 The controlled follow-up is now implemented in
 `notebooks/nano_dsv41f_attention_hypothesis.ipynb`; see the
-[attention experiment guide](attention_hypothesis.md). Physical TPU results for
-that intervention are still pending.
+[attention experiment guide](attention_hypothesis.md). The first TPU attempt
+[failed before timing](experiments/2026-09-22-attention-replay-failure.md);
+the corrected run is pending.
 
 ## Real-corpus profiling follow-up
 
