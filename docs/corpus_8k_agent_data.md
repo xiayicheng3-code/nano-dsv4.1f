@@ -46,24 +46,30 @@ creating a memory spike.
 
 ## Reasoning pool
 
-Default target: 4M accepted nano-tokenizer tokens.
+Default target: 4M accepted nano-tokenizer tokens. The reasoning pool deliberately uses
+sources with explicit permissive top-level licenses:
 
-The source is `open-r1/Mixture-of-Thoughts`, sampled by domain:
+| source | weight | license | acceptance policy |
+|---|---:|---|---|
+| OpenR1-Math-220k `default` | 45% | Apache-2.0 | complete generation; reject a generation explicitly marked incorrect by Math Verify |
+| CHIMERA `Qwen3-235B-2507` | 30% | Apache-2.0 | `correctness=True`; Physics, Chemistry, or Biology only |
+| X-Coder-SFT-376k `hybrid` | 25% | MIT | require a complete explicit `<think>...</think>` response |
 
-```text
-math     45%
-science  30%
-code     25%
-```
+OpenR1-Math is built from Apache-2.0 NuminaMath-1.5 problems and upstream-generated reasoning
+traces. CHIMERA describes its examples as fully synthetic; the science adapter deliberately
+excludes its math, computer-science, humanities, and linguistics rows so this bucket stays a
+science complement rather than duplicating the other two buckets. X-Coder describes its
+competitive-programming collection as fully synthetic.
 
-Only complete explicit `<think>...</think>` examples are accepted. Canonical records keep
-reasoning separate from final assistant content. The frozen nano tokenizer measures reasoning
-length and the existing percentile assignment maps it to integer `reasoning_effort` 1..100.
-The final V4.1 rendering is checked again against the 8192-token row limit.
+Canonical records keep reasoning separate from final assistant content. The frozen nano
+tokenizer measures reasoning length and the existing percentile assignment maps it to integer
+`reasoning_effort` 1..100. The final V4.1 rendering is checked again against the 8192-token row
+limit. Every manifest records dataset/config/split, declared license, source-specific quality
+filtering, and provenance notes.
 
-The aggregate Mixture-of-Thoughts dataset is composed from multiple upstream datasets, so the
-manifest deliberately records its license as component-dependent rather than pretending the
-mixture has one uniform license.
+This replaces the earlier `open-r1/Mixture-of-Thoughts` dependency. It is intentionally not a
+fallback source: if one of these datasets becomes unavailable or changes terms, update the
+source catalog explicitly rather than silently substituting another aggregate mixture.
 
 ## Agent pool
 
