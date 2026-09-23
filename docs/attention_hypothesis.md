@@ -1,5 +1,28 @@
 # Attention batching and VMEM experiment
 
+## Focused follow-up: sequential tiles 128 / 256 / 512
+
+Use [the preset sequential tile notebook](../notebooks/nano_dsv41f_sequential_tiles.ipynb)
+for the next small run. Its first cell explicitly assigns all settings, including
+the updated source branch, so old environment values cannot reactivate the broad
+sweep or pin the previous commit. The original hypothesis notebook is unchanged.
+
+- Eight global rows, CP2/DP4; sequential scheduling for every timed variant.
+- Compressed and global attention, distinct frozen real-corpus inputs.
+- `block_q_dkv=128` paired separately with 256 and 512; other tiles unchanged.
+- Three process repeats, three warmups and twelve samples per operation.
+- Four candidate/family preflights plus twelve timed workers. A failed preflight
+  skips only that pair; it is reported as incomplete, never as a timing result.
+- No local-attention, batching, full-model or trace sweep. Full-model validation
+  of the winning tile is a subsequent experiment; this run does not adopt it.
+- Download `sequential-tile-reports.zip`, or share the public Kaggle output.
+
+The captured payload/control dtype and all forward/gradient gates are retained.
+The 512 configuration is experimental and still requires physical TPU compilation.
+Both paired executables remain resident, as in the original replay protocol.
+
+## Original hypothesis protocol and initial failure history
+
 Status: initial TPU attempt failed before timing; mixed-precision correction
 CPU-validated, corrected TPU run pending. See the
 [2026-09-22 failure analysis](experiments/2026-09-22-attention-replay-failure.md).

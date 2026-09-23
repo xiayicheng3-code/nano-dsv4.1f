@@ -264,7 +264,7 @@ def main():
     parser.add_argument("--top-k", type=int, help="Override profile default (narrow48: 4; others: 2)")
     parser.add_argument("--cp", type=int, default=8)
     parser.add_argument("--splash-batch-mode", choices=("vmap", "sequential"), default="vmap")
-    parser.add_argument("--splash-block-q-dkv", type=int, choices=(128, 256))
+    parser.add_argument("--splash-block-q-dkv", type=int, choices=(128, 256, 512))
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--batch-rows", type=int, default=4)
     parser.add_argument("--phase", choices=("both", "base", "late"), default="both")

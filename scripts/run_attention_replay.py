@@ -90,7 +90,11 @@ def run(a, report, checkpoint):
                   comparison="production tied K=V, Q/shared-KV/sink VJPs; independent K/V covered by oracle",
                   memory_note="compiler HBM estimates and device counters are not VMEM usage",
                   mechanism="VMEM/DMA unresolved pending compiler or usable hardware evidence")
-    order = ["vmap", "sequential"] if a.intervention == "schedule" else ["vmap", "tile256"]
+    sequential_tiles = a.intervention == "sequential_tile"
+    reference_variant = "sequential" if sequential_tiles else "vmap"
+    tile = getattr(a, "tile", 256) if sequential_tiles else 256
+    order = (["sequential", f"tile{tile}"] if sequential_tiles else
+             ["vmap", "sequential"] if a.intervention == "schedule" else ["vmap", "tile256"])
     if a.repeat % 2:
         order.reverse()
     report["order"] = order
@@ -99,19 +103,21 @@ def run(a, report, checkpoint):
     outputs = {}
     for variant in order:
         checkpoint(f"compile_and_check:{variant}")
-        fn = make_function(mesh, meta, "sequential" if variant == "sequential" else "vmap",
-                           tile=256 if variant == "tile256" else None)
+        mode = "sequential" if sequential_tiles or variant == "sequential" else "vmap"
+        block = tile if variant.startswith("tile") else 128 if sequential_tiles else None
+        fn = make_function(mesh, meta, mode, tile=block)
         fwd, prepare, back, combined = operations(fn)
         start = time.perf_counter()
         executable = combined.lower(*inputs, ct).compile()
         seconds = time.perf_counter() - start
         outputs[variant] = jax.device_get(jax.block_until_ready(executable(*inputs, ct)))
         compiled[variant] = (executable, fwd, prepare, back)
-        result = {"compile_seconds": seconds, "memory": compiled_memory_report(executable)}
+        result = {"compile_seconds": seconds, "memory": compiled_memory_report(executable),
+                  "schedule": mode, "block_q_dkv": block or 128}
         report["variants"][variant] = result
         with gzip.open(a.output.parent / f"{a.output.stem}-{variant}-combined.hlo.txt.gz", "wt") as f:
             f.write(executable.as_text())
-    reference = jax.tree.leaves(outputs["vmap"])
+    reference = jax.tree.leaves(outputs[reference_variant])
     for variant in order:
         errors = {name: error_metrics(x, y) for name, x, y in zip(
             ("output", "dq", "dkv", "dsinks"), jax.tree.leaves(outputs[variant]), reference)}
@@ -185,7 +191,9 @@ def main():
     p.add_argument("--family", choices=("local", "compressed", "global"), required=True)
     p.add_argument("--rows", type=int, choices=(4, 8, 24), required=True)
     p.add_argument("--composition", choices=("repeated", "distinct"), default="repeated")
-    p.add_argument("--intervention", choices=("schedule", "tile"), default="schedule")
+    p.add_argument("--intervention", choices=("schedule", "tile", "sequential_tile"), default="schedule")
+    p.add_argument("--tile", type=int, choices=(256, 512), default=256,
+                   help="Candidate block_q_dkv for sequential_tile; baseline is 128")
     p.add_argument("--repeat", type=int, default=0)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--steps", type=int, default=12)

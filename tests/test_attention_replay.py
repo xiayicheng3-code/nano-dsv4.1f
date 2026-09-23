@@ -76,7 +76,8 @@ def test_row_control_and_decision_require_complete_stable_repeats():
 
 
 @pytest.mark.parametrize("preflight", [False, True])
-def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkeypatch, preflight):
+@pytest.mark.parametrize("intervention,tile", [("schedule", 256), ("sequential_tile", 256), ("sequential_tile", 512)])
+def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkeypatch, preflight, intervention, tile):
     if jax.device_count() < 8:
         pytest.skip("requires eight CPU devices")
     import hashlib
@@ -88,9 +89,10 @@ def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkey
     original = replay.make_function
     monkeypatch.setattr(replay, "make_function", lambda *a, **kw: original(*a, **kw, interpret=True))
     rng = np.random.default_rng(101)
-    q = rng.normal(size=(8,256,1,64)).astype("float32") * .1
-    kv = rng.normal(size=(8,256,64)).astype("float32") * .1
-    seg = np.tile(np.repeat(np.arange(2, dtype="int32"),128)[None], (8,1))
+    length = 1024 if intervention == "sequential_tile" else 256
+    q = rng.normal(size=(8,length,1,64)).astype("float32") * .1
+    kv = rng.normal(size=(8,length,64)).astype("float32") * .1
+    seg = np.tile(np.repeat(np.arange(2, dtype="int32"),length//2)[None], (8,1))
     arrays = dict(q=q,k=kv,v=kv,sinks=np.array([.2],dtype="float32"),
                   q_segments=seg,kv_segments=seg,cotangent=q)
     meta = {"local_window":8,"ratio":1,"arrays":{k:{"shape":list(v.shape),"dtype":str(v.dtype)} for k,v in arrays.items()}}
@@ -101,12 +103,17 @@ def test_replay_worker_uses_runtime_residuals_and_writes_report(tmp_path, monkey
     meta["file_sha256"] = hashlib.sha256(bank.read_bytes()).hexdigest()
     (tmp_path / "manifest.json").write_text(json.dumps({"families":{"local":meta}}))
     args = SimpleNamespace(bank=tmp_path,family="local",rows=8,composition="repeated",
-                           intervention="schedule",repeat=1,output=tmp_path/"case.json",
+                           intervention=intervention,tile=tile,repeat=1,output=tmp_path/"case.json",
                            warmup=3,steps=12,trace_steps=0,preflight_only=preflight)
     report = {}
     replay.run(args, report, lambda stage: None)
     assert report["status"] == "passed"
-    assert report["order"] == ["sequential","vmap"]
+    assert report["order"] == ([f"tile{tile}", "sequential"] if intervention == "sequential_tile"
+                               else ["sequential", "vmap"])
+    if intervention == "sequential_tile":
+        assert all(v["schedule"] == "sequential" for v in report["variants"].values())
+        assert report["variants"]["sequential"]["block_q_dkv"] == 128
+        assert report["variants"][f"tile{tile}"]["block_q_dkv"] == tile
     for v in report["variants"].values():
         if preflight:
             assert "combined" not in v and "trace_files" not in v

@@ -48,8 +48,8 @@ class TPUNativeConfig:
     def __post_init__(self) -> None:
         if self.splash_batch_mode not in ("vmap", "sequential"):
             raise ValueError("splash_batch_mode must be vmap or sequential")
-        if self.splash_block_q_dkv is not None and self.splash_block_q_dkv not in (128, 256):
-            raise ValueError("experimental splash_block_q_dkv must be 128 or 256")
+        if self.splash_block_q_dkv is not None and self.splash_block_q_dkv not in (128, 256, 512):
+            raise ValueError("experimental splash_block_q_dkv must be 128, 256 or 512")
         if self.moe_ragged_implementation not in ("auto", "mosaic", "xla"):
             raise ValueError("moe_ragged_implementation must be auto, mosaic or xla")
         if self.moe_capacity_factor < 1.0:
