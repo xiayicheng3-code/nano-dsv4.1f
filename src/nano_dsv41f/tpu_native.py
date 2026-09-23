@@ -44,12 +44,16 @@ class TPUNativeConfig:
     # Experimental controls. Defaults preserve the measured production path.
     splash_batch_mode: Literal["vmap", "sequential"] = "vmap"
     splash_block_q_dkv: int | None = None
+    # Optional family overrides; local-only attention retains the general value.
+    splash_compressed_block_q_dkv: int | None = None
+    splash_global_block_q_dkv: int | None = None
 
     def __post_init__(self) -> None:
         if self.splash_batch_mode not in ("vmap", "sequential"):
             raise ValueError("splash_batch_mode must be vmap or sequential")
-        if self.splash_block_q_dkv is not None and self.splash_block_q_dkv not in (128, 256, 512):
-            raise ValueError("experimental splash_block_q_dkv must be 128, 256 or 512")
+        for name in ("splash_block_q_dkv", "splash_compressed_block_q_dkv", "splash_global_block_q_dkv"):
+            if getattr(self, name) is not None and getattr(self, name) not in (128, 256, 512, 1024, 2048):
+                raise ValueError(f"experimental {name} must be 128, 256, 512, 1024 or 2048")
         if self.moe_ragged_implementation not in ("auto", "mosaic", "xla"):
             raise ValueError("moe_ragged_implementation must be auto, mosaic or xla")
         if self.moe_capacity_factor < 1.0:
@@ -207,6 +211,12 @@ def _round_up(value: int, multiple: int) -> int:
     return math.ceil(value / multiple) * multiple
 
 
+def _splash_tile(options: TPUNativeConfig, family: str | None) -> int | None:
+    override = (options.splash_compressed_block_q_dkv if family == "compressed" else
+                options.splash_global_block_q_dkv if family == "global" else None)
+    return options.splash_block_q_dkv if override is None else override
+
+
 def _splash_runner(
     state: TPUNativeState,
     *,
@@ -216,7 +226,9 @@ def _splash_runner(
     head_dim: int,
     mask_array: np.ndarray,
     save_residuals: bool,
+    family: str | None = None,
 ):
+    block_q_dkv = _splash_tile(state.options, family)
     axis = state.options.manual_axis_name
     dp = state.options.attention_data_shards
     if int(state.mesh.size) % dp:
@@ -251,7 +263,7 @@ def _splash_runner(
         save_residuals,
         state.options.splash_interpret,
         state.options.splash_batch_mode,
-        state.options.splash_block_q_dkv,
+        block_q_dkv,
     )
     cached = _SPLASH_RUNNER_CACHE.get(cache_key)
     if cached is not None:
@@ -267,8 +279,8 @@ def _splash_runner(
         save_residuals=save_residuals,
         interpret=state.options.splash_interpret,
         **({"block_sizes": replace(splash.BlockSizes.get_default(),
-                                  block_q_dkv=state.options.splash_block_q_dkv)}
-           if state.options.splash_block_q_dkv is not None else {}),
+                                  block_q_dkv=block_q_dkv)}
+           if block_q_dkv is not None else {}),
     )
     kernel_spec = kernel.manual_sharding_spec(NamedSharding(manual, P(None, axis)))
     q_spec = P(data_axis, None, axis, None)
@@ -407,6 +419,7 @@ def _combined_splash_attention(
         head_dim=int(q.shape[-1]),
         mask_array=mask,
         save_residuals=False,
+        family="local" if global_state is None else "compressed" if compression_ratio > 1 else "global",
     )
     out = runner(q, kv, segment_ids, kv_segments, sinks)
 

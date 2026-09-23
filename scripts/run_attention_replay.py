@@ -192,7 +192,7 @@ def main():
     p.add_argument("--rows", type=int, choices=(4, 8, 24), required=True)
     p.add_argument("--composition", choices=("repeated", "distinct"), default="repeated")
     p.add_argument("--intervention", choices=("schedule", "tile", "sequential_tile"), default="schedule")
-    p.add_argument("--tile", type=int, choices=(256, 512), default=256,
+    p.add_argument("--tile", type=int, choices=(256, 512, 1024, 2048), default=256,
                    help="Candidate block_q_dkv for sequential_tile; baseline is 128")
     p.add_argument("--repeat", type=int, default=0)
     p.add_argument("--warmup", type=int, default=3)

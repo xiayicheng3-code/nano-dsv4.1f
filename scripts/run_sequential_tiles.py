@@ -55,8 +55,8 @@ def main():
     tiles = [int(t) for t in a.tiles.split(",")]
     if not families or len(set(families)) != len(families) or not set(families) <= {"compressed", "global"}:
         parser.error("families must be compressed and/or global, without duplicates")
-    if 128 not in tiles or len(set(tiles)) != len(tiles) or not set(tiles) <= {128, 256, 512} or len(tiles) < 2:
-        parser.error("tiles must include baseline 128 and candidate 256 and/or 512, without duplicates")
+    if 128 not in tiles or len(set(tiles)) != len(tiles) or not set(tiles) <= {128, 256, 512, 1024, 2048} or len(tiles) < 2:
+        parser.error("tiles must include baseline 128 and candidates from 256/512/1024/2048, without duplicates")
     tiles.remove(128)
     if a.repeats < 3 or a.warmup < 3 or a.steps < 12 or a.trace_steps < 0 or a.timeout <= 0:
         parser.error("require >=3 repeats/warmups, >=12 samples, nonnegative traces and positive timeout")

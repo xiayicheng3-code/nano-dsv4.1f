@@ -1,9 +1,47 @@
 # Attention batching and VMEM experiment
 
-## Focused follow-up: sequential tiles 128 / 256 / 512
+## Combined follow-up: large tiles and full-model validation
+
+Use [the final attention tuning notebook](../notebooks/nano_dsv41f_final_attention_tuning.ipynb)
+on a fresh Kaggle TPU v5e-8 session with the same corpus and tokenizer datasets.
+Run all cells; dataset paths, source branch, seeds and budgets are preset.
+
+- Replay sequential `block_q_dkv=512/1024/2048` against a fresh 128 control for
+  compressed and global attention independently, at eight rows with CP2/DP4.
+- Keep existing BF16 payloads, FP32 sinks, document masks and output/Q/shared-KV/
+  sink-gradient error gates, including separately materialized backward checks.
+- Select each family's best candidate after three complete repeats, ≤5% process
+  spread in both arms and ≥5% improvement in every pair. Prefer a smaller tile
+  within 2% of the best median ratio. No eligible winner means 128 for that family.
+- Full training compares all-128, a freshly validated/stable all-512 fallback,
+  and the selected family settings. Identical profiles are deduplicated. Local
+  attention stays at 128. Use four and eight rows, base and late-indexer phases,
+  three process repeats, three warmups and twelve timed steps, with no traces.
+- The full-model summary requires ≥5% paired step-time improvement in both phases
+  for all repeats and ≤5% process spread. Short-trajectory screens require maximum
+  matched-step loss difference ≤0.01 and per-layer routing-histogram L1 fraction
+  ≤0.10; they do not establish full optimizer/parameter or learning equivalence.
+  Source, settings and input identity must match. Raw checks remain in reports.
+- A failed replay candidate is excluded. A failed full-model profile skips its
+  remaining repeats at that row count. Baseline failure blocks that row count.
+  Other cases continue; timeouts alone never prove OOM. No production default is
+  changed automatically.
+
+Budget: six replay preflights, up to eighteen timed replay workers and twelve to
+eighteen full-model workers (fewer after failures or when no candidate qualifies).
+Fresh-process compilation is the main overhead. Both phases reuse the initialized
+model's short training trajectory within each worker; every worker starts from the
+same seed and uses the same resident input batch. The four-row input is a prefix
+of the eight-row input. This is not a capacity or trained-routing experiment.
+
+Download `final-attention-reports.zip`; it contains settings, provenance, raw
+measurements, numerical checks, compiler memory estimates and failure logs.
+Physical TPU compilation and performance of 1024/2048 remain to be measured.
+
+## Earlier focused follow-up: sequential tiles 128 / 256 / 512
 
 Use [the preset sequential tile notebook](../notebooks/nano_dsv41f_sequential_tiles.ipynb)
-for the next small run. Its first cell explicitly assigns all settings, including
+for the earlier isolated tile protocol. Its first cell explicitly assigns all settings, including
 the updated source branch, so old environment values cannot reactivate the broad
 sweep or pin the previous commit. The original hypothesis notebook is unchanged.
 
@@ -18,7 +56,8 @@ sweep or pin the previous commit. The original hypothesis notebook is unchanged.
 - Download `sequential-tile-reports.zip`, or share the public Kaggle output.
 
 The captured payload/control dtype and all forward/gradient gates are retained.
-The 512 configuration is experimental and still requires physical TPU compilation.
+The isolated 512 result does not establish full-model performance; the combined
+notebook above performs that validation.
 Both paired executables remain resident, as in the original replay protocol.
 
 ## Original hypothesis protocol and initial failure history
