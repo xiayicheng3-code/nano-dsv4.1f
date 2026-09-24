@@ -40,7 +40,7 @@ Candidate failures are isolated; baseline failure stops meaningful comparisons.
 Production defaults remain unchanged.'''),
     code('''import os
 SETTINGS = {
-    'NANO_DSV41F_REF': 'codex/attention-replay-mixed-precision',
+    'NANO_DSV41F_REF': 'main',
     'NANO_PROFILE_CORPUS': '/kaggle/input/datasets/xiayicheng3gmailcom/nanodsv4-1f-pretrain-tokenized',
     'NANO_PROFILE_TOKENIZER': '/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb',
     'NANO_BUFFER_REPEATS': '3', 'NANO_BUFFER_WARMUP': '3',
