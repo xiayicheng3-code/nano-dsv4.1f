@@ -4,7 +4,7 @@ from pathlib import Path
 import nbformat as nbf
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SOURCE_REF = "codex/pretrain-session"
+DEFAULT_SOURCE_REF = "fdd910e10996af0509b63dce20a38293736b3a6e"
 
 
 def build(source_ref=DEFAULT_SOURCE_REF):
