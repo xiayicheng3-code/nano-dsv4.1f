@@ -46,8 +46,9 @@ def test_attention_dp_cp_matches_dense_forward_backward(dp, ratio):
         np.testing.assert_allclose(actual, expected, atol=5e-6, rtol=3e-4)
 
 
-@pytest.mark.parametrize("batch_mode", ["vmap", "sequential"])
-def test_cp2_dp4_full_late_optimizer_step_matches_reference(batch_mode):
+@pytest.mark.parametrize("batch_mode,buffer_divisor", [("vmap", 1), ("sequential", 1), ("sequential", 4)],
+                         ids=["vmap", "sequential", "quarter-buffer"])
+def test_cp2_dp4_full_late_optimizer_step_matches_reference(batch_mode, buffer_divisor):
     """Exercise DP reduction, EP8 reshards, global query budget, and the optimizer together."""
     if len(jax.devices()) < 8:
         pytest.skip("requires eight CPU devices")
@@ -81,7 +82,8 @@ def test_cp2_dp4_full_late_optimizer_step_matches_reference(batch_mode):
     expected = ref(host_params, host_opt)
     native = compile_pretrain_step(params, opt, specs, cfg, train, mesh,
         include_indexer=True, native_config=TPUNativeConfig(splash_interpret=True,
-                                                           splash_batch_mode=batch_mode))
+                                                           splash_batch_mode=batch_mode,
+                                                           moe_buffer_divisor=buffer_divisor))
     actual = native(params, opt, ids, segments, step_id, mask)
     jax.block_until_ready(actual)
     np.testing.assert_allclose(actual[2]["loss"], expected[2]["loss"], atol=2e-5, rtol=2e-5)

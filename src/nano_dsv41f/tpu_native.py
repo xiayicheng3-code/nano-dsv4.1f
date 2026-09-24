@@ -33,6 +33,8 @@ class TPUNativeConfig:
     use_expert_parallel_moe: bool = True
     force_block_remat: bool = True
     moe_ragged_implementation: Literal["auto", "mosaic", "xla"] = "auto"
+    # Experimental fast-buffer divisor; overflow executes the full dropless path.
+    moe_buffer_divisor: int = 1
     # Deprecated compatibility fields; Tokamax ragged dispatch has no capacity cap.
     moe_capacity_factor: float = 1.5
     moe_capacity_multiple: int = 128
@@ -56,6 +58,8 @@ class TPUNativeConfig:
                 raise ValueError(f"experimental {name} must be 128, 256, 512, 1024 or 2048")
         if self.moe_ragged_implementation not in ("auto", "mosaic", "xla"):
             raise ValueError("moe_ragged_implementation must be auto, mosaic or xla")
+        if self.moe_buffer_divisor not in (1, 2, 4):
+            raise ValueError("moe_buffer_divisor must be 1, 2 or 4")
         if self.moe_capacity_factor < 1.0:
             raise ValueError("moe_capacity_factor must be >= 1")
         if self.moe_capacity_multiple <= 0:

@@ -94,14 +94,15 @@ def test_mosaic_precision_reaches_forward_and_both_vjps(mosaic_interpreter, monk
     assert all(precision == (expected, expected) for precision, _ in seen)
 
 
+@pytest.mark.parametrize("divisor", [1, 2, 4])
 @pytest.mark.parametrize("n_experts", [8, 16])
 @pytest.mark.parametrize("skewed", [False, True])
-def test_ragged_ep_bf16_input_and_all_parameter_gradients(n_experts, skewed):
+def test_ragged_ep_bf16_input_and_all_parameter_gradients(n_experts, skewed, divisor):
     if len(jax.devices()) < 8:
         pytest.skip('Run with XLA_FLAGS=--xla_force_host_platform_device_count=8')
     mesh = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 4), ('x', 'y'),
                 axis_types=(AxisType.Auto, AxisType.Auto))
-    state = TPUNativeState(mesh, TPUNativeConfig())
+    state = TPUNativeState(mesh, TPUNativeConfig(moe_buffer_divisor=divisor))
     x = (jax.random.normal(jax.random.key(63), (2, 16, 8)) * .2).astype(jnp.bfloat16)
     p = init_moe(jax.random.key(64), 8, 16, n_experts)
     p = {**p, 'experts': jax.tree.map(lambda a: a.astype(jnp.bfloat16), p['experts']),
@@ -127,7 +128,12 @@ def test_ragged_ep_bf16_input_and_all_parameter_gradients(n_experts, skewed):
     np.testing.assert_array_equal(aux['router_loads'], expected[0][1][1]['router_loads'])
     assert int(aux['expert_dropped'].sum()) == 0
     assert int(aux['expert_loads'].sum()) == x.shape[0] * x.shape[1] * 2
-    assert int(aux['expert_packed_rows']) == 32 * min(2, n_experts // 8)
+    assert int(aux['expert_packed_rows']) == 32 * min(2, n_experts // 8) // divisor
+    chip_loads = np.asarray(aux['expert_loads']).reshape(8, -1).sum(axis=-1)
+    if skewed and divisor > 1:
+        assert (chip_loads > int(aux['expert_packed_rows'])).any()
+    if not skewed:
+        assert (chip_loads <= int(aux['expert_packed_rows'])).any()
     assert int(aux['router_loads'].sum()) == 60
     if skewed:
         assert (np.asarray(aux['expert_loads']) == 0).sum() == n_experts - 2
@@ -143,11 +149,12 @@ def test_invalid_expert_mesh_does_not_silently_fall_back():
                            state=TPUNativeState(mesh, TPUNativeConfig()))
 
 
-def test_ragged_ep_mosaic_interpreter_with_empty_chips(mosaic_interpreter):
+@pytest.mark.parametrize("divisor", [1, 2, 4])
+def test_ragged_ep_mosaic_interpreter_with_empty_chips(mosaic_interpreter, divisor):
     if len(jax.devices()) < 8:
         pytest.skip('Run with XLA_FLAGS=--xla_force_host_platform_device_count=8')
     mesh = Mesh(np.asarray(jax.devices()[:8]), ('x',), axis_types=(AxisType.Auto,))
-    state = TPUNativeState(mesh, TPUNativeConfig(moe_ragged_implementation='mosaic'))
+    state = TPUNativeState(mesh, TPUNativeConfig(moe_ragged_implementation='mosaic', moe_buffer_divisor=divisor))
     x = jax.random.normal(jax.random.key(66), (1, 8, 4)) * .2
     p = init_moe(jax.random.key(67), 4, 8, 16)
     p['router_bias'] = jnp.arange(16, dtype=jnp.float32) * 100
