@@ -10,6 +10,10 @@ gradient; independent K/V derivatives are covered by the small dense oracle.
 All three production families currently use `save_residuals=False`. Optional
 H4 varies just `block_q_dkv` from 128 to 256. The thresholds below remain unchanged.
 
+2026-09-22 update: the [first replay attempt](2026-09-22-attention-replay-failure.md)
+hit a mixed-precision sink-gradient assertion in every sequential case before
+timing. It does not resolve any performance hypothesis; a corrected run is pending.
+
 ## Evidence and reproducibility
 
 - Public run: [xiayicheng3gmailcom/nano-dsv4-1f](https://www.kaggle.com/code/xiayicheng3gmailcom/nano-dsv4-1f/output), output version ID `351468121`.

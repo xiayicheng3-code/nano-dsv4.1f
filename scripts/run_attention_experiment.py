@@ -107,6 +107,26 @@ def main():
                     plan.append(dict(family=family, composition="repeated", rows=batch,
                                      repeat=repeat, intervention="tile"))
     save_report(a.output / "plan.json", plan)
+    preflights = []
+    for family in families:
+        case = dict(family=family, composition="repeated", rows=8,
+                    repeat=0, intervention="schedule")
+        path = a.output / f"preflight-{family}.json"
+        command = [sys.executable, "-u", "scripts/run_attention_replay.py",
+                   "--bank", str(a.bank), "--output", str(path), "--preflight-only"]
+        for key, value in case.items():
+            command.extend(["--" + key.replace("_", "-"), str(value)])
+        print(f"Preflight: {family}, 8 rows, both schedules and all derivative paths", flush=True)
+        result = launch(command, path, a.timeout)
+        preflights.append(result)
+        summary = summarize([], families, a.repeats)
+        summary.update(preflights=preflights, status="preflight_running")
+        if result["status"] != "passed":
+            summary.update(status="preflight_failed", unrun_cases=len(plan))
+            save_report(a.output / "summary.json", summary)
+            print("Preflight failed. Full sweep not started; inspect", path, flush=True)
+            raise SystemExit(1)
+        save_report(a.output / "summary.json", summary)
     for i, case in enumerate(plan):
         report_path = a.output / f"case-{i:03d}.json"
         command = [sys.executable,"-u","scripts/run_attention_replay.py", "--bank",str(a.bank),
@@ -119,7 +139,11 @@ def main():
         # Retain identifying metadata even when a worker dies before its first write.
         result.setdefault("arguments", {}).update(case)
         reports.append(result)
-        save_report(a.output / "summary.json", summarize(reports, families, a.repeats))
+        summary = summarize(reports, families, a.repeats)
+        summary.update(preflights=preflights, status="running")
+        save_report(a.output / "summary.json", summary)
+    summary.update(status="passed" if all(r["status"] == "passed" for r in reports) else "failed")
+    save_report(a.output / "summary.json", summary)
     print(json.dumps({k:v for k,v in summarize(reports,families,a.repeats).items() if k != "cases"}, indent=2))
     if any(r["status"] != "passed" for r in reports):
         raise SystemExit(1)

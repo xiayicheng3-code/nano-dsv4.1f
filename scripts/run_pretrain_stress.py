@@ -77,6 +77,8 @@ def routing_summary(metrics):
         }
         if name == "physical_dispatch":
             result[name]["buffer_utilization_by_layer_chip"] = (chip / max(packed, 1)).tolist()
+            result[name]["fallback_by_layer_chip"] = (chip > packed).tolist()
+            result[name]["fallback_chip_layers"] = int((chip > packed).sum())
     return result
 
 
@@ -104,8 +106,11 @@ def run(args, report, checkpoint):
     config, train, native = pretrain_recipe(
         profile=args.profile, cp=args.cp, dp=args.dp,
         experts=args.experts, width=args.width, top_k=args.top_k)
-    native = replace(native, splash_batch_mode=getattr(args, "splash_batch_mode", "vmap"),
-                     splash_block_q_dkv=getattr(args, "splash_block_q_dkv", None))
+    native = replace(native, moe_buffer_divisor=getattr(args, "moe_buffer_divisor", 1),
+                     splash_batch_mode=getattr(args, "splash_batch_mode", "vmap"),
+                     splash_block_q_dkv=getattr(args, "splash_block_q_dkv", None),
+                     splash_compressed_block_q_dkv=getattr(args, "splash_compressed_block_q_dkv", None),
+                     splash_global_block_q_dkv=getattr(args, "splash_global_block_q_dkv", None))
     if args.batch_rows <= 0 or args.batch_rows % args.dp:
         raise ValueError("batch rows must be positive and divisible by DP")
     if args.trace_steps < 0 or args.data_batches < 1 or (args.trace_steps and args.trace_dir is None):
@@ -264,7 +269,10 @@ def main():
     parser.add_argument("--top-k", type=int, help="Override profile default (narrow48: 4; others: 2)")
     parser.add_argument("--cp", type=int, default=8)
     parser.add_argument("--splash-batch-mode", choices=("vmap", "sequential"), default="vmap")
-    parser.add_argument("--splash-block-q-dkv", type=int, choices=(128, 256))
+    parser.add_argument("--splash-block-q-dkv", type=int, choices=(128, 256, 512, 1024, 2048))
+    parser.add_argument("--splash-compressed-block-q-dkv", type=int, choices=(128, 256, 512, 1024, 2048))
+    parser.add_argument("--splash-global-block-q-dkv", type=int, choices=(128, 256, 512, 1024, 2048))
+    parser.add_argument("--moe-buffer-divisor", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--dp", type=int, default=1)
     parser.add_argument("--batch-rows", type=int, default=4)
     parser.add_argument("--phase", choices=("both", "base", "late"), default="both")

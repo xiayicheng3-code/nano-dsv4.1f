@@ -88,9 +88,9 @@ def apply_moe_v5e_multi(
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Sort local expert assignments, execute ragged GEMMs, and reduce-scatter.
 
-    All assignments fit in a static packed buffer. Runtime group sizes determine
-    which rows the Mosaic kernel computes; there is no per-expert capacity or tile
-    loop in this adapter. Weight shards remain resident. The readable MoE in moe.py
+    A smaller static fast buffer is optional; overflow uses the original full
+    buffer on that chip. Runtime group sizes determine which rows the Mosaic
+    kernel computes; no assignments are dropped. Weight shards remain resident. The readable MoE in moe.py
     is an independent numerical oracle, never a silent native-backend fallback.
     """
     if x.ndim != 3:
@@ -113,7 +113,9 @@ def apply_moe_v5e_multi(
     n_global = batch * tokens
     # Top-K experts are distinct. This bound holds even if all tokens choose the
     # same local experts; unlike an average-load capacity, it cannot drop tokens.
-    packed_rows = n_global * min(top_k, local_experts)
+    full_rows = n_global * min(top_k, local_experts)
+    divisor = state.options.moe_buffer_divisor
+    packed_rows = (full_rows + divisor - 1) // divisor
     axis = state.options.manual_axis_name
     implementation = ragged_dot_implementation(state)
 
@@ -145,26 +147,39 @@ def apply_moe_v5e_multi(
             # Tokamax 0.0.12 rejects group_offset. Compact local groups from row zero
             # instead, placing non-owned assignments in a masked suffix.
             _, assignment_ids = jax.lax.sort_key_val(keys, jnp.arange(indices.size), is_stable=True)
-            assignment_ids = assignment_ids[:packed_rows]
-            token_ids = assignment_ids // top_k
-            valid = jnp.arange(packed_rows) < jnp.sum(loads)
 
-        def evaluate(_):
-            return ragged_expert_forward(
-                flat_x[token_ids], local_params["experts"], loads,
-                swiglu_limit=swiglu_limit, implementation=implementation,
+        def combine(buffer_rows):
+            # Every branch contains only local work. Collectives stay outside the
+            # divergent conditional so different chips can overflow independently.
+            selected_ids = assignment_ids[:buffer_rows]
+            token_ids = selected_ids // top_k
+            valid = jnp.arange(buffer_rows) < jnp.sum(loads)
+
+            def evaluate(_):
+                return ragged_expert_forward(
+                    flat_x[token_ids], local_params["experts"], loads,
+                    swiglu_limit=swiglu_limit, implementation=implementation,
+                )
+
+            selected_out = jax.lax.cond(
+                jnp.any(loads > 0), evaluate,
+                lambda _: jnp.zeros((buffer_rows, dim), local_params["experts"]["w2"].dtype),
+                operand=None,
             )
+            with jax.named_scope("moe_combine_scatter"):
+                values = jnp.where(valid[:, None], selected_out.astype(jnp.float32), 0)
+                values *= jnp.where(valid, weights[selected_ids], 0)[:, None]
+                return jnp.zeros((n_global, dim), jnp.float32).at[token_ids].add(values)
 
-        # Empty chips skip both GEMMs. All collectives remain outside this branch.
-        selected_out = jax.lax.cond(
-            jnp.any(loads > 0), evaluate,
-            lambda _: jnp.zeros((packed_rows, dim), local_params["experts"]["w2"].dtype),
-            operand=None,
-        )
-        with jax.named_scope("moe_combine_scatter"):
-            values = jnp.where(valid[:, None], selected_out.astype(jnp.float32), 0)
-            values *= jnp.where(valid, weights[assignment_ids], 0)[:, None]
-            contribution = jnp.zeros((n_global, dim), jnp.float32).at[token_ids].add(values)
+        if divisor == 1:
+            contribution = combine(full_rows)
+        else:
+            # Never pass group_sizes exceeding the selected buffer to ragged_dot.
+            # Overflow recomputes the complete local assignment list without drops.
+            contribution = jax.lax.cond(
+                jnp.sum(loads) <= packed_rows,
+                lambda _: combine(packed_rows), lambda _: combine(full_rows), None,
+            )
         contribution = contribution.reshape(global_x.shape)
         routed_local = jax.lax.psum_scatter(contribution, axis, scatter_dimension=1, tiled=True)
         shared = local_params["shared"]

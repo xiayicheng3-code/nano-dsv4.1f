@@ -1,13 +1,80 @@
 # Attention batching and VMEM experiment
 
-Status: implemented and CPU-validated; physical TPU experiment **not yet run**.
+## Combined follow-up: large tiles and full-model validation
+
+Use [the final attention tuning notebook](../notebooks/nano_dsv41f_final_attention_tuning.ipynb)
+on a fresh Kaggle TPU v5e-8 session with the same corpus and tokenizer datasets.
+Run all cells; dataset paths, source branch, seeds and budgets are preset.
+
+- Replay sequential `block_q_dkv=512/1024/2048` against a fresh 128 control for
+  compressed and global attention independently, at eight rows with CP2/DP4.
+- Keep existing BF16 payloads, FP32 sinks, document masks and output/Q/shared-KV/
+  sink-gradient error gates, including separately materialized backward checks.
+- Select each family's best candidate after three complete repeats, ≤5% process
+  spread in both arms and ≥5% improvement in every pair. Prefer a smaller tile
+  within 2% of the best median ratio. No eligible winner means 128 for that family.
+- Full training compares all-128, a freshly validated/stable all-512 fallback,
+  and the selected family settings. Identical profiles are deduplicated. Local
+  attention stays at 128. Use four and eight rows, base and late-indexer phases,
+  three process repeats, three warmups and twelve timed steps, with no traces.
+- The full-model summary requires ≥5% paired step-time improvement in both phases
+  for all repeats and ≤5% process spread. Short-trajectory screens require maximum
+  matched-step loss difference ≤0.01 and per-layer routing-histogram L1 fraction
+  ≤0.10; they do not establish full optimizer/parameter or learning equivalence.
+  Source, settings and input identity must match. Raw checks remain in reports.
+- A failed replay candidate is excluded. A failed full-model profile skips its
+  remaining repeats at that row count. Baseline failure blocks that row count.
+  Other cases continue; timeouts alone never prove OOM. No production default is
+  changed automatically.
+
+Budget: six replay preflights, up to eighteen timed replay workers and twelve to
+eighteen full-model workers (fewer after failures or when no candidate qualifies).
+Fresh-process compilation is the main overhead. Both phases reuse the initialized
+model's short training trajectory within each worker; every worker starts from the
+same seed and uses the same resident input batch. The four-row input is a prefix
+of the eight-row input. This is not a capacity or trained-routing experiment.
+
+Download `final-attention-reports.zip`; it contains settings, provenance, raw
+measurements, numerical checks, compiler memory estimates and failure logs.
+Physical TPU compilation and performance of 1024/2048 remain to be measured.
+
+## Earlier focused follow-up: sequential tiles 128 / 256 / 512
+
+Use [the preset sequential tile notebook](../notebooks/nano_dsv41f_sequential_tiles.ipynb)
+for the earlier isolated tile protocol. Its first cell explicitly assigns all settings, including
+the updated source branch, so old environment values cannot reactivate the broad
+sweep or pin the previous commit. The original hypothesis notebook is unchanged.
+
+- Eight global rows, CP2/DP4; sequential scheduling for every timed variant.
+- Compressed and global attention, distinct frozen real-corpus inputs.
+- `block_q_dkv=128` paired separately with 256 and 512; other tiles unchanged.
+- Three process repeats, three warmups and twelve samples per operation.
+- Four candidate/family preflights plus twelve timed workers. A failed preflight
+  skips only that pair; it is reported as incomplete, never as a timing result.
+- No local-attention, batching, full-model or trace sweep. Full-model validation
+  of the winning tile is a subsequent experiment; this run does not adopt it.
+- Download `sequential-tile-reports.zip`, or share the public Kaggle output.
+
+The captured payload/control dtype and all forward/gradient gates are retained.
+The isolated 512 result does not establish full-model performance; the combined
+notebook above performs that validation.
+Both paired executables remain resident, as in the original replay protocol.
+
+## Original hypothesis protocol and initial failure history
+
+Status: initial TPU attempt failed before timing; mixed-precision correction
+CPU-validated, corrected TPU run pending. See the
+[2026-09-22 failure analysis](experiments/2026-09-22-attention-replay-failure.md).
 Use [the Kaggle notebook](../notebooks/nano_dsv41f_attention_hypothesis.ipynb) on a
 fresh TPU v5e-8 session, with the same two attached datasets as the real-corpus
 profile. Run the default matrix first. The notebook fetches
-`codex/pretrain-stress-8k` and records its resolved commit.
+`codex/attention-replay-mixed-precision` and records its resolved commit.
 
 This implements the [registered H1–H4 protocol](experiments/2026-09-21-pretrain-profile.md).
 The existing `vmap` and default Splash tiles remain the production defaults.
+Both schedules now normalize the returned sink cotangent to the sink input dtype;
+forward values and kernel math are unchanged. The baseline is remeasured with
+this shared correction.
 
 ## What is controlled
 
@@ -46,6 +113,13 @@ Default: 3 families × 2 compositions × 2 shapes × 3 fresh-process repeats =
 36 worker processes. Each process checks and times both variants. Shape order
 and variant order alternate. Workers preserve failures and partial JSON/logs.
 Expect compilation to take substantially longer than the timed samples.
+
+Three untimed TPU preflight workers first check the 8-row shape for each family,
+using the real captured dtypes. Combined, forward-only and backward-only paths
+must all compile and pass numerical checks. A failed preflight stops the sweep,
+saves partial reports and remains visible in the notebook. Preflight results are
+excluded from all timing summaries. The CPU tests also explicitly cover BF16
+Q/K/V with FP32 sink gradients; the earlier all-FP32 checks missed this failure.
 
 Each configuration has at least 3 warmups and 12 synchronized unprofiled samples.
 Combined forward+VJP is the primary S2 metric. Forward-only and backward-only
