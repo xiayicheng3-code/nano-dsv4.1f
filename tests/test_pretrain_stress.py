@@ -52,14 +52,21 @@ def test_invalid_four_device_recipe_rejected():
         pretrain_recipe(cp=2, dp=2)
 
 
-def test_stress_notebook_is_valid_and_uses_canonical_bootstrap():
+def test_archived_stress_notebook_is_valid_and_preserves_canonical_bootstrap():
     import nbformat
-    nb = nbformat.read(ROOT / "notebooks/nano_dsv41f_pretrain_stress.ipynb", as_version=4)
+    archived = ROOT / "notebooks/archive/nano_dsv41f_pretrain_stress.ipynb"
+    nb = nbformat.read(archived, as_version=4)
     nbformat.validate(nb)
     code = [cell.source for cell in nb.cells if cell.cell_type == "code"]
     assert (ROOT / "scripts/kaggle_bootstrap.py").read_text() in code
     for source in code:
         ast.parse(source)
+
+    notice = nbformat.read(ROOT / "notebooks/nano_dsv41f_pretrain_stress.ipynb", as_version=4)
+    nbformat.validate(notice)
+    assert not [cell for cell in notice.cells if cell.cell_type == "code"]
+    text = "\n".join(cell.source for cell in notice.cells if cell.cell_type == "markdown")
+    assert "Archived" in text and "final_attention_tuning" in text
 
 
 @pytest.mark.parametrize("profile,top_k", [("baseline", 2), ("narrow48", 4)])
