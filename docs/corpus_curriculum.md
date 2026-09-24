@@ -1,131 +1,82 @@
-# Corpus curriculum for nano-dsv4.1f
+# Corpus and stage curriculum for nano-dsv4.1f
 
-This document defines the first reproducible training-data baseline for the 4K nano model.
-It assumes the 32,768-token nano tokenizer is already frozen. The objective is not to copy a
-private DeepSeek data recipe; it is to build a small-model curriculum that exposes the
-architecture to broad language, code, math, long-enough retrieval contexts, and a separate
-reasoning-SFT view.
+The canonical training lifecycle is now **pretrain → mid-train → SFT**. See [`training_stages.md`](training_stages.md) for the machine-readable stage contract and stage-level objective policy.
 
-## Why three LM phases
+The old `early` / `middle` / `late_mid` document curriculum is no longer the active training design. Its Q-aware packing and source-adapter code remains as reusable implementation machinery.
 
-The current default training schedule has two architecture-level landmarks:
+## 1. Pretrain
 
-- selective indexer distillation starts at progress `0.55`;
-- cosine decay starts at progress `0.90`, while the default indexer auxiliary window ends
-  there as well.
+Pretraining is prepared separately by the dedicated 3B-token pipeline:
 
-The corpus baseline uses three data regimes:
+- 3,000,000,000 non-padding training tokens measured with the frozen nano tokenizer;
+- 10,000,000 validation tokens;
+- 8192-token rows;
+- general FineWeb-Edu text;
+- ordinary causal-LM loss;
+- no reasoning/agent mixture and no assistant-only loss mask.
 
-| Phase | Progress | FineWeb-Edu | Cosmopedia v2 | CodeParrot clean | FineMath | Packing |
-| --- | ---: | ---: | ---: | ---: | ---: | --- |
-| early | 0.00–0.55 | 72% | 13% | 12% | 3% 3+ | ordinary best fit |
-| middle | 0.55–0.75 | 60% | 10% | 15% | 15% 3+ | ordinary best fit |
-| late_mid | 0.75–1.00 | 50% | 5% | 20% | 25% 4+ | **Q-position aware** |
+This budget is independent of later mid-training and SFT step counts.
 
-These are token targets, not document-count targets. The main trend is deliberate: keep web
-and synthetic educational text dominant early, then increase code/math after basic language
-modeling is stable. FineMath-4+ is reserved for late-mid because it is the smaller,
-higher-quality slice. The numbers are a baseline for ablation, not claimed optima.
+## 2. Mid-train
 
-The CodeParrot source has per-file licenses. The default adapter accepts only a conservative
-permissive allow-list (`MIT`, `Apache-2.0`, BSD, ISC, CC0, Unlicense) and records how many
-rows were rejected. Change that list only after reviewing the terms for the corpus you plan
-to redistribute/use.
+There is one explicit Q-aware document stage rather than `middle` plus `late_mid`.
 
-With the checked-in `TrainConfig(total_steps=10_000, seq_len=4096)` and the builder's 5%
-headroom, the three outputs contain 10,500 packed rows / 43,008,000 physical tokens:
+Starting document token mix:
 
-```text
-early      5,775 rows
-middle     2,100 rows
-late_mid   2,625 rows
-```
+| source | share |
+| --- | ---: |
+| FineWeb-Edu | 50% |
+| Cosmopedia v2 | 5% |
+| permissively filtered CodeParrot clean | 20% |
+| FineMath 4+ | 25% |
 
-The headroom is intentional: training can consume exactly its scheduled number of rows while
-leaving some shuffle/restart slack.
+The CodeParrot source has per-file licenses. The adapter keeps the existing conservative permissive allow-list (`MIT`, `Apache-2.0`, BSD, ISC, CC0, Unlicense) and records rejected rows.
 
-## Document handling
-
-Every source document is tokenized with the frozen nano tokenizer. Long documents are split
-into contiguous chunks of at most `seq_len - 2` content tokens; every chunk gets nano BOS
-and EOS. Chunks remain independent packed segments, so the LM never receives a next-token
-target or attention history across unrelated documents/chunks.
-
-Final packed shards store:
+The starting pool-level sampler is:
 
 ```text
-input_ids               uint16 [rows, 4096]
-segment_ids              uint16 [rows, 4096]
-token_mask                uint8 [rows, 4096]
-source_ids                uint8 [rows, 4096]
-eligible_q               uint16 [rows]
-selected_q               uint16 [rows]
-q_budget_utilization     float32 [rows]
-q_eligible_coverage      float32 [rows]
-q_band_counts             uint16 [rows, bands]
-q_expected_selected      float32 [rows, bands]
+document  80%
+reasoning  5%
+agent     15%
 ```
 
-The existing `pack_token_sequences` implementation remains the source of truth for ratio
-alignment and masked in-segment padding.
+Reasoning/agent traces use their ordinary causal-LM view during mid-training. The `sft_loss_mask` is not applied here.
 
-## Q-position-aware late-mid packing
+### Q-aware packing
 
-For the default warmup rule, a real token at segment-local position `p` is an eligible
-retriever query when
+For the current retriever rule, a real token at segment-local position `p` becomes eligible when
 
 ```text
 p >= local_window + top_k = 128 + 512 = 640.
 ```
 
-Therefore a segment with real length `L` contributes
+With query budget `B=128`:
 
 ```text
-eligible_Q(L) = max(L - 640, 0).
-```
-
-A row's eligible pool is the sum across packed segments. With query budget `B=128`:
-
-```text
+eligible_Q(L) = max(L - 640, 0)
 selected_Q = min(B, eligible_Q)
 budget_utilization = selected_Q / B
 eligible_coverage = selected_Q / eligible_Q
 ```
 
-Packing only for maximum LM fill can produce rows full of short documents with zero useful
-Q positions. Packing only for exactly 128 eligible positions has the opposite failure mode:
-it concentrates supervision around positions 640–767 and rarely teaches later retrieval.
-
-Late-mid therefore tracks local-position bands:
+At 8K the reporting bands are:
 
 ```text
 [640,768), [768,1024), [1024,1536), [1536,2048),
-[2048,3072), [3072,4096)
+[2048,3072), [3072,4096), [4096,6144), [6144,8192)
 ```
 
-For each candidate row, the packer computes the expected sampled Q count in each band under
-the actual uniform-without-replacement query sampler. It then normalizes by band width and
-prefers anchors that reduce imbalance in **expected samples per local position**, while also
-penalizing under-filled query budgets. Fillers preferentially use short/non-Q-bearing
-segments so an anchor's long-context profile is not accidentally swamped.
+The packer balances expected sampled-Q density across local positions while retaining ordinary fill efficiency. Every shard stores the raw diagnostics so the heuristic can be changed from measurements rather than intuition.
 
-This is intentionally observable rather than magical: every shard stores the raw Q metrics,
-and the phase manifest reports aggregate budget utilization, eligible coverage, expected
-band samples, and per-position densities. If the heuristic is bad on the real corpus, we can
-change it based on those measurements.
+Mid-training is also the intended stage for selective indexer distillation. Candidate masking remains off so the indexer learns against all legal compressed history.
 
-For the ratio-aware r=2 encoder ablation, use a 1152 threshold and matching band edges. The
-current default model still uses the 640 rule for all retrievers.
+## 3. SFT
 
-## Reasoning SFT sidecar
+SFT is a separate assistant-only optimization stage. Trace shards retain user/system/tool-result tokens as context while supervising assistant reasoning/content/tool-call spans through `sft_loss_mask`.
 
-Reasoning SFT is prepared separately from the causal-LM shards. The current LM loss masks
-padding/document boundaries, but does not yet expose the assistant-only loss mask needed for
-correct SFT. Keeping canonical SFT separate prevents user/tool context from accidentally
-becoming prediction targets.
+### Reasoning sources
 
-The default reasoning mix is deliberately restricted to datasets with explicit permissive
-licenses and relatively simple provenance:
+The current reasoning mix is restricted to sources with explicit permissive top-level licenses and relatively simple provenance:
 
 | bucket | source | weight | license | filter |
 | --- | --- | ---: | --- | --- |
@@ -133,87 +84,59 @@ licenses and relatively simple provenance:
 | science | `TianHongZXY/CHIMERA`, `Qwen3-235B-2507` | 30% | Apache-2.0 | `correctness=True`; Physics/Chemistry/Biology only |
 | code | `IIGroup/X-Coder-SFT-376k`, `hybrid` | 25% | MIT | complete `<think>...</think>` response |
 
-Default target: 4,000,000 rendered tokens.
+OpenR1-Math's underlying NuminaMath-1.5 dataset is also Apache-2.0. CHIMERA describes its examples as fully synthetic; its solution traces are generated by Qwen3-235B-A22B-Thinking-2507. X-Coder describes its code tasks as fully synthetic and uses DeepSeek-R1-0528 / Qwen3 thinking models for solutions. Builders record each source's declared license and provenance note rather than treating the pool as one newly licensed dataset.
 
-OpenR1-Math's underlying NuminaMath-1.5 dataset is also Apache-2.0. CHIMERA describes its
-examples as fully synthetic; its solution traces are generated by Qwen3-235B-A22B-Thinking-2507.
-X-Coder describes its code tasks as fully synthetic and uses DeepSeek-R1-0528 / Qwen3 thinking
-models for solutions. The builders write each source's declared license and provenance note
-into the manifest rather than treating the pool as one newly licensed dataset.
+The earlier `open-r1/Mixture-of-Thoughts` dependency is no longer part of the pipeline. Do not restore an aggregate mixture solely for convenience; review both its declared license and the provenance of the content being trained on or redistributed.
 
-The adapter is deliberately strict for the 4K nano model:
+The reasoning adapter:
 
-1. apply source-specific correctness/domain filters before tokenization;
-2. require explicit reasoning plus a final answer;
-3. normalize to separate `reasoning_content` and final assistant `content`;
-4. use the frozen nano tokenizer for all length checks;
-5. drop examples whose DeepSeek-style two-turn rendering exceeds 4096 tokens;
-6. assign integer `reasoning_effort` **1..100** from tokenizer-measured reasoning-length
-   percentiles, with the existing small deterministic jitter;
-7. re-check length after inserting the numeric effort prefix;
-8. save structured JSONL, not permanently rendered prompt strings.
+1. applies source-specific correctness/domain filters before tokenization;
+2. requires explicit reasoning plus a final answer;
+3. normalizes `reasoning_content` separately from final assistant `content`;
+4. checks length with the frozen nano tokenizer;
+5. assigns integer `reasoning_effort` 1..100 from tokenizer-measured reasoning-length percentiles;
+6. rechecks length after inserting the numeric effort prefix;
+7. stores structured records rather than permanently rendered prompt strings.
 
-The result preserves source metadata and the exact integer effort assignment provenance.
-With at least 100 accepted reasoning records the assignment logic preserves coverage anchors
-for every integer 1..100.
+Agent traces keep their structured tool calls/results and are cleaned through the existing canonical adapters. Ordinary document rows are excluded from the default SFT pool.
 
-The earlier `open-r1/Mixture-of-Thoughts` source is no longer part of the pipeline. Do not add
-an aggregate reasoning mixture back merely because its top-level card is convenient; review
-both its declared license and the provenance of the content being redistributed or trained on.
+SFT is also the intended stage to enable the hierarchical candidate mask, matching the final inference retrieval hierarchy after unrestricted mid-training distillation.
 
-## Build commands
+## Stage-aware build commands
 
-Install the data dependencies once:
+Prepare the single mid-training document corpus:
 
 ```bash
-pip install -e '.[data]'
-```
-
-Build all three LM phases from a frozen tokenizer:
-
-```bash
-python scripts/prepare_corpus.py \
+python scripts/prepare_midtrain_corpus.py \
   --tokenizer /path/to/tokenizer.json \
-  --output-dir /kaggle/working/nano-dsv41f-corpus
-```
-
-Build only late-mid while experimenting with Q packing:
-
-```bash
-python scripts/prepare_corpus.py \
-  --tokenizer /path/to/tokenizer.json \
-  --output-dir /kaggle/working/nano-dsv41f-corpus \
-  --phase late_mid \
+  --output-dir /kaggle/working/nano-dsv41f-midtrain-8k \
+  --total-steps 10000 \
+  --seq-len 8192 \
   --query-budget 128 \
-  --q-threshold 640
+  --q-threshold 640 \
+  --q-band-edges 640,768,1024,1536,2048,3072,4096,6144,8192
 ```
 
-Build the SFT sidecar:
+Prepare the reasoning/agent trace pools and write explicit mid-training/SFT manifest views:
 
 ```bash
-python scripts/prepare_reasoning_sft.py \
+python scripts/prepare_stage_traces.py \
   --tokenizer /path/to/tokenizer.json \
-  --output-dir /kaggle/working/nano-dsv41f-reasoning-sft \
-  --target-tokens 4000000 \
-  --max-tokens 4096
+  --output-dir /kaggle/working/nano-dsv41f-traces-8k \
+  --pool all \
+  --seq-len 8192
 ```
 
-Both builders emit manifests containing source choices, declared licenses, provenance notes,
-token/row counts, filtering statistics, and the settings needed to reproduce the data
-selection. The LM shards additionally contain SHA-256 hashes.
+The lower-level legacy builders remain for reusable packing/adapters, but new runs should use the stage-aware entry points.
 
-## Next measurement before training
+## Diagnostics before training
 
-Before treating the baseline as final, inspect the generated manifests rather than changing
-weights by intuition. The useful first diagnostics are:
+Inspect generated manifests before changing the baselines. Useful first measurements include:
 
 - actual source token fractions after packing/trimming;
 - real-token packing utilization;
-- late-mid mean Q-budget utilization;
-- late-mid eligible-Q coverage;
+- mid-training Q-budget utilization and eligible-Q coverage;
 - expected sampled-Q density across local-position bands;
-- source-specific SFT rejection rates;
-- length and integer-effort histograms for SFT.
-
-Those measurements tell us whether the next iteration should change source weights, document
-length sampling, the Q-balance objective, or the query budget itself.
+- source-specific reasoning/SFT rejection rates;
+- length and integer-effort histograms;
+- reasoning/agent pool token fractions after final filtering.

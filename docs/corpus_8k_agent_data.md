@@ -1,177 +1,150 @@
-# 8K document, reasoning, and agent data
+# 8K mid-training and SFT data
 
-This is the CPU/Kaggle preparation path for the first 8K nano-dsv4.1f training run. It
-keeps three physical pools separate so training can change mixture weights without rebuilding
-data:
+This is the CPU/Kaggle preparation path for stages **2 and 3** of the canonical lifecycle:
 
 ```text
-document/   ordinary causal-LM text/code/math
-reasoning/  explicit problem -> reasoning -> answer traces
+pretrain  ->  midtrain  ->  sft
+```
+
+General 3B-token pretraining is prepared separately. This pipeline produces three physical pools:
+
+```text
+document/   curated causal-LM text/code/math for mid-training
+reasoning/  structured reasoning traces
 agent/      reasoning -> tool -> observation -> ... trajectories
 ```
 
-All packed rows are 8192 tokens. Token IDs remain `uint16`; masks/source IDs/effort IDs use
-bytes. Shards are uncompressed NPZ by default because DEFLATE is usually wasted CPU for this
-Kaggle preprocessing job. Pass `--compress-shards` only when storage is the limiting resource.
+The trace pools are deliberately reusable. Mid-training consumes their ordinary causal-LM view; SFT consumes the assistant-only `sft_loss_mask` view.
+
+All packed rows are 8192 tokens. Token IDs remain `uint16`; masks/source IDs/effort IDs use compact integer types. Shards are uncompressed NPZ by default because DEFLATE is usually wasted CPU for this Kaggle preprocessing job.
 
 ## Frozen tokenizer
 
-The Kaggle notebook resolves the already-built tokenizer directly from:
+The Kaggle notebook resolves the already-built tokenizer from:
 
 ```text
 xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb
 ```
 
-It uses `kagglehub.dataset_download(...)` because the tokenizer is a file artifact rather
-than tabular data. The builders verify every reserved nano/DeepSeek protocol token ID before
-writing corpus shards.
+The builders verify every reserved nano/DeepSeek protocol token ID before writing shards.
 
-## Document pool
+## Mid-training document pool
 
-The source progression remains a small-model-oriented baseline:
+The old `middle` and `late_mid` document phases are replaced by one explicit mid-training corpus.
 
-| phase | FineWeb-Edu | Cosmopedia v2 | code | math | packing |
-|---|---:|---:|---:|---:|---|
-| early | 72% | 13% | 12% | 3% FineMath-3+ | best fit |
-| middle | 60% | 10% | 15% | 15% FineMath-3+ | best fit |
-| late-mid | 50% | 5% | 20% | 25% FineMath-4+ | Q-aware |
+Starting token mix:
 
-With 10,000 training steps and 5% data headroom, this is still 10,500 rows, but at 8K it is
-86,016,000 physical tokens rather than the earlier 43,008,000-token 4K build.
+| source | share | packing |
+| --- | ---: | --- |
+| FineWeb-Edu | 50% | Q-aware |
+| Cosmopedia v2 | 5% | Q-aware |
+| permissively filtered CodeParrot clean | 20% | Q-aware |
+| FineMath 4+ | 25% | Q-aware |
 
-CPU tokenization is batched with Hugging Face `tokenizers.Tokenizer.encode_batch`, so the Rust
-backend and Rayon can use the Kaggle CPU cores. Batches are bounded by both document count
-(default 256) and total characters (default 4M) to avoid one collection of huge webpages
-creating a memory spike.
+This keeps the higher-quality endpoint of the previous curriculum. Broad scale now belongs to the separate pretraining stage.
+
+CPU tokenization uses batched Hugging Face `tokenizers.Tokenizer.encode_batch`, bounded by both document count and total characters. Long documents are split into 8K-compatible chunks with BOS/EOS, and the packer preserves ratio-2 alignment and document boundaries.
 
 ## Reasoning pool
 
-Default target: 4M accepted nano-tokenizer tokens. The reasoning pool deliberately uses
-sources with explicit permissive top-level licenses:
+Default target: 4M accepted nano-tokenizer tokens. The reasoning pool uses sources with explicit permissive top-level licenses:
 
 | source | weight | license | acceptance policy |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | OpenR1-Math-220k `default` | 45% | Apache-2.0 | complete generation; reject a generation explicitly marked incorrect by Math Verify |
 | CHIMERA `Qwen3-235B-2507` | 30% | Apache-2.0 | `correctness=True`; Physics, Chemistry, or Biology only |
 | X-Coder-SFT-376k `hybrid` | 25% | MIT | require a complete explicit `<think>...</think>` response |
 
-OpenR1-Math is built from Apache-2.0 NuminaMath-1.5 problems and upstream-generated reasoning
-traces. CHIMERA describes its examples as fully synthetic; the science adapter deliberately
-excludes its math, computer-science, humanities, and linguistics rows so this bucket stays a
-science complement rather than duplicating the other two buckets. X-Coder describes its
-competitive-programming collection as fully synthetic.
+OpenR1-Math is built from Apache-2.0 NuminaMath-1.5 problems and upstream-generated reasoning traces. CHIMERA describes its examples as fully synthetic; the science adapter excludes its math, computer-science, humanities, and linguistics rows. X-Coder describes its competitive-programming collection as fully synthetic.
 
-Canonical records keep reasoning separate from final assistant content. The frozen nano
-tokenizer measures reasoning length and the existing percentile assignment maps it to integer
-`reasoning_effort` 1..100. The final V4.1 rendering is checked again against the 8192-token row
-limit. Every manifest records dataset/config/split, declared license, source-specific quality
-filtering, and provenance notes.
+Canonical records keep reasoning separate from final assistant content. The frozen nano tokenizer measures reasoning length and the deterministic percentile assignment maps it to integer `reasoning_effort` 1..100. Final V4.1 rendering is checked against the 8192-token row limit. Every manifest records dataset/config/split, declared license, source-specific quality filtering, and provenance notes.
 
-This replaces the earlier `open-r1/Mixture-of-Thoughts` dependency. It is intentionally not a
-fallback source: if one of these datasets becomes unavailable or changes terms, update the
-source catalog explicitly rather than silently substituting another aggregate mixture.
+This replaces the earlier `open-r1/Mixture-of-Thoughts` dependency. It is not a fallback source: if a current source becomes unavailable or changes terms, update the catalog explicitly rather than silently substituting another aggregate mixture.
 
 ## Agent pool
 
 Default target: 8M accepted nano-tokenizer tokens.
 
 | source | weight | acceptance policy | role |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | Nebius SWE-agent trajectories | 40% | `target=True` only | repository/SWE actions |
 | NVIDIA Nemotron Agentic v2 interactive | 25% | curated source rows | multi-turn tools/customer workflows |
 | NVIDIA Nemotron Agentic v2 search | 15% | curated source rows | repeated web-search decisions |
 | OpenSeeker v1 cleaned | 20% | `trajectory_correctness=Correct` only | long-horizon search/visit research |
 
-### SWE conversion
+Successful SWE-style traces are converted to the canonical `swe_environment` tool interface rather than training a second fenced-command protocol. Search/visit trajectories are converted to canonical tool-call IDs/results. Oversized observations are explicitly truncated with a visible marker rather than silently rewritten.
 
-The current Nebius release stores a trajectory as rows with `role`, `text`, `mask`, and
-`system_prompt`. An AI turn contains natural-language reasoning followed by its environment
-command in the final fenced code block. The adapter:
-
-1. keeps only solved trajectories (`target=True`);
-2. preserves the issue/user text and SWE environment instructions;
-3. converts the final fenced command into a `swe_environment(cmd=...)` tool call;
-4. maps the following user/environment turn to the matching tool result;
-5. keeps the preceding natural language as explicit assistant reasoning.
-
-This avoids training the original fenced-command syntax as a second competing tool protocol.
-
-### Search conversion
-
-OpenSeeker's validated FSM is converted from
-
-```text
-system -> user -> reasoning -> tool_call -> tool_output -> ... -> answer
-```
-
-into canonical OpenAI-style messages with real tool-call IDs. Only Correct trajectories are
-used. Search/visit observations are truncated explicitly before rendering so a single search
-page cannot crowd the whole 8K context; the truncation marker remains visible to the model.
-
-NVIDIA rows are already message + tool-schema structured, so they go through the existing
-canonical cleaner with only explicit tool-output length caps.
+Before any source is included in the final run, verify its license and training/redistribution terms separately.
 
 ## DeepSeek V4.1 rendering
 
-Tool schemas, DSML calls, tool-result folding, role markers, thinking markers and EOS placement
-are produced by the maintained `deepseek-recipe` V4.1 renderer.
-
-The released V4.1 renderer itself uses the numeric prompt form
-
-```text
-Reasoning Effort: N (range 1-100, the higher the value, the more thorough the reasoning)
-```
-
-but the public Python API currently exposes named effort presets. The nano data path therefore
-renders with the official 75/default form and replaces exactly that one numeric prefix with the
-canonical integer assigned to the example. No tool/role serialization is hand-reimplemented.
+Tool schemas, DSML calls, tool-result folding, role markers, thinking markers and EOS placement are produced by the maintained `deepseek-recipe` V4.1 renderer at tokenization time. Store structured records rather than permanently rendered prompt strings.
 
 ## Two training views from one trace shard
 
-Trace NPZ shards contain:
+Trace NPZ shards contain fields such as:
 
 ```text
-input_ids               uint16 [rows,8192]
-segment_ids              uint16 [rows,8192]
-token_mask                uint8 [rows,8192]
-sft_loss_mask             uint8 [rows,8192]
-source_ids                uint8 [rows,8192]
-reasoning_effort_ids      uint8 [rows,8192]
-tool_calls               uint16 [rows]
+input_ids
+segment_ids
+token_mask
+sft_loss_mask
+source_ids
+reasoning_effort_ids
+tool_calls
 ... Q diagnostics ...
 ```
 
-For mixed/continued pretraining, ignore `sft_loss_mask` and use ordinary packed causal LM. For
-SFT, additionally require the target token's `sft_loss_mask`: user/system/tool observations
-remain context while assistant reasoning, DSML calls, final content and EOS are supervised.
+### Mid-training view
+
+Use ordinary causal-LM targets from `token_mask` / `segment_ids`. Do **not** apply `sft_loss_mask`.
+
+Starting pool sampler:
+
+```text
+document  80%
+reasoning  5%
+agent     15%
+```
+
+This gives the ~122M model some tool/reasoning exposure without allowing those formats to dominate the continuation stage.
+
+### SFT view
+
+Exclude ordinary document rows by default. Supervise assistant targets only:
+
+```text
+valid_sft_target = ordinary_valid_target AND sft_loss_mask
+```
+
+User/system/tool-result tokens remain context. A starting trace-only ratio matching the 4M reasoning / 8M agent target sizes is 1/3 reasoning and 2/3 agent, but that ratio should be revisited after final filtering.
 
 ## 8K Q-aware statistics
 
-The current retriever warmup still starts at segment-local position 640 with budget 128. The
-8K reporting bands are:
+The current retriever eligibility starts at segment-local position 640 with query budget 128. Reporting bands are:
 
 ```text
 [640,768), [768,1024), [1024,1536), [1536,2048),
 [2048,3072), [3072,4096), [4096,6144), [6144,8192)
 ```
 
-Late-mid documents and both trace pools are packed with the expected sampled-Q-density
-objective. Every manifest reports eligible Q count, selected Q count, budget utilization,
-eligible coverage and expected sample density by local-position band.
+Mid-training documents and both trace pools retain eligible-Q count, selected-Q count, budget utilization, eligible coverage and expected sampled-Q density by local-position band.
 
-## Initial sampler schedule
+## Stage-aware entry points
 
-Keep physical pools independent and sample them at training time:
+Prepare the single mid-training document corpus:
 
 ```text
-early:     100% document
-middle:     90% document + 5% reasoning +  5% agent
-late-mid:   80% document + 5% reasoning + 15% agent
+scripts/prepare_midtrain_corpus.py
 ```
 
-These are starting points for ablations, not claims about an optimal DeepSeek training recipe.
-In particular, agent data is intentionally withheld early so the ~122M model first acquires
-basic language/code/math capacity instead of overfitting tool syntax.
+Prepare reasoning/agent traces and stamp explicit stage views:
+
+```text
+scripts/prepare_stage_traces.py
+```
+
+The lower-level `prepare_document_corpus_8k.py` and `prepare_trace_corpus.py` implementations remain underneath those wrappers for reusable packing/adapter code. New runs should use the stage-aware entry points.
 
 ## Kaggle notebook
 
@@ -181,6 +154,4 @@ Run:
 notebooks/nano_dsv41f_prepare_8k_data.ipynb
 ```
 
-It downloads the frozen tokenizer by Kaggle handle, clones the corpus branch, enables tokenizer
-CPU parallelism, builds all three pools, and prints source fractions, retention/drop counts,
-SFT supervision fractions, reasoning-effort coverage and Q-position statistics.
+The notebook prepares **mid-training + SFT data only**. It does not rebuild the 3B-token pretraining corpus.
