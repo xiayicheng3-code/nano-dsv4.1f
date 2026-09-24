@@ -1,11 +1,12 @@
-"""The focused preset must skip the old sweep and isolate candidate failures."""
+"""The focused preset remains reproducible after its notebook is archived."""
 import json
 from pathlib import Path
 import sys
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 import run_sequential_tiles as sweep
 
 
@@ -43,17 +44,18 @@ def test_focused_plan_and_candidate_failure_isolation(tmp_path, monkeypatch, fai
             assert row["median_time_reduction_fraction"] == pytest.approx(.2)
 
 
-def test_notebook_preset_overrides_stale_run_and_uses_only_focused_supervisor(monkeypatch):
+def test_archived_notebook_preserves_focused_preset_and_active_path_is_notice(monkeypatch):
     import os
     import nbformat
-    import build_sequential_tiles_notebook as builder
-    builder.build()
-    notebook = nbformat.read(builder.ROOT / "notebooks/nano_dsv41f_sequential_tiles.ipynb", as_version=4)
+
+    notebook = nbformat.read(ROOT / "notebooks/archive/nano_dsv41f_sequential_tiles.ipynb",
+                             as_version=4)
+    nbformat.validate(notebook)
     monkeypatch.setenv("NANO_ATTN_ROWS", "4,8,24")
     monkeypatch.setenv("NANO_ATTN_FULL_MODEL", "1")
     monkeypatch.setenv("NANO_ATTN_TILE_TEST", "1")
     monkeypatch.setenv("NANO_DSV41F_REF", "old-commit")
-    # Isolate the settings-cell environment assignment from the test process.
+    # Isolate the historical settings-cell environment assignment from the test process.
     with monkeypatch.context() as patch:
         patch.setattr(os, "environ", dict(os.environ))
         namespace = {}
@@ -69,6 +71,12 @@ def test_notebook_preset_overrides_stale_run_and_uses_only_focused_supervisor(mo
     assert "scripts/run_sequential_tiles.py" in code
     assert "scripts/run_attention_experiment.py" not in code
     assert "scripts/run_stress_suite.py" not in code
+
+    notice = nbformat.read(ROOT / "notebooks/nano_dsv41f_sequential_tiles.ipynb", as_version=4)
+    nbformat.validate(notice)
+    assert not [cell for cell in notice.cells if cell.cell_type == "code"]
+    text = "\n".join(cell.source for cell in notice.cells if cell.cell_type == "markdown")
+    assert "Archived" in text and "final_attention_tuning" in text
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
