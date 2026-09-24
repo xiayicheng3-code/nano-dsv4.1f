@@ -259,6 +259,29 @@ This is now a real accelerator-specific execution path, but **it is still under 
 
 ## Try it on Kaggle
 
+For full **8192-token pretraining stress tests**, use
+[`notebooks/nano_dsv41f_pretrain_stress.ipynb`](notebooks/nano_dsv41f_pretrain_stress.ipynb).
+It compares the seven-layer baseline at attention CP8/DP1 and CP2/DP4, then a
+48-expert/128-width/top-4 candidate, all at the same global batch. An optional
+bounded search measures the observed batch-capacity boundary in DP-sized increments. Native attention now
+honors these layouts; MoE remains EP8. It records base and late-indexer compile times,
+synchronized optimizer-step timings, compiler/device memory, and incremental failure
+reports. See [the stress-test recipe and interpretation](docs/pretrain_stress.md).
+Regenerate this notebook with `python scripts/build_stress_notebook.py`.
+
+For the **4/8/24-row throughput investigation with real packed corpus inputs**, use
+[`notebooks/nano_dsv41f_pretrain_profile.ipynb`](notebooks/nano_dsv41f_pretrain_profile.ipynb).
+It checks the attached tokenizer/corpus, records per-layer routing and dispatch loads,
+and exports separate warmed-up TPU traces after unprofiled timing.
+See the [measured 4/8/24-row results and testable hypotheses](docs/experiments/2026-09-21-pretrain-profile.md)
+for the next attention-batching experiment.
+
+Run that controlled experiment with
+[`notebooks/nano_dsv41f_attention_hypothesis.ipynb`](notebooks/nano_dsv41f_attention_hypothesis.ipynb).
+It freezes real model attention inputs, checks gradients, compares local `vmap`
+with sequential attention, and offers a tile-pressure probe and full-model A/B.
+See [controls, environment variables and interpretation](docs/attention_hypothesis.md).
+
 A lightweight notebook is checked in at [`notebooks/nano_dsv41f_kaggle.ipynb`](notebooks/nano_dsv41f_kaggle.ipynb). From a blank Kaggle session, select TPU, enable Internet, and run top-to-bottom. The notebook fetches the requested Git ref and prints the exact commit SHA for reproducibility.
 
 Regenerate both maintained notebook entry points with:

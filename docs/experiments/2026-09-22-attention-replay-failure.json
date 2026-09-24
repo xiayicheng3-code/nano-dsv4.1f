@@ -1,0 +1,709 @@
+{
+  "source": {
+    "url": "https://www.kaggle.com/code/xiayicheng3gmailcom/nano-dsv4-1f/output",
+    "output_version_id": 351680820,
+    "directory": "attention-hypothesis-20260922-010806",
+    "commit": "2c455587fd44b32d29fcc7fb4382eb112b2d766c"
+  },
+  "file_sha256": {
+    "replay/summary.json": "5af054b637e06116ed03c8399190199cabe256c5a7b036fb807361fdf1858875",
+    "bank/manifest.json": "7749812c76fc8413a90193ccf65b22cd9c3e1833a1f61da3ba9a6957fba67102",
+    "environment.json": "83bfb556887c79f14663019b3b35223b3f6c17b3bc92c0cf625c997fe85107c3"
+  },
+  "status_counts": {
+    "failed": 36
+  },
+  "timed_cases": 0,
+  "trace_files": 0,
+  "vmap_compile_and_execute_passes": 24,
+  "packages": {
+    "jax": "0.10.2",
+    "jaxlib": "0.10.2",
+    "libtpu": "0.0.42.1",
+    "tokamax": "0.0.12"
+  },
+  "environment": {
+    "NANO_DSV41F_REF": "codex/pretrain-stress-8k",
+    "NANO_PROFILE_CORPUS": "/kaggle/input/datasets/xiayicheng3gmailcom/nanodsv4-1f-pretrain-tokenized",
+    "NANO_PROFILE_TOKENIZER": "/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb",
+    "NANO_ATTN_ROWS": "4,8",
+    "NANO_ATTN_FAMILIES": "local,compressed,global",
+    "NANO_ATTN_COMPOSITIONS": "repeated,distinct",
+    "NANO_ATTN_REPEATS": "3",
+    "NANO_ATTN_WARMUP": "3",
+    "NANO_ATTN_STEPS": "12",
+    "NANO_ATTN_TRACE_STEPS": "3",
+    "NANO_ATTN_TILE_TEST": "0",
+    "NANO_ATTN_FULL_MODEL": "0",
+    "NANO_ATTN_TIMEOUT": "1800",
+    "NANO_ATTN_FULL_TIMEOUT": "3600",
+    "NANO_PROFILE_DATA_SEED": "1701",
+    "NANO_PROFILE_MODEL_SEED": "7"
+  },
+  "capture": {
+    "seed": 7,
+    "rows": 8,
+    "recipe_sha256": "fb8dea74b560891d06e9ec38eaf6a531e275ae44e0db254f317b7e7a000e8a59",
+    "final_hidden_sum": 151235.40625,
+    "families": {
+      "local": {
+        "layer": 0,
+        "save_residuals": false,
+        "local_window": 128,
+        "ratio": 1,
+        "arrays": {
+          "q": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              8,
+              64
+            ],
+            "sha256": "8982074692cb51bfce30d58c05e47252b1b0fe011dcb6a6876f4274b7c68a546"
+          },
+          "k": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              64
+            ],
+            "sha256": "5cbe7c9873f7c82603b4e108190893b4ce5090397d34baf3dcc57d3555a4b438"
+          },
+          "v": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              64
+            ],
+            "sha256": "5cbe7c9873f7c82603b4e108190893b4ce5090397d34baf3dcc57d3555a4b438"
+          },
+          "q_segments": {
+            "dtype": "int32",
+            "shape": [
+              8,
+              8192
+            ],
+            "sha256": "f636ea336eab6d9dfaee87c301a1ce7567d1117c16a443548c528300d95b4778"
+          },
+          "kv_segments": {
+            "dtype": "int32",
+            "shape": [
+              8,
+              8192
+            ],
+            "sha256": "f636ea336eab6d9dfaee87c301a1ce7567d1117c16a443548c528300d95b4778"
+          },
+          "sinks": {
+            "dtype": "float32",
+            "shape": [
+              8
+            ],
+            "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+          },
+          "cotangent": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              8,
+              64
+            ],
+            "sha256": "89e761c190028440fc14870061c13c16ac845201a04e08d1f7daaa64cfb61fa0"
+          }
+        },
+        "file_sha256": "171be39340ea0b965384995dbadcf0c33880e71ebb1b2dd8d82600934a086e31"
+      },
+      "compressed": {
+        "layer": 1,
+        "save_residuals": false,
+        "local_window": 128,
+        "ratio": 2,
+        "arrays": {
+          "q": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              8,
+              64
+            ],
+            "sha256": "987cc4f700b618112217db6325d6cfb6d8ca3c8cfd738a29aed1f88a043f3361"
+          },
+          "k": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              12288,
+              64
+            ],
+            "sha256": "6e6cf03ea71510195eba03de5ced74183d281cc1c612a16446479fbeb7e70a95"
+          },
+          "v": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              12288,
+              64
+            ],
+            "sha256": "6e6cf03ea71510195eba03de5ced74183d281cc1c612a16446479fbeb7e70a95"
+          },
+          "q_segments": {
+            "dtype": "int32",
+            "shape": [
+              8,
+              8192
+            ],
+            "sha256": "f636ea336eab6d9dfaee87c301a1ce7567d1117c16a443548c528300d95b4778"
+          },
+          "kv_segments": {
+            "dtype": "int32",
+            "shape": [
+              8,
+              12288
+            ],
+            "sha256": "80cd14e70bfd673857a2590d0d8a9c282c56fe25664d6fda8f95e3695fb98435"
+          },
+          "sinks": {
+            "dtype": "float32",
+            "shape": [
+              8
+            ],
+            "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+          },
+          "cotangent": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              8,
+              64
+            ],
+            "sha256": "2809d87a3bfa1f9b745bfb77d982596c03b6fa44d55ddbf7f7327202d6889b5d"
+          }
+        },
+        "file_sha256": "df0536b03e17ddf9108ce0fb4ae76824d4d30c11952b9f5cf8bb89d25fa476ee"
+      },
+      "global": {
+        "layer": 3,
+        "save_residuals": false,
+        "local_window": 128,
+        "ratio": 1,
+        "arrays": {
+          "q": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              8,
+              64
+            ],
+            "sha256": "bd881c96f4e810ef6ddd394d6c82e0f7467cd426984f98bb12c5e8062ebc2713"
+          },
+          "k": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              16384,
+              64
+            ],
+            "sha256": "ac85571f8df8b7ea14b480b135c0b31f0e8942a3c45415f8d389095936c3db6a"
+          },
+          "v": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              16384,
+              64
+            ],
+            "sha256": "ac85571f8df8b7ea14b480b135c0b31f0e8942a3c45415f8d389095936c3db6a"
+          },
+          "q_segments": {
+            "dtype": "int32",
+            "shape": [
+              8,
+              8192
+            ],
+            "sha256": "f636ea336eab6d9dfaee87c301a1ce7567d1117c16a443548c528300d95b4778"
+          },
+          "kv_segments": {
+            "dtype": "int32",
+            "shape": [
+              8,
+              16384
+            ],
+            "sha256": "e667bf18f3182db96c3baebac4fdba9c677de995a6ed2df5d6318e0008961d52"
+          },
+          "sinks": {
+            "dtype": "float32",
+            "shape": [
+              8
+            ],
+            "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+          },
+          "cotangent": {
+            "dtype": "bfloat16",
+            "shape": [
+              8,
+              8192,
+              8,
+              64
+            ],
+            "sha256": "8d79941aa36d97e051307a97d273f15ccb405738c012899177b081fd3111f4ba"
+          }
+        },
+        "file_sha256": "cb78f426ac53cd8fb3b1e6344acede6bd178cb8e4176548ca55850c1225a5e3a"
+      }
+    }
+  },
+  "hypothesis_result": "inconclusive: all pairs failed before timing",
+  "example_traceback": "Traceback (most recent call last):\n  File \"/kaggle/working/nano-dsv4.1f/src/nano_dsv41f/tpu_native.py\", line 313, in <lambda>\n    return jax.lax.map(lambda xs: one(*xs), inputs)\n  File \"/kaggle/working/nano-dsv4.1f/src/nano_dsv41f/tpu_native.py\", line 299, in one\n    result = kernel_arg(\n  File \"/usr/local/lib/python3.12/site-packages/jax/experimental/pallas/ops/tpu/splash_attention/splash_attention_kernel.py\", line 2469, in __call__\n    return _splash_attention(\njax._src.source_info_util.JaxStackTraceBeforeTransformation: AssertionError: (ShapedArray(float32[8]), ShapedArray(bfloat16[8]))\n\nThe preceding stack trace is the source of the JAX operation that, once transformed by JAX, triggered the following exception.\n\n--------------------\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/kaggle/working/nano-dsv4.1f/scripts/run_attention_replay.py\", line 184, in main\n    run(a, report, checkpoint)\n  File \"/kaggle/working/nano-dsv4.1f/scripts/run_attention_replay.py\", line 106, in run\n    executable = combined.lower(*inputs, ct).compile()\n                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/kaggle/working/nano-dsv4.1f/scripts/run_attention_replay.py\", line 42, in combined\n    return y, backward(cotangent)\n              ^^^^^^^^^^^^^^^^^^^\nAssertionError: (ShapedArray(float32[8]), ShapedArray(bfloat16[8]))\n--------------------\nFor simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.\n",
+  "cases": [
+    {
+      "family": "local",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 0,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "local",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "local",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "local",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "compressed",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "compressed",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "compressed",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "compressed",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "global",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "global",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "global",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "global",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 1,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": []
+    },
+    {
+      "family": "local",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "local",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "compressed",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 4,
+      "composition": "repeated",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 8,
+      "composition": "repeated",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 4,
+      "composition": "distinct",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    },
+    {
+      "family": "global",
+      "rows": 8,
+      "composition": "distinct",
+      "repeat": 2,
+      "intervention": "schedule",
+      "status": "failed",
+      "stage": "compile_and_check:sequential",
+      "exception": "(ShapedArray(float32[8]), ShapedArray(bfloat16[8]))",
+      "compiled_variants": [
+        "vmap"
+      ]
+    }
+  ]
+}

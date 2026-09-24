@@ -201,6 +201,7 @@ def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
         return {
             "native_moe_layers": jnp.asarray(0, dtype=jnp.int32),
             "expert_loads": jnp.zeros((config.n_experts,), dtype=jnp.int32),
+            "expert_loads_by_layer": jnp.zeros((0, config.n_experts), dtype=jnp.int32),
             "expert_overflow": jnp.zeros((config.n_experts,), dtype=jnp.int32),
             "expert_dropped": jnp.zeros((config.n_experts,), dtype=jnp.int32),
             "expert_capacity": jnp.asarray(0, dtype=jnp.int32),
@@ -219,6 +220,7 @@ def _native_moe_diagnostics(backbone_aux, config) -> dict[str, jax.Array]:
     return {
         "native_moe_layers": jnp.asarray(len(native_layers), dtype=jnp.int32),
         "expert_loads": loads,
+        "expert_loads_by_layer": jnp.stack(tuple(layer["expert_loads"] for layer in native_layers)),
         "expert_overflow": overflow,
         "expert_dropped": jnp.sum(jnp.stack(tuple(layer["expert_dropped"] for layer in native_layers)), axis=0),
         "expert_capacity": native_layers[0]["expert_capacity"],

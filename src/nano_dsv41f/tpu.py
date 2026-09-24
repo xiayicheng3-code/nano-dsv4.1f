@@ -175,6 +175,7 @@ def semantic_axes(config, mesh: Mesh, *, strict: bool = True) -> dict[str, Any]:
         "context": axes_for_shard_count(
             mesh, pc.attention_context_shard, strict=strict
         ),
+        "data": axes_for_shard_count(mesh, pc.attention_data_shard, strict=strict),
         "heads": axes_for_shard_count(
             mesh, pc.attention_head_shard, strict=strict
         ),
@@ -341,8 +342,12 @@ def init_optimizer_state_sharded(params, param_specs, config, mesh: Mesh):
 
 
 def batch_named_sharding(config, mesh: Mesh, *, strict: bool = True) -> NamedSharding:
-    axis = semantic_axes(config, mesh, strict=strict)["context"]
-    return NamedSharding(mesh, P(None, axis))
+    axes = semantic_axes(config, mesh, strict=strict)
+    def names(axis):
+        return set(axis if isinstance(axis, tuple) else (() if axis is None else (axis,)))
+    if names(axes["data"]) & names(axes["context"]):
+        raise ValueError("attention data and context axes must be disjoint")
+    return NamedSharding(mesh, P(axes["data"], axes["context"]))
 
 
 def validate_sequence_length(seq_len: int, config, mesh: Mesh) -> tuple[str, ...]:
@@ -388,6 +393,8 @@ def put_training_batch(
             "input_ids, segment_ids and token_mask must have identical [B,T] shapes"
         )
     validate_sequence_length(int(input_ids.shape[1]), config, mesh)
+    if input_ids.shape[0] % config.parallelism.attention_data_shard:
+        raise ValueError("global batch rows must be divisible by attention_data_shard")
     sharding = batch_named_sharding(config, mesh)
     return (
         jax.device_put(input_ids, sharding),

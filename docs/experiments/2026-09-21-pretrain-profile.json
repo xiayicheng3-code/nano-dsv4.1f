@@ -1,0 +1,378 @@
+{
+  "schema": 1,
+  "run": "pretrain-profile-20260921-110434",
+  "summary_sha256": "145f04cc378962fabfc3dc26d54f7ccf0ac944cf8a7c6ad8c3e4b00d1cea57ff",
+  "scope_precedence": [
+    "splash",
+    "ragged_expert_forward",
+    "moe_combine_scatter",
+    "moe_all_gather",
+    "moe_dispatch_sort",
+    "other"
+  ],
+  "trace_method": "Sum HLO total_self_time (us) by first matching tf_op_name scope; divide by device_count * captured_steps * 1000 for mean ms/device/step. Source attribution can be affected by fusion; other is not an MoE category.",
+  "cases": [
+    {
+      "name": "case-00",
+      "status": "passed",
+      "commit": "0b52e74dd5fa578aabff926752a684ef03c7d547",
+      "case": {
+        "profile": "narrow48",
+        "top_k": 4,
+        "cp": 2,
+        "dp": 4,
+        "batch_rows": 4,
+        "data": "/kaggle/working/pretrain-profile-20260921-110434/inputs/rows-4.npz",
+        "data_batches": 3,
+        "seed": 7,
+        "warmup": 3,
+        "steps": 12,
+        "trace_steps": 3,
+        "trace_dir": "/kaggle/working/pretrain-profile-20260921-110434/traces",
+        "phase": "both",
+        "routing": "normal"
+      },
+      "packages": {
+        "jax": "0.10.2",
+        "jaxlib": "0.10.2",
+        "libtpu": "0.0.42.1",
+        "tokamax": "0.0.12"
+      },
+      "runtime": {
+        "jax_version": "0.10.2",
+        "platform": "tpu",
+        "device_kind": "TPU v5 lite",
+        "device_count": 8,
+        "local_device_count": 8,
+        "process_count": 1,
+        "process_index": 0
+      },
+      "recipe_sha256": "1ffbfb84d01f294c5755601a0dd00b2ff751fa67c33c45637bb6cfacaab414c1",
+      "batch_bank": [
+        {
+          "lm_tokens": 32687,
+          "real_tokens": 32715,
+          "physical_tokens": 32768,
+          "sha256": "5c9ba50d281af5c9194592e7db75a08accd0a4ae9f823f7af788babd5836b348"
+        },
+        {
+          "lm_tokens": 32613,
+          "real_tokens": 32646,
+          "physical_tokens": 32768,
+          "sha256": "28f9dba5f46e2c1491b61a05894c7e924bdfa3a9f7c279068d7ab2643c44cc5e"
+        },
+        {
+          "lm_tokens": 32646,
+          "real_tokens": 32671,
+          "physical_tokens": 32768,
+          "sha256": "4e31735b7bd5c525479ef632b0b721a0d2c5e6e00b154a1636b0e716c5d21cb4"
+        }
+      ],
+      "phases": {
+        "base": {
+          "median_seconds": 0.40039120650004634,
+          "p95_seconds": 0.40592265554995494,
+          "physical_tokens_per_second": 81839.95919000336,
+          "lm_tokens_per_second": 81497.66381796345,
+          "microseconds_per_physical_token": 12.218969924928173,
+          "compiler_estimated_total_gib": 2.220703601837158,
+          "measured_steps": 12,
+          "routing_maxima_over_measured_steps_and_layers": {
+            "real_tokens": {
+              "max_over_mean_by_layer": 4.015304092314285,
+              "chip_max_over_mean_by_layer": 1.5552498853736818
+            },
+            "physical_dispatch": {
+              "max_over_mean_by_layer": 4.00341796875,
+              "chip_max_over_mean_by_layer": 1.55615234375
+            }
+          },
+          "hlo_profile": {
+            "export": "case-00-base-hlo_stats.json",
+            "export_sha256": "700dc0adf797f08ef13be068a1cd698b1df3bfe04be7ae2f22494ed1a84bbb91",
+            "captured_steps": 3,
+            "devices": 8,
+            "ms_per_device_step_by_scope": {
+              "splash": 109.56546302083338,
+              "other": 117.68997791666992,
+              "moe_combine_scatter": 83.46503802083335,
+              "moe_all_gather": 19.669296406249995,
+              "moe_dispatch_sort": 18.493148854166666,
+              "ragged_expert_forward": 41.756391666666495
+            }
+          }
+        },
+        "late": {
+          "median_seconds": 0.42881951350000236,
+          "p95_seconds": 0.42957999650004697,
+          "physical_tokens_per_second": 76414.43303862108,
+          "lm_tokens_per_second": 76191.77222854274,
+          "microseconds_per_physical_token": 13.086533004760813,
+          "compiler_estimated_total_gib": 2.328005313873291,
+          "measured_steps": 12,
+          "routing_maxima_over_measured_steps_and_layers": {
+            "real_tokens": {
+              "max_over_mean_by_layer": 5.404058645281748,
+              "chip_max_over_mean_by_layer": 1.7743061937143907
+            },
+            "physical_dispatch": {
+              "max_over_mean_by_layer": 5.3961181640625,
+              "chip_max_over_mean_by_layer": 1.7752685546875
+            }
+          },
+          "hlo_profile": {
+            "export": "case-00-late-hlo_stats.json",
+            "export_sha256": "df0f4fc4bdfe4a7bdceb270f6933338b88837cba9193d94a05101e23d7c8feff",
+            "captured_steps": 3,
+            "devices": 8,
+            "ms_per_device_step_by_scope": {
+              "splash": 109.72031395833342,
+              "other": 140.2198059375037,
+              "moe_combine_scatter": 83.41960109374995,
+              "moe_all_gather": 20.530921666666675,
+              "moe_dispatch_sort": 18.52319682291667,
+              "ragged_expert_forward": 41.68333374999983
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "case-01",
+      "status": "passed",
+      "commit": "0b52e74dd5fa578aabff926752a684ef03c7d547",
+      "case": {
+        "profile": "narrow48",
+        "top_k": 4,
+        "cp": 2,
+        "dp": 4,
+        "batch_rows": 8,
+        "data": "/kaggle/working/pretrain-profile-20260921-110434/inputs/rows-8.npz",
+        "data_batches": 3,
+        "seed": 7,
+        "warmup": 3,
+        "steps": 12,
+        "trace_steps": 3,
+        "trace_dir": "/kaggle/working/pretrain-profile-20260921-110434/traces",
+        "phase": "both",
+        "routing": "normal"
+      },
+      "packages": {
+        "jax": "0.10.2",
+        "jaxlib": "0.10.2",
+        "libtpu": "0.0.42.1",
+        "tokamax": "0.0.12"
+      },
+      "runtime": {
+        "jax_version": "0.10.2",
+        "platform": "tpu",
+        "device_kind": "TPU v5 lite",
+        "device_count": 8,
+        "local_device_count": 8,
+        "process_count": 1,
+        "process_index": 0
+      },
+      "recipe_sha256": "1ffbfb84d01f294c5755601a0dd00b2ff751fa67c33c45637bb6cfacaab414c1",
+      "batch_bank": [
+        {
+          "lm_tokens": 65407,
+          "real_tokens": 65460,
+          "physical_tokens": 65536,
+          "sha256": "4fe010eae80b296285a19c972036c4bacb5ee2d1081887723fbf4f9b15c6eb2a"
+        },
+        {
+          "lm_tokens": 65147,
+          "real_tokens": 65217,
+          "physical_tokens": 65536,
+          "sha256": "903c331cc67a3f14bbf4c3a667d4d2bbb643220c55b61d61dbe4da9eacd63191"
+        },
+        {
+          "lm_tokens": 65207,
+          "real_tokens": 65267,
+          "physical_tokens": 65536,
+          "sha256": "9276fbea43e561948398f39d368f248e76682efc4f55e7c104b43ca5c3f25ab9"
+        }
+      ],
+      "phases": {
+        "base": {
+          "median_seconds": 0.9530692139999246,
+          "p95_seconds": 0.9554142154999568,
+          "physical_tokens_per_second": 68763.10664254148,
+          "lm_tokens_per_second": 68484.91966416148,
+          "microseconds_per_physical_token": 14.542682098387521,
+          "compiler_estimated_total_gib": 4.291353225708008,
+          "measured_steps": 12,
+          "routing_maxima_over_measured_steps_and_layers": {
+            "real_tokens": {
+              "max_over_mean_by_layer": 3.9792850904745123,
+              "chip_max_over_mean_by_layer": 1.520952395544456
+            },
+            "physical_dispatch": {
+              "max_over_mean_by_layer": 3.9697265625,
+              "chip_max_over_mean_by_layer": 1.521209716796875
+            }
+          },
+          "hlo_profile": {
+            "export": "case-01-base-hlo_stats.json",
+            "export_sha256": "41ac054248386692c4e244789f01ce0c8cc833a22154571c76fc8ba366ea0524",
+            "captured_steps": 3,
+            "devices": 8,
+            "ms_per_device_step_by_scope": {
+              "splash": 353.8939988541669,
+              "other": 235.06883828124384,
+              "moe_combine_scatter": 185.93897895833325,
+              "moe_all_gather": 38.96336182291666,
+              "moe_dispatch_sort": 37.10107046874998,
+              "ragged_expert_forward": 91.32950479166685
+            }
+          }
+        },
+        "late": {
+          "median_seconds": 1.0109652890000689,
+          "p95_seconds": 1.0126863640500574,
+          "physical_tokens_per_second": 64825.17324093363,
+          "lm_tokens_per_second": 64516.888908733315,
+          "microseconds_per_physical_token": 15.426106094361403,
+          "compiler_estimated_total_gib": 4.47769021987915,
+          "measured_steps": 12,
+          "routing_maxima_over_measured_steps_and_layers": {
+            "real_tokens": {
+              "max_over_mean_by_layer": 7.383134738771769,
+              "chip_max_over_mean_by_layer": 2.0286821824199057
+            },
+            "physical_dispatch": {
+              "max_over_mean_by_layer": 7.38153076171875,
+              "chip_max_over_mean_by_layer": 2.028045654296875
+            }
+          },
+          "hlo_profile": null
+        }
+      }
+    },
+    {
+      "name": "case-02",
+      "status": "passed",
+      "commit": "0b52e74dd5fa578aabff926752a684ef03c7d547",
+      "case": {
+        "profile": "narrow48",
+        "top_k": 4,
+        "cp": 2,
+        "dp": 4,
+        "batch_rows": 24,
+        "data": "/kaggle/working/pretrain-profile-20260921-110434/inputs/rows-24.npz",
+        "data_batches": 3,
+        "seed": 7,
+        "warmup": 3,
+        "steps": 12,
+        "trace_steps": 3,
+        "trace_dir": "/kaggle/working/pretrain-profile-20260921-110434/traces",
+        "phase": "both",
+        "routing": "normal"
+      },
+      "packages": {
+        "jax": "0.10.2",
+        "jaxlib": "0.10.2",
+        "libtpu": "0.0.42.1",
+        "tokamax": "0.0.12"
+      },
+      "runtime": {
+        "jax_version": "0.10.2",
+        "platform": "tpu",
+        "device_kind": "TPU v5 lite",
+        "device_count": 8,
+        "local_device_count": 8,
+        "process_count": 1,
+        "process_index": 0
+      },
+      "recipe_sha256": "1ffbfb84d01f294c5755601a0dd00b2ff751fa67c33c45637bb6cfacaab414c1",
+      "batch_bank": [
+        {
+          "lm_tokens": 195841,
+          "real_tokens": 196039,
+          "physical_tokens": 196608,
+          "sha256": "b079a6537c2615d1ad36197395ce09971487c6bca758d4ae590c337637cc4410"
+        },
+        {
+          "lm_tokens": 195331,
+          "real_tokens": 195522,
+          "physical_tokens": 196608,
+          "sha256": "d8c951a3da17836819011c1c8fd1cbc94f12c371c060c9c132e64575947346b4"
+        },
+        {
+          "lm_tokens": 195557,
+          "real_tokens": 195749,
+          "physical_tokens": 196608,
+          "sha256": "c0a28ba160e1683f18ea6a79c1b6a63147c8431521a6ef0c8a2adb6edfd96a2a"
+        }
+      ],
+      "phases": {
+        "base": {
+          "median_seconds": 2.9378506594999863,
+          "p95_seconds": 2.9476892650999162,
+          "physical_tokens_per_second": 66922.39422185678,
+          "lm_tokens_per_second": 66582.5374939912,
+          "microseconds_per_physical_token": 14.9426811701456,
+          "compiler_estimated_total_gib": 12.242065906524658,
+          "measured_steps": 12,
+          "routing_maxima_over_measured_steps_and_layers": {
+            "real_tokens": {
+              "max_over_mean_by_layer": 4.952117252195413,
+              "chip_max_over_mean_by_layer": 1.6528411383966202
+            },
+            "physical_dispatch": {
+              "max_over_mean_by_layer": 4.95257568359375,
+              "chip_max_over_mean_by_layer": 1.6516011555989583
+            }
+          },
+          "hlo_profile": {
+            "export": "case-02-base-hlo_stats.json",
+            "export_sha256": "402d47fba2dce64bda501d1809c34c1d0d8da37217425cafe76dde86a58ad351",
+            "captured_steps": 3,
+            "devices": 8,
+            "ms_per_device_step_by_scope": {
+              "splash": 994.9026958333344,
+              "other": 862.8840315103639,
+              "moe_combine_scatter": 561.3225452083334,
+              "moe_all_gather": 126.22077343750004,
+              "moe_dispatch_sort": 114.00606458333343,
+              "ragged_expert_forward": 282.8325283333331
+            }
+          }
+        },
+        "late": {
+          "median_seconds": 3.115612854500114,
+          "p95_seconds": 3.124932077550079,
+          "physical_tokens_per_second": 63104.11761076935,
+          "lm_tokens_per_second": 62782.00806919072,
+          "microseconds_per_physical_token": 15.846826449076914,
+          "compiler_estimated_total_gib": 12.692324161529541,
+          "measured_steps": 12,
+          "routing_maxima_over_measured_steps_and_layers": {
+            "real_tokens": {
+              "max_over_mean_by_layer": 10.100459602426048,
+              "chip_max_over_mean_by_layer": 2.288113860096348
+            },
+            "physical_dispatch": {
+              "max_over_mean_by_layer": 10.09478759765625,
+              "chip_max_over_mean_by_layer": 2.2900594075520835
+            }
+          },
+          "hlo_profile": {
+            "export": "case-02-late-hlo_stats.json",
+            "export_sha256": "9d68b59a434f8a76dfb82478209919efcca860769bea6c9c9363e715ee7677d9",
+            "captured_steps": 3,
+            "devices": 8,
+            "ms_per_device_step_by_scope": {
+              "splash": 985.8602572395831,
+              "other": 1025.6649620832707,
+              "moe_all_gather": 147.54409348958333,
+              "moe_combine_scatter": 560.964210052083,
+              "moe_dispatch_sort": 113.99802062500014,
+              "ragged_expert_forward": 281.67901119791645
+            }
+          }
+        }
+      }
+    }
+  ]
+}

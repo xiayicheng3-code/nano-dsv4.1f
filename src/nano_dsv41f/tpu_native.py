@@ -33,22 +33,41 @@ class TPUNativeConfig:
     use_expert_parallel_moe: bool = True
     force_block_remat: bool = True
     moe_ragged_implementation: Literal["auto", "mosaic", "xla"] = "auto"
+    # Experimental fast-buffer divisor; overflow executes the full dropless path.
+    moe_buffer_divisor: int = 1
     # Deprecated compatibility fields; Tokamax ragged dispatch has no capacity cap.
     moe_capacity_factor: float = 1.5
     moe_capacity_multiple: int = 128
     manual_axis_name: str = "tp"
     splash_interpret: bool = False
     need_teacher_lse: bool = False
+    # Set from ModelConfig.parallelism by compile_pretrain_step_native.
+    attention_data_shards: int = 1
+    # Experimental controls. Defaults preserve the measured production path.
+    splash_batch_mode: Literal["vmap", "sequential"] = "vmap"
+    splash_block_q_dkv: int | None = None
+    # Optional family overrides; local-only attention retains the general value.
+    splash_compressed_block_q_dkv: int | None = None
+    splash_global_block_q_dkv: int | None = None
 
     def __post_init__(self) -> None:
+        if self.splash_batch_mode not in ("vmap", "sequential"):
+            raise ValueError("splash_batch_mode must be vmap or sequential")
+        for name in ("splash_block_q_dkv", "splash_compressed_block_q_dkv", "splash_global_block_q_dkv"):
+            if getattr(self, name) is not None and getattr(self, name) not in (128, 256, 512, 1024, 2048):
+                raise ValueError(f"experimental {name} must be 128, 256, 512, 1024 or 2048")
         if self.moe_ragged_implementation not in ("auto", "mosaic", "xla"):
             raise ValueError("moe_ragged_implementation must be auto, mosaic or xla")
+        if self.moe_buffer_divisor not in (1, 2, 4):
+            raise ValueError("moe_buffer_divisor must be 1, 2 or 4")
         if self.moe_capacity_factor < 1.0:
             raise ValueError("moe_capacity_factor must be >= 1")
         if self.moe_capacity_multiple <= 0:
             raise ValueError("moe_capacity_multiple must be positive")
         if not self.manual_axis_name:
             raise ValueError("manual_axis_name must be non-empty")
+        if self.attention_data_shards <= 0:
+            raise ValueError("attention_data_shards must be positive")
 
 
 @dataclass(frozen=True)
@@ -196,6 +215,12 @@ def _round_up(value: int, multiple: int) -> int:
     return math.ceil(value / multiple) * multiple
 
 
+def _splash_tile(options: TPUNativeConfig, family: str | None) -> int | None:
+    override = (options.splash_compressed_block_q_dkv if family == "compressed" else
+                options.splash_global_block_q_dkv if family == "global" else None)
+    return options.splash_block_q_dkv if override is None else override
+
+
 def _splash_runner(
     state: TPUNativeState,
     *,
@@ -205,12 +230,26 @@ def _splash_runner(
     head_dim: int,
     mask_array: np.ndarray,
     save_residuals: bool,
+    family: str | None = None,
 ):
+    block_q_dkv = _splash_tile(state.options, family)
     axis = state.options.manual_axis_name
-    manual = manual_v5e_mesh(state.mesh, axis)
-    shards = int(manual.size)
+    dp = state.options.attention_data_shards
+    if int(state.mesh.size) % dp:
+        raise ValueError("attention DP must divide the device mesh")
+    shards = int(state.mesh.size) // dp
+    if dp == 1:
+        manual = manual_v5e_mesh(state.mesh, axis)
+        data_axis = None
+    else:
+        from .tpu import axes_for_shard_count
+        manual = state.mesh
+        axis = axes_for_shard_count(manual, shards)
+        data_axis = axes_for_shard_count(manual, dp)
+        if axis == data_axis:
+            raise ValueError("attention CP and DP require distinct mesh axes")
     if seq_len % shards:
-        raise ValueError("Splash query length must divide evenly over all v5e chips")
+        raise ValueError("Splash query length must divide evenly over context shards")
     if (seq_len // shards) % 128:
         raise ValueError(
             f"TPU Splash needs 128-row Q tiles per shard; got {seq_len // shards}"
@@ -219,6 +258,7 @@ def _splash_runner(
     cache_key = (
         id(state.mesh),
         axis,
+        data_axis,
         seq_len,
         kv_len,
         n_heads,
@@ -226,6 +266,8 @@ def _splash_runner(
         hash(mask_array.tobytes()),
         save_residuals,
         state.options.splash_interpret,
+        state.options.splash_batch_mode,
+        block_q_dkv,
     )
     cached = _SPLASH_RUNNER_CACHE.get(cache_key)
     if cached is not None:
@@ -240,13 +282,16 @@ def _splash_runner(
         q_seq_shards=shards,
         save_residuals=save_residuals,
         interpret=state.options.splash_interpret,
+        **({"block_sizes": replace(splash.BlockSizes.get_default(),
+                                  block_q_dkv=block_q_dkv)}
+           if block_q_dkv is not None else {}),
     )
     kernel_spec = kernel.manual_sharding_spec(NamedSharding(manual, P(None, axis)))
-    q_spec = P(None, None, axis, None)
-    kv_spec = P()
-    q_segment_spec = P(None, axis)
-    kv_segment_spec = P()
-    lse_spec = P(None, None, axis)
+    q_spec = P(data_axis, None, axis, None)
+    kv_spec = P(data_axis, None, None)
+    q_segment_spec = P(data_axis, axis)
+    kv_segment_spec = P(data_axis, None)
+    lse_spec = P(data_axis, None, axis)
     out_specs = (q_spec, lse_spec) if save_residuals else q_spec
 
     @jax.shard_map(
@@ -264,26 +309,59 @@ def _splash_runner(
         check_vma=False,
     )
     def _mapped(kernel_arg, q_bhtd, k_btd, v_btd, q_segments, kv_segments, sinks):
-        scale = jnp.asarray(head_dim**-0.5, dtype=q_bhtd.dtype)
+        sink_dtype = sinks.dtype
 
-        def one(qh, k, v, q_seg, kv_seg):
-            result = kernel_arg(
-                qh * scale,
+        def raw_one(row_kernel, qh, k, v, row_sinks, q_seg, kv_seg):
+            result = row_kernel(
+                qh * jnp.asarray(head_dim**-0.5, dtype=qh.dtype),
                 k,
                 v,
                 segment_ids=splash.SegmentIds(q=q_seg, kv=kv_seg),
-                sinks=sinks,
+                sinks=row_sinks,
             )
             if save_residuals:
                 out, (lse,) = result
                 return out, lse
             return result
 
-        return jax.vmap(one)(q_bhtd, k_btd, v_btd, q_segments, kv_segments)
+        # JAX 0.10.2 Splash returns dsinks in the attention output dtype (BF16),
+        # even for FP32 sink inputs. A scan transpose must accumulate it into an
+        # FP32 carry and rejects the mismatched type. Normalize the cotangent at
+        # the custom-VJP boundary, before scan/vmap perform their reductions.
+        # Forward sink values and the Splash kernel are unchanged. Apply this to
+        # both schedules so the experiment uses the same derivative contract.
+        @jax.custom_vjp
+        def typed_one(*args):
+            return raw_one(*args)
 
-    def apply(q, kv, q_segments, kv_segments, sinks):
+        def typed_fwd(*args):
+            result, pullback = jax.vjp(raw_one, *args)
+            return result, pullback
+
+        def typed_bwd(pullback, cotangent):
+            grads = list(pullback(cotangent))
+            grads[4] = grads[4].astype(sink_dtype)
+            return tuple(grads)
+
+        typed_one.defvjp(typed_fwd, typed_bwd)
+
+        def one(qh, k, v, q_seg, kv_seg):
+            # Pass the kernel pytree explicitly: closing over its traced mask
+            # arrays can leak tracers when the full model is rematerialized.
+            return typed_one(kernel_arg, qh, k, v, sinks, q_seg, kv_seg)
+
+        inputs = (q_bhtd, k_btd, v_btd, q_segments, kv_segments)
+        if state.options.splash_batch_mode == "sequential":
+            return jax.lax.map(lambda xs: one(*xs), inputs)
+        return jax.vmap(one)(*inputs)
+
+    def apply(q, kv, q_segments, kv_segments, sinks, *, value=None):
+        if q.shape[0] % dp:
+            raise ValueError("Splash batch rows must be divisible by attention DP")
         q_bhtd = jnp.swapaxes(q, 1, 2)
-        result = _mapped(kernel, q_bhtd, kv, kv, q_segments, kv_segments, sinks)
+        # Production uses tied K/V. The replay can also check their separate VJPs.
+        result = _mapped(kernel, q_bhtd, kv, kv if value is None else value,
+                         q_segments, kv_segments, sinks)
         if save_residuals:
             out_bhtd, lse_bht = result
             return jnp.swapaxes(out_bhtd, 1, 2), jnp.swapaxes(lse_bht, 1, 2)
@@ -345,6 +423,7 @@ def _combined_splash_attention(
         head_dim=int(q.shape[-1]),
         mask_array=mask,
         save_residuals=False,
+        family="local" if global_state is None else "compressed" if compression_ratio > 1 else "global",
     )
     out = runner(q, kv, segment_ids, kv_segments, sinks)
 
@@ -570,6 +649,13 @@ def compile_pretrain_step_native(
     from .tpu import compile_pretrain_step as compile_reference_step
 
     options = TPUNativeConfig() if native_config is None else native_config
+    pc = config.parallelism
+    if options.use_splash_attention:
+        if pc.attention_head_shard != 1:
+            raise ValueError("native Splash currently supports attention_head_shard=1")
+        if pc.attention_context_shard * pc.attention_data_shard != int(mesh.size):
+            raise ValueError("native attention requires CP * DP = mesh size")
+    options = replace(options, attention_data_shards=pc.attention_data_shard)
     install_model_dispatch()
     options = replace(options, need_teacher_lse=bool(include_indexer))
     effective_config = config

@@ -333,6 +333,7 @@ def apply_model(
         if config.remat.policy == "block":
             block_forward = jax.checkpoint(block_forward)
 
+        block_forward = jax.named_call(block_forward, name=f"backbone_layer_{spec.layer_id}")
         streams, incoming_pre, state, aux = block_forward(
             streams,
             incoming_pre,
