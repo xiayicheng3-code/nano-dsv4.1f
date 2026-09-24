@@ -66,7 +66,7 @@ def test_compact_sampling_preserves_masks_and_nested_batches(corpus, tmp_path):
         for key in data.KEYS:
             np.testing.assert_array_equal(small[key].reshape(3, 4, 8192),
                                           large[key].reshape(3, 8, 8192)[:, :4])
-        np.testing.assert_array_equal(small["segment_ids"][:, ::2], small["segment_ids"][:, 1::2])
+        np.testing.assert_array_equal(small["segment_ids"][:, 0::2], small["segment_ids"][:, 1::2])
         assert small["token_mask"].sum() == 12 * 8
         assert not small["token_mask"][:, 5].any()
         assert (small["segment_ids"][:, 6:] == 1).all()
@@ -105,14 +105,21 @@ def test_routing_does_not_hide_layer_skew_or_count_padding_as_real():
     assert result["real_tokens"]["chip_loads_by_layer"] == [[4, 0], [0, 4]]
 
 
-def test_profile_notebook_valid_and_bootstrap_canonical():
+def test_archived_profile_notebook_is_valid_and_preserves_canonical_bootstrap():
     import nbformat
-    nb = nbformat.read(ROOT / "notebooks/nano_dsv41f_pretrain_profile.ipynb", as_version=4)
+    archived = ROOT / "notebooks/archive/nano_dsv41f_pretrain_profile.ipynb"
+    nb = nbformat.read(archived, as_version=4)
     nbformat.validate(nb)
     code = [c.source for c in nb.cells if c.cell_type == "code"]
     assert (ROOT / "scripts/kaggle_bootstrap.py").read_text() in code
     for source in code:
         ast.parse(source)
+
+    notice = nbformat.read(ROOT / "notebooks/nano_dsv41f_pretrain_profile.ipynb", as_version=4)
+    nbformat.validate(notice)
+    assert not [cell for cell in notice.cells if cell.cell_type == "code"]
+    text = "\n".join(cell.source for cell in notice.cells if cell.cell_type == "markdown")
+    assert "Archived" in text and "final_attention_tuning" in text
 
 
 def test_worker_cycles_bank_and_exports_separate_traces_on_cpu(monkeypatch, tmp_path):
