@@ -1,4 +1,13 @@
-"""Shared 8K pretraining recipe: stress runs and training must use this factory."""
+"""Shared 8K TPU benchmark recipe.
+
+This factory defines synthetic stress/profiling workloads, not the production
+pretraining budget. The canonical training plan is token-budgeted pretrain ->
+mid-train -> SFT (see ``training_stages`` / ``docs/training_stages.md``).
+The default 10k-step coordinate system below is retained only so historical TPU
+benchmarks keep their original LR/indexer phase locations; production launchers
+must choose their stage step budget deliberately from the training token budget
+and effective batch.
+"""
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -11,9 +20,12 @@ from .tpu_native import TPUNativeConfig
 EXPERT_PROFILES = {"baseline": (8, 768, 2), "narrow24": (24, 256, 2), "narrow48": (48, 128, 4)}
 
 
-def pretrain_recipe(*, profile="baseline", cp=8, dp=1, experts=None, width=None, top_k=None):
+def pretrain_recipe(*, profile="baseline", cp=8, dp=1, experts=None, width=None, top_k=None,
+                    benchmark_total_steps=10_000):
     if cp * dp != 8 or (cp, dp) not in ((8, 1), (4, 2), (2, 4)):
         raise ValueError("supported v5e-8 attention layouts: CP8/DP1, CP4/DP2, CP2/DP4")
+    if benchmark_total_steps <= 0:
+        raise ValueError("benchmark_total_steps must be positive")
     e, f, k = EXPERT_PROFILES[profile]
     config = apply_tokenizer_contract(ModelConfig())
     config = replace(
@@ -26,7 +38,7 @@ def pretrain_recipe(*, profile="baseline", cp=8, dp=1, experts=None, width=None,
     )
     if config.d_ff % 128:
         raise ValueError("stress recipe expert width must be a multiple of 128")
-    train = TrainConfig(seq_len=8192)
+    train = TrainConfig(total_steps=benchmark_total_steps, seq_len=8192)
     native = TPUNativeConfig(moe_ragged_implementation="mosaic", attention_data_shards=dp)
     return config, train, native
 
