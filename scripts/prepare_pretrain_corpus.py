@@ -152,14 +152,15 @@ def restore_rows(tokens, lengths, offsets, *, alignment=2):
     return {"input_ids": ids, "segment_ids": segments, "token_mask": mask}
 
 
-def iter_pretrain_batches(root, *, split="train", batch_rows=1, seed=1701, drop_last=True):
+def iter_pretrain_batches(root, *, split="train", batch_rows=1, seed=1701, drop_last=True,
+                          start_batch=0):
     """One pass, shuffled shards/rows, bounded memory; no implicit epoch repetition.
 
     Concatenates the tail of one shard with the next, so drop_last loses at most
     batch_rows-1 rows per pass, rather than per shard. Save seed and consumed batch
     index with the model checkpoint to reproduce/resume the training input order.
     """
-    if split not in ("train", "validation") or batch_rows <= 0:
+    if split not in ("train", "validation") or batch_rows <= 0 or start_batch < 0:
         raise ValueError("invalid split or batch size")
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text())
@@ -173,10 +174,18 @@ def iter_pretrain_batches(root, *, split="train", batch_rows=1, seed=1701, drop_
     rng = np.random.default_rng(seed)
     rng.shuffle(shards)
     pending = []
+    skip_rows = start_batch * batch_rows
     for directory, shard in shards:
+        # Advance the same RNG for skipped shards without opening/decompressing rows.
+        order = rng.permutation(shard["rows"])
+        if skip_rows >= len(order):
+            skip_rows -= len(order)
+            continue
+        order = order[skip_rows:]
+        skip_rows = 0
         arrays = {key: np.load(directory / info["file"], mmap_mode="r", allow_pickle=False)
                   for key, info in shard["files"].items()}
-        for index in rng.permutation(shard["rows"]):
+        for index in order:
             lo, hi = arrays["offsets"][index:index + 2]
             pending.append((arrays["tokens"][index].copy(), arrays["lengths"][lo:hi].copy()))
             if len(pending) == batch_rows:

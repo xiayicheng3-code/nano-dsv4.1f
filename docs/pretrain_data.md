@@ -49,6 +49,10 @@ The loader reconstructs segment IDs and token masks from these small lengths.
 It reads token arrays through NumPy memory maps and shuffles shards and rows.
 Full-length segment/mask arrays exist only for the current host training batch.
 
+The production notebook uses **2.4B** non-padding tokens from this corpus and
+reserves **600M** of the combined 3B experiment budget for mid-training. Corpus
+size and the first run's consumption budget are separate. See [the run guide](pretrain_run.md).
+
 ## Reproducibility and interruption
 
 `build_plan.json` freezes the source revision, file order, tokenizer SHA-256,
@@ -91,7 +95,8 @@ for batch in iter_pretrain_batches(corpus_dir, batch_rows=global_microbatch_rows
 ```
 
 Save the data seed and number of consumed batches alongside model checkpoints;
-recreate the iterator and skip that many batches to resume the same input order.
+pass `start_batch=consumed_batches` to resume the same input order without
+opening token arrays for preceding shards.
 There is no implicit repetition. `drop_last=True` drops at most one incomplete
 batch per dataset pass; `drop_last=False` retains it for evaluation or inspection.
 

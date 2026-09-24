@@ -9,9 +9,10 @@ from .corpus_curriculum import PhaseSpec
 class TrainingStageSpec:
     """Repository-level training stage semantics.
 
-    Stage budgets are intentionally independent. They are not fractions of one shared
-    optimizer-step schedule: pretraining is token-budgeted, while mid-training and SFT
-    can choose their own step/token budgets after the preceding checkpoint exists.
+    Stage semantics do not fix budgets or optimizer schedules. The current Kaggle
+    experiment allocates 2.4B/0.6B tokens to pretrain/midtrain with a continuous
+    optimizer schedule; SFT is separate. Other experiments may choose independent
+    budgets without changing these data and supervision contracts.
     """
 
     name: str
