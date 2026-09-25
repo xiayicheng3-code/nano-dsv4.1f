@@ -1,6 +1,12 @@
-import torch
+import pytest
 
-from nano_dsv41f.chat_protocol import (
+# These tests belong to the optional CPU/API surface. The ordinary JAX-only job should
+# collect the repository without pulling in Torch or deepseek-recipe; the dedicated
+# cpu-inference job installs both extras and executes this module fully.
+torch = pytest.importorskip("torch")
+pytest.importorskip("deepseek_recipe")
+
+from nano_dsv41f.chat_protocol import (  # noqa: E402
     ASSISTANT_TOKEN,
     BOS_TOKEN,
     EOS_TOKEN_ID,
