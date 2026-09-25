@@ -9,25 +9,14 @@ from .mhc_engram import ngram_hash_ids
 from .rope_ops import linear
 
 
-def apply_engram(
+def _inject_engram(
     model: Any,
     streams: torch.Tensor,
-    input_ids: torch.Tensor,
-    segment_ids: torch.Tensor,
+    hashes: torch.Tensor,
     layer_id: int,
-    token_mask: torch.Tensor | None,
+    token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    ec = model.config.engram
     prefix = f"blocks.{layer_id}.engram"
-    hashes = ngram_hash_ids(
-        input_ids,
-        segment_ids,
-        table_size=ec.table_size,
-        max_ngram_size=ec.max_ngram_size,
-        n_hash_heads=ec.n_hash_heads,
-        pad_token_id=ec.pad_token_id,
-        seed=layer_id * 97,
-    )
     looked_up = model._w(f"{prefix}.table")[hashes]
     flat = looked_up.reshape(*looked_up.shape[:-2], -1)
     kv = linear(flat, model._w(f"{prefix}.wkv"))
@@ -66,6 +55,54 @@ def apply_engram(
         gate.to(streams.dtype).unsqueeze(-1)
         * value.to(streams.dtype).unsqueeze(-2)
     )
+
+
+def apply_engram(
+    model: Any,
+    streams: torch.Tensor,
+    input_ids: torch.Tensor,
+    segment_ids: torch.Tensor,
+    layer_id: int,
+    token_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    ec = model.config.engram
+    hashes = ngram_hash_ids(
+        input_ids,
+        segment_ids,
+        table_size=ec.table_size,
+        max_ngram_size=ec.max_ngram_size,
+        n_hash_heads=ec.n_hash_heads,
+        pad_token_id=ec.pad_token_id,
+        seed=layer_id * 97,
+    )
+    return _inject_engram(
+        model, streams, hashes, layer_id, token_mask=token_mask
+    )
+
+
+def apply_engram_step(
+    model: Any,
+    streams: torch.Tensor,
+    input_ids_history: torch.Tensor,
+    segment_ids_history: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Inject Engram memory for only the newest autoregressive token.
+
+    Hashing reads the short token history so n-grams remain exactly packed-sequence safe,
+    while the table lookup and gate are evaluated only for the current decode row.
+    """
+    ec = model.config.engram
+    hashes = ngram_hash_ids(
+        input_ids_history,
+        segment_ids_history,
+        table_size=ec.table_size,
+        max_ngram_size=ec.max_ngram_size,
+        n_hash_heads=ec.n_hash_heads,
+        pad_token_id=ec.pad_token_id,
+        seed=layer_id * 97,
+    )[..., -1:, :]
+    return _inject_engram(model, streams, hashes, layer_id)
 
 
 def apply_moe(model: Any, x: torch.Tensor, layer_id: int) -> torch.Tensor:
