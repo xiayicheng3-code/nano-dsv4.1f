@@ -219,7 +219,13 @@ class NanoDeepSeekProtocolBackend:
             sparse_retrieval=True,
         )
         generated = output[0, input_ids.shape[1] :].detach().cpu().tolist()
-        finish = "stop" if generated and generated[-1] == EOS_TOKEN_ID else "length"
+        stopped = bool(generated and generated[-1] == EOS_TOKEN_ID)
+        finish = "stop" if stopped else "length"
+        # The generation engine uses EOS as its stop condition; the protocol parser should
+        # receive only assistant-output tokens. This matches DeepSeek's decode demo, which
+        # truncates at the first end-of-sentence marker before building the API response.
+        if stopped:
+            generated = generated[:-1]
         return generated, len(prompt_ids), finish
 
     def complete_raw(
