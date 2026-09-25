@@ -21,7 +21,18 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: Apply source-quality changes
-        run: python scripts/_patch_sft_sources_temp.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/_patch_sft_sources_temp.py')
+          text = p.read_text()
+          old = 'pattern, dedent(new_body).strip() + "\\n\\n", text, count=1, flags=re.S'
+          new = 'pattern, lambda _: dedent(new_body).strip() + "\\n\\n", text, count=1, flags=re.S'
+          if old not in text:
+              raise SystemExit('temporary patch helper replacement target not found')
+          p.write_text(text.replace(old, new, 1))
+          PY
+          python scripts/_patch_sft_sources_temp.py
       - name: Install test dependencies
         run: pip install -e '.[dev]'
       - name: Validate patched source selection
