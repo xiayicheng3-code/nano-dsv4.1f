@@ -93,14 +93,14 @@ Packed ratio-2 decode requires segment boundaries to fall on completed compressi
 
 ## DeepSeek V4.1 API protocols
 
-DeepSeek V4.1 does not use a simple local Jinja chat template as its authoritative protocol definition. The CPU serving layer therefore uses the maintained `deepseek-recipe` package to normalize requests, render V4.1 prompts, and parse generated thinking/tool syntax back into the requested response format.
+DeepSeek V4.1 does not use a simple local Jinja chat template as its authoritative protocol definition. The CPU serving layer therefore uses the maintained `deepseek-recipe` package to normalize requests, render/encode V4.1 prompts, and parse generated token IDs plus thinking/tool syntax back into the requested response format.
 
 `NanoDeepSeekProtocolBackend` exposes four text-generation endpoint families:
 
 - `POST /v1/completions` — classic raw-prompt completions; **no chat template is applied**;
-- `POST /v1/chat/completions` — OpenAI-style Chat Completions rendered as DeepSeek V4.1;
-- `POST /v1/responses` — OpenAI Responses requests rendered as DeepSeek V4.1;
-- `POST /v1/messages` — Anthropic Messages requests rendered as DeepSeek V4.1.
+- `POST /v1/chat/completions` — OpenAI-style Chat Completions encoded as DeepSeek V4.1;
+- `POST /v1/responses` — OpenAI Responses requests encoded as DeepSeek V4.1;
+- `POST /v1/messages` — Anthropic Messages requests encoded as DeepSeek V4.1.
 
 The HTTP app also exposes `GET /v1/models` and `GET /health`.
 
@@ -117,13 +117,13 @@ backend = NanoDeepSeekProtocolBackend.from_pretrained(
 app = create_app(backend)
 ```
 
-The correctness-first HTTP adapter currently returns complete responses. Token-by-token HTTP streaming is deliberately left for the vLLM scheduler integration, while the protocol rendering/parsing itself is already the DeepSeek V4.1 implementation rather than an approximation.
+The correctness-first HTTP adapter currently returns complete responses. Token-by-token HTTP streaming is deliberately left for the vLLM scheduler integration, while the protocol rendering/encoding/parsing itself is already the DeepSeek V4.1 implementation rather than an approximation.
 
 ## Public Kaggle chat notebook
 
-`notebooks/nano_dsv41f_cpu_chat.ipynb` is the visitor-facing demo, separate from the training notebook. Before publishing it on Kaggle, attach an input containing the exported checkpoint and frozen tokenizer. A visitor can then use Kaggle's normal **Copy & Edit** flow, start a CPU session, choose **Run All**, and use the notebook's persistent `chat()` helper for multi-turn conversation.
+`notebooks/nano_dsv41f_cpu_chat.ipynb` is the visitor-facing demo, separate from the training notebook. Before publishing it on Kaggle, attach an input containing the exported checkpoint and frozen tokenizer. A visitor can then use Kaggle's normal **Copy & Edit** flow, start a CPU session, choose **Run All**, and chat in an in-notebook `ipywidgets` message box with **Send** and **Reset** controls.
 
-The notebook intentionally uses ordinary executable cells rather than relying on notebook widgets. It also includes an optional local FastAPI launch cell for endpoint testing inside the Kaggle runtime.
+The widget keeps the same multi-turn `chat()` history used by direct Python calls and exposes thinking mode, DeepSeek's named reasoning-effort levels (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`), and max output tokens. No public tunnel or separate web service is needed for the visitor chat surface. The notebook also includes an optional local FastAPI launch cell for endpoint testing inside the Kaggle runtime.
 
 Regenerate it with:
 
