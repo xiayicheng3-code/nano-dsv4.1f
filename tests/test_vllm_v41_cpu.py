@@ -12,6 +12,7 @@ from nano_dsv41f.config import (
     EngramConfig,
     IndexerConfig,
     ModelConfig,
+    ParallelismConfig,
     RopeConfig,
 )
 from nano_dsv41f.hf_export import flatten_parameter_tree
@@ -67,6 +68,7 @@ def tiny_config() -> ModelConfig:
             head_dim=4,
         ),
         dspark=DSparkConfig(enabled=False),
+        parallelism=ParallelismConfig(expert_shard=4),
     )
 
 
