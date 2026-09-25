@@ -13,6 +13,8 @@ def test_deepseek_recipe_renders_chat_completions():
         {
             "model": "nano-dsv4.1f",
             "messages": [{"role": "user", "content": "Hello"}],
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
             "stream": False,
             "max_tokens": 32,
         },
@@ -22,6 +24,7 @@ def test_deepseek_recipe_renders_chat_completions():
     assert ASSISTANT_TOKEN in prepared.prompt
     assert "Hello" in prepared.prompt
     assert prepared.inference_options.max_tokens == 32
+    assert prepared.conversation_request.conversation.thinking_mode is True
 
 
 def test_deepseek_recipe_renders_responses_api():
