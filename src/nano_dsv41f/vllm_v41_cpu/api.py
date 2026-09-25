@@ -99,6 +99,14 @@ def prepare_protocol_request(
         body = body.encode("utf-8")
 
     request = request_types[protocol](body)
+    # DeepSeek protocol request objects are single-consumption: inspect request-level
+    # metadata before convert(), matching the maintained deepseek-recipe server example.
+    include_usage = (
+        bool(request.include_usage()) if protocol == "chat_completions" else False
+    )
+    custom_tool_names = (
+        frozenset(request.custom_tool_names()) if protocol == "responses" else frozenset()
+    )
     converted = request.convert(recipe["ConversionOptions"]())
     rendered = recipe["DeepseekV41Encoding"]().render_conversation(
         converted.conversation
@@ -108,12 +116,6 @@ def prepare_protocol_request(
             "nano-dsv4.1f CPU serving is text-only; V4.1 image prompt rendering is "
             "recognized but no vision encoder is implemented"
         )
-    include_usage = (
-        bool(request.include_usage()) if protocol == "chat_completions" else False
-    )
-    custom_tool_names = (
-        frozenset(request.custom_tool_names()) if protocol == "responses" else frozenset()
-    )
     return PreparedProtocolRequest(
         protocol=protocol,
         request=request,
