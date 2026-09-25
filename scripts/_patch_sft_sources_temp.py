@@ -1,0 +1,538 @@
+from __future__ import annotations
+
+from pathlib import Path
+import re
+from textwrap import dedent
+
+
+def replace_once(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{path}: expected exactly one literal match, found {count}")
+    p.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def replace_function(path: str, name: str, next_name: str, new_body: str) -> None:
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    pattern = rf"def {name}\(.*?(?=\ndef {next_name}\()"
+    updated, count = re.subn(
+        pattern, dedent(new_body).strip() + "\n\n", text, count=1, flags=re.S
+    )
+    if count != 1:
+        raise RuntimeError(f"{path}: failed replacing function {name}; matches={count}")
+    p.write_text(updated, encoding="utf-8")
+
+
+OPENR1_REASONING = r'''
+def adapt_openr1_math(source: ReasoningSource, row: dict[str, Any]) -> dict[str, Any] | None:
+    user = row.get("problem")
+    if not isinstance(user, str) or not user.strip():
+        messages = row.get("messages")
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            user = messages[0].get("content")
+    if not isinstance(user, str) or not user.strip():
+        return None
+
+    generations = row.get("generations")
+    complete = row.get("is_reasoning_complete")
+    math_verified = row.get("correctness_math_verify")
+    llama_verified = row.get("correctness_llama")
+    if not isinstance(generations, list) or not isinstance(complete, list):
+        return None
+
+    for i, generation in enumerate(generations):
+        if i >= len(complete) or complete[i] is not True:
+            continue
+        math_ok = (
+            isinstance(math_verified, list)
+            and i < len(math_verified)
+            and math_verified[i] is True
+        )
+        llama_ok = (
+            isinstance(llama_verified, list)
+            and i < len(llama_verified)
+            and llama_verified[i] is True
+        )
+        if not (math_ok or llama_ok):
+            continue
+        if not isinstance(generation, str):
+            continue
+        split = split_think_content(generation)
+        if split is None:
+            continue
+        reasoning, final = split
+        return _record(
+            source=source,
+            user=user,
+            reasoning=reasoning,
+            final=final,
+            metadata={
+                "uuid": row.get("uuid"),
+                "upstream_source": row.get("source"),
+                "problem_type": row.get("problem_type"),
+                "generation_index": i,
+                "reasoning_complete": True,
+                "math_verify": math_ok,
+                "llama_verify": llama_ok,
+            },
+        )
+    return None
+'''
+
+
+OPENR1_TRACE = r'''
+def adapt_openr1_math(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    user = row.get("problem")
+    if not isinstance(user, str) or not user.strip():
+        messages = row.get("messages")
+        if isinstance(messages, list) and messages and isinstance(messages[0], dict):
+            user = messages[0].get("content")
+    generations = row.get("generations")
+    complete = row.get("is_reasoning_complete")
+    math_verified = row.get("correctness_math_verify")
+    llama_verified = row.get("correctness_llama")
+    if (
+        not isinstance(user, str)
+        or not isinstance(generations, list)
+        or not isinstance(complete, list)
+    ):
+        return None
+    for i, generation in enumerate(generations):
+        if i >= len(complete) or complete[i] is not True:
+            continue
+        math_ok = (
+            isinstance(math_verified, list)
+            and i < len(math_verified)
+            and math_verified[i] is True
+        )
+        llama_ok = (
+            isinstance(llama_verified, list)
+            and i < len(llama_verified)
+            and llama_verified[i] is True
+        )
+        if not (math_ok or llama_ok):
+            continue
+        if not isinstance(generation, str):
+            continue
+        split = _split_think(generation)
+        if split is None:
+            continue
+        reasoning, final = split
+        return _reasoning_case(
+            source,
+            row,
+            row_index,
+            user=user,
+            reasoning=reasoning,
+            final=final,
+            metadata={
+                "upstream_source": row.get("source"),
+                "problem_type": row.get("problem_type"),
+                "generation_index": i,
+                "reasoning_complete": True,
+                "math_verify": math_ok,
+                "llama_verify": llama_ok,
+            },
+        )
+    return None
+'''
+
+
+OFFICIAL_OPENSEEKER = r'''
+def adapt_openseeker(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    # Parse PolarSeeker/OpenSeeker-v1-Data directly. Upstream stores calls inside
+    # assistant XML and returns the corresponding tool outputs in the next user turn.
+    correctness = row.get("trajectory correctness", row.get("trajectory_correctness", ""))
+    if str(correctness).lower() != "correct":
+        return None
+    raw = row.get("trajectory")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, list) or len(raw) < 3:
+        return None
+
+    def blocks(text: str, tag: str) -> list[str]:
+        return [
+            value.strip()
+            for value in re.findall(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, flags=re.DOTALL)
+        ]
+
+    messages: list[dict[str, Any]] = []
+    pending_call_ids: list[str] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role", "")).lower()
+        content = str(item.get("content", ""))
+
+        if role == "system":
+            if not messages:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a deep-research assistant. Use the provided search and "
+                            "visit tools to gather evidence and synthesize an accurate answer."
+                        ),
+                    }
+                )
+            continue
+
+        if role == "user":
+            tool_responses = blocks(content, "tool_response")
+            if pending_call_ids:
+                if len(tool_responses) != len(pending_call_ids):
+                    return None
+                for call_id, response in zip(pending_call_ids, tool_responses):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": truncate_text(response, source.max_observation_chars),
+                        }
+                    )
+                pending_call_ids = []
+            elif tool_responses:
+                return None
+            elif content.strip():
+                messages.append({"role": "user", "content": content.strip()})
+            continue
+
+        if role != "assistant" or pending_call_ids:
+            return None
+
+        reasoning_blocks = blocks(content, "think")
+        if len(reasoning_blocks) != 1 or not reasoning_blocks[0]:
+            return None
+        reasoning = reasoning_blocks[0]
+        call_blocks = blocks(content, "tool_call")
+        answer_blocks = blocks(content, "answer")
+        if call_blocks and answer_blocks:
+            return None
+
+        if call_blocks:
+            tool_calls: list[dict[str, Any]] = []
+            for j, raw_call in enumerate(call_blocks):
+                try:
+                    payload = json.loads(raw_call)
+                except json.JSONDecodeError:
+                    return None
+                name = payload.get("name")
+                if name not in {"search", "visit"}:
+                    return None
+                call_id = f"search_{row_index}_{i}_{j}"
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": _json_arguments(
+                                payload.get("arguments", payload.get("parameters", {}))
+                            ),
+                        },
+                    }
+                )
+                pending_call_ids.append(call_id)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": reasoning,
+                    "tool_calls": tool_calls,
+                }
+            )
+            continue
+
+        if len(answer_blocks) != 1 or not answer_blocks[0]:
+            return None
+        messages.append(
+            {
+                "role": "assistant",
+                "reasoning_content": reasoning,
+                "content": answer_blocks[0],
+            }
+        )
+
+    if pending_call_ids:
+        return None
+    if not messages or messages[-1].get("role") != "assistant":
+        return None
+    if not str(messages[-1].get("content", "")).strip():
+        return None
+    try:
+        return normalize_agent_trace(
+            {
+                "messages": messages,
+                "tools": _openseeker_tools(),
+                "thinking_mode": "thinking",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "trajectory_correctness": "Correct",
+                    "number_of_tool_calls": row.get("number of tool calls"),
+                    "expected_answer": row.get("answer"),
+                },
+            },
+            default_reasoning_effort=75,
+            policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
+        )
+    except Exception:
+        return None
+'''
+
+
+def main() -> None:
+    replace_once(
+        "scripts/prepare_reasoning_sft.py",
+        '        split="hybrid",\n',
+        '        split="verified_90k",\n',
+    )
+    replace_once(
+        "scripts/prepare_reasoning_sft.py",
+        '            "Fully synthetic competitive-programming SFT data; queries are synthetic and "\n            "responses are generated by DeepSeek-R1-0528 / Qwen3-235B-A22B-Thinking-2507."\n',
+        '            "Fully synthetic competitive-programming SFT data; use verified_90k, which "\n            "the upstream dataset describes as all verified high-quality solutions."\n',
+    )
+    replace_function(
+        "scripts/prepare_reasoning_sft.py",
+        "adapt_openr1_math",
+        "adapt_chimera_science",
+        OPENR1_REASONING,
+    )
+
+    replace_once(
+        "scripts/prepare_trace_corpus.py",
+        '        "hybrid",\n        0.25,\n        "xcoder",',
+        '        "verified_90k",\n        0.25,\n        "xcoder",',
+    )
+    replace_once(
+        "scripts/prepare_trace_corpus.py",
+        '        provenance="Fully synthetic competitive-programming reasoning SFT data.",\n',
+        '        provenance=(\n            "Fully synthetic competitive-programming reasoning SFT data; use verified_90k, "\n            "which upstream describes as all verified high-quality solutions."\n        ),\n',
+    )
+    replace_once(
+        "scripts/prepare_trace_corpus.py",
+        '        "AmanPriyanshu/tool-reasoning-sft-RESEARCH-OpenSeeker-v1-Data", "train",\n        0.20, "openseeker", "mit", max_observation_chars=1400,\n',
+        '        "PolarSeeker/OpenSeeker-v1-Data", "train",\n        0.20, "openseeker", "mit", max_observation_chars=1400,\n        provenance=(\n            "Official OpenSeeker v1 trajectories; keep trajectory correctness=Correct and "\n            "convert the original compound tool format locally."\n        ),\n',
+    )
+    replace_function(
+        "scripts/prepare_trace_corpus.py",
+        "adapt_openr1_math",
+        "adapt_chimera_science",
+        OPENR1_TRACE,
+    )
+    replace_function(
+        "scripts/prepare_trace_corpus.py",
+        "adapt_openseeker",
+        "ADAPTERS",
+        OFFICIAL_OPENSEEKER,
+    )
+
+    for path in ("docs/corpus_8k_agent_data.md", "docs/corpus_curriculum.md"):
+        p = Path(path)
+        text = p.read_text(encoding="utf-8")
+        text = text.replace("X-Coder-SFT-376k `hybrid`", "X-Coder-SFT-376k `verified_90k`")
+        text = text.replace(
+            "`IIGroup/X-Coder-SFT-376k`, `hybrid`",
+            "`IIGroup/X-Coder-SFT-376k`, `verified_90k`",
+        )
+        text = text.replace(
+            "complete generation; reject a generation explicitly marked incorrect by Math Verify",
+            "complete generation; require Math Verify or Llama judge to be explicitly correct",
+        )
+        text = text.replace(
+            "require a complete explicit `<think>...</think>` response",
+            "upstream verified solution with a complete explicit `<think>...</think>` response",
+        )
+        text = text.replace(
+            "X-Coder describes its competitive-programming collection as fully synthetic.",
+            "X-Coder describes its competitive-programming collection as fully synthetic; the selected `verified_90k` split contains only upstream-verified solutions.",
+        )
+        text = text.replace(
+            "X-Coder describes its code tasks as fully synthetic and uses DeepSeek-R1-0528 / Qwen3 thinking models for solutions.",
+            "X-Coder describes its code tasks as fully synthetic and uses DeepSeek-R1-0528 / Qwen3 thinking models for solutions; the selected `verified_90k` split is the upstream verified subset.",
+        )
+        text = text.replace(
+            "| OpenSeeker v1 cleaned | 20% | `trajectory_correctness=Correct` only | long-horizon search/visit research |",
+            "| Official OpenSeeker v1 | 20% | `trajectory correctness=Correct` only | long-horizon search/visit research |",
+        )
+        text = text.replace(
+            "Search/visit trajectories are converted to canonical tool-call IDs/results.",
+            "Official OpenSeeker search/visit trajectories are converted directly from the original compound tool format to canonical tool-call IDs/results.",
+        )
+        p.write_text(text, encoding="utf-8")
+
+    doc = Path("docs/corpus_8k_agent_data.md")
+    text = doc.read_text(encoding="utf-8")
+    marker = "Default target: 8M accepted nano-tokenizer tokens.\n"
+    note = (
+        "Default target: 8M accepted nano-tokenizer tokens.\n\n"
+        "> **Target semantics.** The 4M reasoning / 8M agent values are corpus-construction "
+        "defaults for accepted rendered trace tokens, not a scaling-law-derived SFT budget. "
+        "Only assistant targets contribute SFT loss, so supervised-token counts are lower. "
+        "Revisit these defaults after final filtering using the generated manifest's actual "
+        "trace and supervised-token statistics.\n"
+    )
+    if marker not in text:
+        raise RuntimeError("could not find agent target documentation marker")
+    doc.write_text(text.replace(marker, note, 1), encoding="utf-8")
+
+    test = Path("tests/test_reasoning_sft_sources.py")
+    text = test.read_text(encoding="utf-8")
+    text = text.replace(
+        '    assert catalog["code"].dataset == "IIGroup/X-Coder-SFT-376k"\n',
+        '    assert catalog["code"].dataset == "IIGroup/X-Coder-SFT-376k"\n'
+        '    assert catalog["code"].split == "verified_90k"\n',
+        1,
+    )
+    start = text.index("def test_openr1_math_prefers_complete_verified_generation()")
+    end = text.index("\ndef test_chimera_science_requires_verified_science_subject()", start)
+    replacement = dedent(r'''
+        def test_openr1_math_requires_positive_upstream_verification() -> None:
+            source = reasoning_sft.SOURCE_CATALOG["math"]
+            row = {
+                "problem": "Compute 1 + 1.",
+                "uuid": "math-1",
+                "source": "unit-test",
+                "problem_type": "Algebra",
+                "generations": [
+                    "<think>unverified reasoning</think>\n2",
+                    "<think>math-verified reasoning</think>\n2",
+                    "<think>llama-verified reasoning</think>\n2",
+                ],
+                "is_reasoning_complete": [True, True, True],
+                "correctness_math_verify": [False, True, False],
+                "correctness_llama": [False, False, True],
+            }
+            case = reasoning_sft.adapt_openr1_math(source, row)
+            assert case is not None
+            assert case["messages"][1]["reasoning_content"] == "math-verified reasoning"
+            assert case["metadata"]["generation_index"] == 1
+            assert case["metadata"]["math_verify"] is True
+
+            llama_only = {**row, "correctness_math_verify": [False, False, False]}
+            case = reasoning_sft.adapt_openr1_math(source, llama_only)
+            assert case is not None
+            assert case["metadata"]["generation_index"] == 2
+            assert case["metadata"]["llama_verify"] is True
+
+            unverified = {
+                **row,
+                "correctness_math_verify": [False, False, False],
+                "correctness_llama": [False, False, False],
+            }
+            assert reasoning_sft.adapt_openr1_math(source, unverified) is None
+    ''').strip()
+    test.write_text(text[:start] + replacement + "\n\n" + text[end + 1 :], encoding="utf-8")
+
+    Path("tests/test_trace_source_selection.py").write_text(
+        dedent(r'''
+            from __future__ import annotations
+
+            import importlib.util
+            from pathlib import Path
+            import sys
+
+
+            SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "prepare_trace_corpus.py"
+            SPEC = importlib.util.spec_from_file_location("prepare_trace_corpus_source_tests", SCRIPT)
+            assert SPEC is not None and SPEC.loader is not None
+            trace_corpus = importlib.util.module_from_spec(SPEC)
+            sys.modules[SPEC.name] = trace_corpus
+            SPEC.loader.exec_module(trace_corpus)
+
+
+            def _source(sources, key: str):
+                return next(source for source in sources if source.key == key)
+
+
+            def test_trace_catalog_uses_verified_xcoder_and_official_openseeker() -> None:
+                xcoder = _source(trace_corpus.REASONING_SOURCES, "xcoder")
+                assert xcoder.dataset == "IIGroup/X-Coder-SFT-376k"
+                assert xcoder.split == "verified_90k"
+
+                openseeker = _source(trace_corpus.AGENT_SOURCES, "openseeker_correct")
+                assert openseeker.dataset == "PolarSeeker/OpenSeeker-v1-Data"
+                assert "AmanPriyanshu" not in openseeker.dataset
+
+
+            def test_trace_openr1_requires_positive_verifier() -> None:
+                source = _source(trace_corpus.REASONING_SOURCES, "openr1_math")
+                base = {
+                    "problem": "Compute 2 + 2.",
+                    "generations": ["<think>reason</think>\n4"],
+                    "is_reasoning_complete": [True],
+                }
+                assert trace_corpus.adapt_openr1_math(
+                    source,
+                    {**base, "correctness_math_verify": [False], "correctness_llama": [False]},
+                    0,
+                ) is None
+                case = trace_corpus.adapt_openr1_math(
+                    source,
+                    {**base, "correctness_math_verify": [False], "correctness_llama": [True]},
+                    0,
+                )
+                assert case is not None
+                assert case["metadata"]["llama_verify"] is True
+
+
+            def test_official_openseeker_trajectory_is_converted_directly() -> None:
+                source = _source(trace_corpus.AGENT_SOURCES, "openseeker_correct")
+                row = {
+                    "question": "Who wrote the example book?",
+                    "answer": "Ada Example",
+                    "number of tool calls": 1,
+                    "trajectory correctness": "Correct",
+                    "trajectory": [
+                        {"role": "system", "content": "tool schema here"},
+                        {"role": "user", "content": "Who wrote the example book?"},
+                        {
+                            "role": "assistant",
+                            "content": (
+                                '<think>I should search.</think>'
+                                '<tool_calls_begin><tool_call>{"name":"search","arguments":{"query":"example book author"}}</tool_call></tool_calls_end>'
+                            ),
+                        },
+                        {"role": "user", "content": "<tool_response>Ada Example wrote it.</tool_response>"},
+                        {
+                            "role": "assistant",
+                            "content": "<think>The source identifies the author.</think><answer>Ada Example</answer>",
+                        },
+                    ],
+                }
+                case = trace_corpus.adapt_openseeker(source, row, 7)
+                assert case is not None
+                assert case["metadata"]["dataset"] == "PolarSeeker/OpenSeeker-v1-Data"
+                assert case["metadata"]["trajectory_correctness"] == "Correct"
+                assert any(message.get("role") == "tool" for message in case["messages"])
+                assert case["messages"][-1]["content"] == "Ada Example"
+
+                assert trace_corpus.adapt_openseeker(
+                    source, {**row, "trajectory correctness": "Incorrect"}, 7
+                ) is None
+        ''').lstrip(),
+        encoding="utf-8",
+    )
+
+    production = (
+        Path("scripts/prepare_reasoning_sft.py").read_text(encoding="utf-8")
+        + Path("scripts/prepare_trace_corpus.py").read_text(encoding="utf-8")
+    )
+    assert "AmanPriyanshu/tool-reasoning-sft-RESEARCH-OpenSeeker-v1-Data" not in production
+    assert '"hybrid"' not in production
+
+
+if __name__ == "__main__":
+    main()
