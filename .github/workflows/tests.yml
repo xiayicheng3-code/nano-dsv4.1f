@@ -40,3 +40,21 @@ jobs:
           assert len(nb.cells) >= 4
           print(f'validated {path}: {len(nb.cells)} cells')
           PY
+
+  cpu-inference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install CPU Torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install project
+        run: pip install -e '.[dev,export]' 'jax==0.10.2' 'jaxlib==0.10.2'
+      - name: Test V4.1 CPU inference
+        env:
+          JAX_PLATFORMS: cpu
+        run: pytest -q tests/test_vllm_v41_cpu.py
