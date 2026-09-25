@@ -15,7 +15,7 @@ from nano_dsv41f.config import (
     ParallelismConfig,
     RopeConfig,
 )
-from nano_dsv41f.hf_export import flatten_parameter_tree
+from nano_dsv41f.hf_export import export_portable_checkpoint, flatten_parameter_tree
 from nano_dsv41f.model import apply_model, init_model
 
 
@@ -98,6 +98,26 @@ def test_dense_cpu_logits_match_jax_reference():
         rtol=3e-4,
         atol=3e-4,
     )
+
+
+def test_exported_checkpoint_loads_without_weight_renaming(tmp_path):
+    config = tiny_config()
+    params = init_model(jax.random.PRNGKey(9), config)
+    export_portable_checkpoint(params, tmp_path, config, max_position_embeddings=128)
+    cpu = NanoDeepseekV41CPU.from_pretrained(tmp_path, dtype=torch.float32)
+    ids = torch.tensor([[0, 4, 7, 11, 15, 3, 2, 1]], dtype=torch.long)
+    loaded_logits, _ = cpu.forward(
+        ids, compute_indexer=False, sparse_retrieval=False
+    )
+    direct = NanoDeepseekV41CPU(
+        config,
+        flatten_parameter_tree(params),
+        dtype=torch.float32,
+    )
+    direct_logits, _ = direct.forward(
+        ids, compute_indexer=False, sparse_retrieval=False
+    )
+    torch.testing.assert_close(loaded_logits, direct_logits, rtol=0.0, atol=0.0)
 
 
 def test_sparse_cpu_path_accepts_odd_prefix_and_reindexes():
