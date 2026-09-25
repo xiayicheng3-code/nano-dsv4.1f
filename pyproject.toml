@@ -20,6 +20,14 @@ export = ["safetensors>=0.6"]
 cpu = ["torch>=2.4", "safetensors>=0.6"]
 data = ["datasets>=3.0", "tokenizers>=0.21", "deepseek-recipe>=0.1", "kagglehub>=0.3"]
 interop = ["safetensors>=0.6", "tokenizers>=0.21", "deepseek-recipe>=0.1"]
+api = [
+  "torch>=2.4",
+  "safetensors>=0.6",
+  "tokenizers>=0.21",
+  "deepseek-recipe>=0.1",
+  "fastapi>=0.115",
+  "uvicorn>=0.32",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
