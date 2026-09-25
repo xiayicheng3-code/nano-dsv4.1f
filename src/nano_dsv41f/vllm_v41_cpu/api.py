@@ -52,6 +52,7 @@ def _recipe_types() -> dict[str, Any]:
             ResponsesRequest,
             ResponsesResponse,
             StreamProcessor,
+            Tokenizer,
         )
     except ImportError as exc:  # pragma: no cover - optional dependency guard
         raise RuntimeError(
@@ -70,6 +71,7 @@ def _recipe_types() -> dict[str, Any]:
         "InferenceFinishReason": InferenceFinishReason,
         "PromptUsage": PromptUsage,
         "StreamProcessor": StreamProcessor,
+        "Tokenizer": Tokenizer,
     }
 
 
@@ -77,11 +79,11 @@ def prepare_protocol_request(
     protocol: Protocol,
     body: bytes | str | dict[str, Any],
 ) -> PreparedProtocolRequest:
-    """Render one API request with DeepSeek's maintained V4.1 protocol implementation.
+    """Normalize and render one request using DeepSeek's maintained V4.1 protocol.
 
     V4.1 is deliberately not represented by a local Jinja template. Chat Completions,
-    Responses, and Anthropic Messages are normalized and rendered by `deepseek-recipe`,
-    which is also responsible for tool-result folding, reasoning effort, and DSML syntax.
+    Responses, and Anthropic Messages are normalized by `deepseek-recipe`, which owns
+    tool-result folding, reasoning effort, DSML syntax, and output parsing rules.
     """
     recipe = _recipe_types()
     request_types = {
@@ -123,20 +125,31 @@ def prepare_protocol_request(
 
 
 class NanoTokenizer:
-    """Thin wrapper around the frozen nano tokenizer used by protocol serving."""
+    """Frozen nano tokenizer with both raw and DeepSeek-protocol views."""
 
     def __init__(self, tokenizer_json: str | Path) -> None:
         try:
-            from tokenizers import Tokenizer
+            from tokenizers import Tokenizer as HFTokenizer
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError(
                 "CPU API serving needs `pip install 'nano-dsv41f[api]'`"
             ) from exc
         self.path = Path(tokenizer_json)
-        self.tokenizer = Tokenizer.from_file(str(self.path))
+        self.tokenizer = HFTokenizer.from_file(str(self.path))
+        recipe = _recipe_types()
+        self.recipe_tokenizer = recipe["Tokenizer"].from_file(str(self.path))
 
     def encode(self, text: str) -> list[int]:
+        """Encode a raw completion prompt without adding protocol markers."""
         return list(self.tokenizer.encode(text, add_special_tokens=False).ids)
+
+    def encode_conversation(self, conversation: Any) -> list[int]:
+        """Encode a structured V4.1 conversation through DeepSeek's own encoder."""
+        recipe = _recipe_types()
+        encoding = recipe["DeepseekV41Encoding"]().with_tokenizer(
+            self.recipe_tokenizer
+        )
+        return list(encoding.encode(conversation))
 
     def decode(self, token_ids: list[int] | torch.Tensor) -> str:
         if isinstance(token_ids, torch.Tensor):
@@ -182,17 +195,16 @@ class NanoDeepSeekProtocolBackend:
             model_name=model_name,
         )
 
-    def _generate_prompt(
+    def _generate_ids(
         self,
-        prompt: str,
+        prompt_ids: list[int],
         *,
         max_tokens: int | None,
         temperature: float | None,
         top_p: float | None,
-    ) -> tuple[str, int, int, str]:
-        prompt_ids = self.tokenizer.encode(prompt)
+    ) -> tuple[list[int], int, str]:
         if not prompt_ids:
-            raise ValueError("rendered prompt tokenized to an empty sequence")
+            raise ValueError("prompt tokenized to an empty sequence")
         input_ids = torch.tensor(
             [prompt_ids], dtype=torch.long, device=self.model.device
         )
@@ -204,10 +216,9 @@ class NanoDeepSeekProtocolBackend:
             top_p=0.95 if top_p is None else float(top_p),
             sparse_retrieval=True,
         )
-        generated = output[0, input_ids.shape[1] :]
-        text = self.tokenizer.decode(generated)
-        finish = "stop" if generated.numel() and int(generated[-1]) == EOS_TOKEN_ID else "length"
-        return text, len(prompt_ids), int(generated.numel()), finish
+        generated = output[0, input_ids.shape[1] :].detach().cpu().tolist()
+        finish = "stop" if generated and generated[-1] == EOS_TOKEN_ID else "length"
+        return generated, len(prompt_ids), finish
 
     def complete_raw(
         self,
@@ -217,15 +228,18 @@ class NanoDeepSeekProtocolBackend:
         temperature: float | None = None,
         top_p: float | None = None,
     ) -> dict[str, Any]:
-        """Classic Completion semantics: the caller supplies an already-rendered prompt."""
-        text, prompt_tokens, completion_tokens, finish = self._generate_prompt(
-            prompt,
+        """Classic Completion semantics: caller text is used as the raw model prompt."""
+        prompt_ids = self.tokenizer.encode(prompt)
+        generated, prompt_tokens, finish = self._generate_ids(
+            prompt_ids,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
         )
+        text = self.tokenizer.decode(generated)
         if text.endswith(EOS_TOKEN):
             text = text[: -len(EOS_TOKEN)]
+        completion_tokens = len(generated)
         return {
             "id": f"cmpl-{uuid4().hex}",
             "object": "text_completion",
@@ -253,13 +267,16 @@ class NanoDeepSeekProtocolBackend:
     ) -> tuple[PreparedProtocolRequest, str]:
         """Return a complete JSON response for Chat/Responses/Messages.
 
-        The DeepSeek parser, not this adapter, decides how generated thinking text and
-        DSML tool calls map back into the requested API protocol.
+        Both input tokenization and output token parsing stay inside `deepseek-recipe`.
+        That is important for V4.1 special tokens, thinking blocks, and DSML tool calls.
         """
         prepared = prepare_protocol_request(protocol, body)
         opts = prepared.inference_options
-        generated_text, prompt_tokens, completion_tokens, finish = self._generate_prompt(
-            prepared.prompt,
+        prompt_ids = self.tokenizer.encode_conversation(
+            prepared.conversation_request.conversation
+        )
+        generated, prompt_tokens, finish = self._generate_ids(
+            prompt_ids,
             max_tokens=opts.max_tokens,
             temperature=opts.temperature,
             top_p=opts.top_p,
@@ -281,7 +298,9 @@ class NanoDeepSeekProtocolBackend:
         elif protocol == "responses":
             generator = generator.with_custom_tool_names(prepared.custom_tool_names)
         processor = recipe["StreamProcessor"](
-            generator, prepared.conversation_request.parsing_options
+            generator,
+            prepared.conversation_request.parsing_options,
+            self.tokenizer.recipe_tokenizer,
         )
         response = response_type(response_id, model_name, int(time()), 0, 0)
         reason = (
@@ -293,17 +312,16 @@ class NanoDeepSeekProtocolBackend:
             recipe["InferenceChunk"].ready(
                 prompt_usage=recipe["PromptUsage"](prompt_tokens=prompt_tokens)
             ),
-            recipe["InferenceChunk"].text(
-                generated_text, content_tokens=completion_tokens
-            ),
+            *(recipe["InferenceChunk"].token(token_id) for token_id in generated),
             recipe["InferenceChunk"].finish(finish_reason=reason),
         ]
         try:
             for chunk in chunks:
                 for output in processor.push(chunk):
                     response.append(output)
-            for output in processor.finish():
-                response.append(output)
+            if not processor.finished:
+                for output in processor.finish():
+                    response.append(output)
             return prepared, response.to_json()
         finally:
             processor.close()
@@ -387,12 +405,10 @@ def create_app(backend: NanoDeepSeekProtocolBackend):
             _prepared, payload = backend.complete_protocol(protocol, body)
             return Response(payload, media_type="application/json")
         except Exception as exc:
-            # deepseek-recipe exposes structured conversion errors, but keeping this adapter
-            # dependency-light is preferable to importing its exception hierarchy at module load.
             status = int(getattr(exc, "status_code", 400))
-            body = getattr(exc, "body", None)
-            if body is not None:
-                return Response(body, status_code=status, media_type="application/json")
+            error_body = getattr(exc, "body", None)
+            if error_body is not None:
+                return Response(error_body, status_code=status, media_type="application/json")
             return JSONResponse(
                 status_code=status,
                 content={
