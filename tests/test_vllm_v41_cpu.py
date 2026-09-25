@@ -72,9 +72,19 @@ def tiny_config() -> ModelConfig:
     )
 
 
-def test_dense_cpu_logits_match_jax_reference_with_packing():
+def make_cpu(seed: int) -> tuple[ModelConfig, object, NanoDeepseekV41CPU]:
     config = tiny_config()
-    params = init_model(jax.random.PRNGKey(7), config)
+    params = init_model(jax.random.PRNGKey(seed), config)
+    cpu = NanoDeepseekV41CPU(
+        config,
+        flatten_parameter_tree(params),
+        dtype=torch.float32,
+    )
+    return config, params, cpu
+
+
+def test_dense_cpu_logits_match_jax_reference_with_packing():
+    config, params, cpu = make_cpu(7)
     input_ids = jnp.asarray(
         [[1, 5, 3, 8, 13, 21, 34, 2]], dtype=jnp.int32
     )
@@ -89,12 +99,6 @@ def test_dense_cpu_logits_match_jax_reference_with_packing():
         input_ids,
         segment_ids=segment_ids,
         compute_indexer=False,
-    )
-
-    cpu = NanoDeepseekV41CPU(
-        config,
-        flatten_parameter_tree(params),
-        dtype=torch.float32,
     )
     actual, _ = cpu.forward(
         torch.tensor(np.asarray(input_ids), dtype=torch.long),
@@ -131,13 +135,7 @@ def test_exported_checkpoint_loads_without_weight_renaming(tmp_path):
 
 
 def test_sparse_cpu_path_accepts_odd_prefix_and_reindexes():
-    config = tiny_config()
-    params = init_model(jax.random.PRNGKey(11), config)
-    cpu = NanoDeepseekV41CPU(
-        config,
-        flatten_parameter_tree(params),
-        dtype=torch.float32,
-    )
+    config, _, cpu = make_cpu(11)
     ids = torch.tensor(
         [[1, 2, 3, 4, 5, 6, 7, 8, 9]], dtype=torch.long
     )
@@ -146,6 +144,55 @@ def test_sparse_cpu_path_accepts_odd_prefix_and_reindexes():
     assert torch.isfinite(logits).all()
     assert aux["final_global_source_layer"] == 3
     assert aux["layers"][5]["retrieval_mask"] is not None
+
+
+def test_cached_dense_prefill_matches_full_prefix_with_packing():
+    _, _, cpu = make_cpu(13)
+    ids = torch.tensor([[1, 5, 3, 8, 13, 21, 34, 2]], dtype=torch.long)
+    segments = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.long)
+    full, _ = cpu.forward(
+        ids,
+        segment_ids=segments,
+        compute_indexer=False,
+        sparse_retrieval=False,
+    )
+    cached, cache = cpu.prefill_cache(
+        ids,
+        segment_ids=segments,
+        compute_indexer=False,
+        sparse_retrieval=False,
+    )
+    torch.testing.assert_close(cached, full, rtol=4e-4, atol=4e-4)
+    assert cache.length == ids.shape[1]
+    assert set(cache.owners) == {1, 3}
+
+
+def test_cached_sparse_prefill_matches_full_prefix():
+    _, _, cpu = make_cpu(17)
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9]], dtype=torch.long)
+    full, _ = cpu.forward(ids, sparse_retrieval=True)
+    cached, cache = cpu.prefill_cache(ids, sparse_retrieval=True)
+    torch.testing.assert_close(cached, full, rtol=5e-4, atol=5e-4)
+    assert cache.owners[1].pending_latent is not None
+    assert cache.owners[3].state.index_k is not None
+
+
+def test_cached_greedy_generation_matches_full_prefix_recompute():
+    _, _, cpu = make_cpu(19)
+    prompt = torch.tensor([[1, 7, 3, 9, 4, 12, 5, 2]], dtype=torch.long)
+    expected = prompt.clone()
+    for _ in range(3):
+        logits, _ = cpu.forward(expected, sparse_retrieval=True)
+        next_id = logits[:, -1].argmax(dim=-1, keepdim=True)
+        expected = torch.cat((expected, next_id), dim=-1)
+
+    actual = cpu.generate(
+        prompt,
+        max_new_tokens=3,
+        temperature=0.0,
+        sparse_retrieval=True,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_cpu_port_has_no_deepseek_v4_imports():
