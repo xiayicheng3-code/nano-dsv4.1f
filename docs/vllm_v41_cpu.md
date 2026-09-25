@@ -52,7 +52,24 @@ logits, aux = model.forward(
 
 `tests/test_vllm_v41_cpu.py` compares that dense CPU path directly with JAX logits from the same randomly initialized parameter tree.
 
-## Generation
+## Incremental cache and generation
+
+The CPU reference now has a real autoregressive cache rather than recomputing the prefix. It keeps independent persistent compressed-KV/indexer states for the context source layer (L1) and generation source layer (L3), per-layer local/SWA KV histories, and a causal pending token for ratio-2 compression.
+
+```python
+prefill_logits, cache = model.prefill_cache(
+    input_ids,
+    sparse_retrieval=True,
+)
+
+next_logits, cache, aux = model.forward_step(
+    torch.tensor([[23]]),
+    cache,
+    sparse_retrieval=True,
+)
+```
+
+Normal generation uses that cache automatically:
 
 ```python
 output_ids = model.generate(
@@ -62,10 +79,12 @@ output_ids = model.generate(
 )
 ```
 
-The initial generation path recomputes the full prefix for each token. That is intentional: it establishes an executable CPU reference before adding vLLM's paged-cache/scheduler integration.
+The cache is intentionally an ordinary Torch correctness structure rather than a page manager. Tests compare cached dense and sparse prefill against full-prefix execution and cached greedy generation against full-prefix recomputation.
+
+Packed ratio-2 decode requires segment boundaries to fall on completed compression groups, matching the packed training invariant; the runtime raises instead of compressing across a segment boundary.
 
 ## Current execution boundary
 
-This first CPU milestone is a semantic runtime, not yet a registered vLLM engine model. The next serving step is to wrap the validated operators in an out-of-tree `vllm.general_plugins` model and replace prefix recomputation with V4.1-aware paged SWA/compressed-KV/indexer caches.
+This CPU milestone is a cache-correct semantic runtime, not yet a registered vLLM engine model. The next serving step is to wrap these validated semantics in an out-of-tree `vllm.general_plugins` model and map the local/compressed/indexer cache state onto vLLM's scheduler and paged cache allocation.
 
-DSpark speculative decoding is also deferred until ordinary autoregressive decode is cache-correct. Quantization/QAT configuration remains checkpoint metadata, while this CPU reference executes the loaded tensors in the selected Torch dtype rather than reproducing production packed FP4/FP8 cache layouts.
+DSpark speculative decoding remains deferred until the ordinary vLLM cached path is integrated. Quantization/QAT configuration remains checkpoint metadata, while this CPU reference executes the loaded tensors in the selected Torch dtype rather than reproducing production packed FP4/FP8 cache layouts.
