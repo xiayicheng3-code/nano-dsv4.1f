@@ -89,13 +89,35 @@ def apply_engram_step(
 ) -> torch.Tensor:
     """Inject Engram memory for only the newest autoregressive token.
 
-    Hashing reads the short token history so n-grams remain exactly packed-sequence safe,
-    while the table lookup and gate are evaluated only for the current decode row.
+    A short decode prefix is left-padded to the maximum n-gram width. Padding segment IDs
+    are -1, so the synthetic history is rejected by the same packed-boundary comparison
+    used by full-sequence hashing. This exactly represents missing left context without
+    allowing an n-gram to cross a real segment boundary.
     """
     ec = model.config.engram
+    pad = max(ec.max_ngram_size - input_ids_history.shape[-1], 0)
+    if pad:
+        id_pad = torch.full(
+            (input_ids_history.shape[0], pad),
+            ec.pad_token_id,
+            dtype=input_ids_history.dtype,
+            device=input_ids_history.device,
+        )
+        segment_pad = torch.full(
+            (segment_ids_history.shape[0], pad),
+            -1,
+            dtype=segment_ids_history.dtype,
+            device=segment_ids_history.device,
+        )
+        hash_input_ids = torch.cat((id_pad, input_ids_history), dim=-1)
+        hash_segment_ids = torch.cat((segment_pad, segment_ids_history), dim=-1)
+    else:
+        hash_input_ids = input_ids_history
+        hash_segment_ids = segment_ids_history
+
     hashes = ngram_hash_ids(
-        input_ids_history,
-        segment_ids_history,
+        hash_input_ids,
+        hash_segment_ids,
         table_size=ec.table_size,
         max_ngram_size=ec.max_ngram_size,
         n_hash_heads=ec.n_hash_heads,
