@@ -53,8 +53,8 @@ jobs:
       - name: Install CPU Torch
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Install project
-        run: pip install -e '.[dev,export]' 'jax==0.10.2' 'jaxlib==0.10.2'
-      - name: Test V4.1 CPU inference
+        run: pip install -e '.[dev,export,api]' 'jax==0.10.2' 'jaxlib==0.10.2'
+      - name: Test V4.1 CPU inference and API protocol
         env:
           JAX_PLATFORMS: cpu
-        run: pytest -q tests/test_vllm_v41_cpu.py
+        run: pytest -q tests/test_vllm_v41_cpu.py tests/test_v41_api_protocol.py
