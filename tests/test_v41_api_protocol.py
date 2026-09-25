@@ -1,6 +1,9 @@
+import torch
+
 from nano_dsv41f.chat_protocol import (
     ASSISTANT_TOKEN,
     BOS_TOKEN,
+    EOS_TOKEN_ID,
     USER_TOKEN,
 )
 
@@ -61,6 +64,25 @@ def test_deepseek_recipe_renders_anthropic_messages():
     assert ASSISTANT_TOKEN in prepared.prompt
     assert "Hello from Messages" in prepared.prompt
     assert prepared.inference_options.max_tokens == 20
+
+
+def test_generation_eos_is_transport_stop_not_parser_text():
+    from nano_dsv41f.vllm_v41_cpu.api import NanoDeepSeekProtocolBackend
+
+    class StubModel:
+        device = torch.device("cpu")
+
+        def generate(self, input_ids, **_kwargs):
+            suffix = torch.tensor([[17, 23, EOS_TOKEN_ID]], dtype=torch.long)
+            return torch.cat((input_ids, suffix), dim=-1)
+
+    backend = NanoDeepSeekProtocolBackend(StubModel(), object())
+    generated, prompt_tokens, finish = backend._generate_ids(
+        [4, 5, 6], max_tokens=8, temperature=0.0, top_p=1.0
+    )
+    assert generated == [17, 23]
+    assert prompt_tokens == 3
+    assert finish == "stop"
 
 
 def test_cpu_http_app_exposes_major_endpoint_families():
