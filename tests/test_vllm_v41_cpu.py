@@ -72,14 +72,23 @@ def tiny_config() -> ModelConfig:
     )
 
 
-def test_dense_cpu_logits_match_jax_reference():
+def test_dense_cpu_logits_match_jax_reference_with_packing():
     config = tiny_config()
     params = init_model(jax.random.PRNGKey(7), config)
     input_ids = jnp.asarray(
         [[1, 5, 3, 8, 13, 21, 34, 2]], dtype=jnp.int32
     )
+    # Keep the boundary aligned with ratio-2 compression, matching the packed-data
+    # invariant used by the JAX reference while exercising segment-local masks/RoPE/Engram.
+    segment_ids = jnp.asarray(
+        [[0, 0, 0, 0, 1, 1, 1, 1]], dtype=jnp.int32
+    )
     expected, _ = apply_model(
-        params, config, input_ids, compute_indexer=False
+        params,
+        config,
+        input_ids,
+        segment_ids=segment_ids,
+        compute_indexer=False,
     )
 
     cpu = NanoDeepseekV41CPU(
@@ -89,6 +98,7 @@ def test_dense_cpu_logits_match_jax_reference():
     )
     actual, _ = cpu.forward(
         torch.tensor(np.asarray(input_ids), dtype=torch.long),
+        segment_ids=torch.tensor(np.asarray(segment_ids), dtype=torch.long),
         compute_indexer=False,
         sparse_retrieval=False,
     )
