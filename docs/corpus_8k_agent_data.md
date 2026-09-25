@@ -51,11 +51,11 @@ Default target: 4M accepted nano-tokenizer tokens. The reasoning pool uses sourc
 
 | source | weight | license | acceptance policy |
 | --- | ---: | --- | --- |
-| OpenR1-Math-220k `default` | 45% | Apache-2.0 | complete generation; reject a generation explicitly marked incorrect by Math Verify |
+| OpenR1-Math-220k `default` | 45% | Apache-2.0 | complete generation; require Math Verify or Llama judge to be explicitly correct |
 | CHIMERA `Qwen3-235B-2507` | 30% | Apache-2.0 | `correctness=True`; Physics, Chemistry, or Biology only |
-| X-Coder-SFT-376k `hybrid` | 25% | MIT | require a complete explicit `<think>...</think>` response |
+| X-Coder-SFT-376k `verified_90k` | 25% | MIT | upstream verified solution with a complete explicit `<think>...</think>` response |
 
-OpenR1-Math is built from Apache-2.0 NuminaMath-1.5 problems and upstream-generated reasoning traces. CHIMERA describes its examples as fully synthetic; the science adapter excludes its math, computer-science, humanities, and linguistics rows. X-Coder describes its competitive-programming collection as fully synthetic.
+OpenR1-Math is built from Apache-2.0 NuminaMath-1.5 problems and upstream-generated reasoning traces. CHIMERA describes its examples as fully synthetic; the science adapter excludes its math, computer-science, humanities, and linguistics rows. X-Coder describes its competitive-programming collection as fully synthetic; the selected `verified_90k` split contains only upstream-verified solutions.
 
 Canonical records keep reasoning separate from final assistant content. The frozen nano tokenizer measures reasoning length and the deterministic percentile assignment maps it to integer `reasoning_effort` 1..100. Final V4.1 rendering is checked against the 8192-token row limit. Every manifest records dataset/config/split, declared license, source-specific quality filtering, and provenance notes.
 
@@ -65,14 +65,16 @@ This replaces the earlier `open-r1/Mixture-of-Thoughts` dependency. It is not a 
 
 Default target: 8M accepted nano-tokenizer tokens.
 
+> **Target semantics.** The 4M reasoning / 8M agent values are corpus-construction defaults for accepted rendered trace tokens, not a scaling-law-derived SFT budget. Only assistant targets contribute SFT loss, so supervised-token counts are lower. Revisit these defaults after final filtering using the generated manifest's actual trace and supervised-token statistics.
+
 | source | weight | acceptance policy | role |
 | --- | ---: | --- | --- |
 | Nebius SWE-agent trajectories | 40% | `target=True` only | repository/SWE actions |
 | NVIDIA Nemotron Agentic v2 interactive | 25% | curated source rows | multi-turn tools/customer workflows |
 | NVIDIA Nemotron Agentic v2 search | 15% | curated source rows | repeated web-search decisions |
-| OpenSeeker v1 cleaned | 20% | `trajectory_correctness=Correct` only | long-horizon search/visit research |
+| Official OpenSeeker v1 | 20% | `trajectory correctness=Correct` only | long-horizon search/visit research |
 
-Successful SWE-style traces are converted to the canonical `swe_environment` tool interface rather than training a second fenced-command protocol. Search/visit trajectories are converted to canonical tool-call IDs/results. Oversized observations are explicitly truncated with a visible marker rather than silently rewritten.
+Successful SWE-style traces are converted to the canonical `swe_environment` tool interface rather than training a second fenced-command protocol. Official OpenSeeker search/visit trajectories are converted directly from the original compound tool format to canonical tool-call IDs/results. Oversized observations are explicitly truncated with a visible marker rather than silently rewritten.
 
 Before any source is included in the final run, verify its license and training/redistribution terms separately.
 

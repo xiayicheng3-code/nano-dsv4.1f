@@ -19,11 +19,12 @@ def test_reasoning_sources_are_explicit_and_permissive() -> None:
     assert catalog["math"].dataset == "open-r1/OpenR1-Math-220k"
     assert catalog["science"].dataset == "TianHongZXY/CHIMERA"
     assert catalog["code"].dataset == "IIGroup/X-Coder-SFT-376k"
+    assert catalog["code"].split == "verified_90k"
     assert {source.license for source in catalog.values()} <= {"apache-2.0", "mit"}
     assert all("Mixture-of-Thoughts" not in source.dataset for source in catalog.values())
 
 
-def test_openr1_math_prefers_complete_verified_generation() -> None:
+def test_openr1_math_requires_positive_upstream_verification() -> None:
     source = reasoning_sft.SOURCE_CATALOG["math"]
     row = {
         "problem": "Compute 1 + 1.",
@@ -31,18 +32,32 @@ def test_openr1_math_prefers_complete_verified_generation() -> None:
         "source": "unit-test",
         "problem_type": "Algebra",
         "generations": [
-            "<think>bad reasoning</think>\n3",
-            "<think>good reasoning</think>\n2",
+            "<think>unverified reasoning</think>\n2",
+            "<think>math-verified reasoning</think>\n2",
+            "<think>llama-verified reasoning</think>\n2",
         ],
-        "is_reasoning_complete": [True, True],
-        "correctness_math_verify": [False, True],
+        "is_reasoning_complete": [True, True, True],
+        "correctness_math_verify": [False, True, False],
+        "correctness_llama": [False, False, True],
     }
     case = reasoning_sft.adapt_openr1_math(source, row)
     assert case is not None
-    assert case["messages"][1]["reasoning_content"] == "good reasoning"
-    assert case["messages"][1]["content"] == "2"
+    assert case["messages"][1]["reasoning_content"] == "math-verified reasoning"
     assert case["metadata"]["generation_index"] == 1
+    assert case["metadata"]["math_verify"] is True
 
+    llama_only = {**row, "correctness_math_verify": [False, False, False]}
+    case = reasoning_sft.adapt_openr1_math(source, llama_only)
+    assert case is not None
+    assert case["metadata"]["generation_index"] == 2
+    assert case["metadata"]["llama_verify"] is True
+
+    unverified = {
+        **row,
+        "correctness_math_verify": [False, False, False],
+        "correctness_llama": [False, False, False],
+    }
+    assert reasoning_sft.adapt_openr1_math(source, unverified) is None
 
 def test_chimera_science_requires_verified_science_subject() -> None:
     source = reasoning_sft.SOURCE_CATALOG["science"]

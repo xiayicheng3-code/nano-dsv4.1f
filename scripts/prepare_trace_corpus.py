@@ -85,11 +85,14 @@ REASONING_SOURCES = (
         "xcoder",
         "reasoning",
         "IIGroup/X-Coder-SFT-376k",
-        "hybrid",
+        "verified_90k",
         0.25,
         "xcoder",
         "mit",
-        provenance="Fully synthetic competitive-programming reasoning SFT data.",
+        provenance=(
+            "Fully synthetic competitive-programming reasoning SFT data; use verified_90k, "
+            "which upstream describes as all verified high-quality solutions."
+        ),
     ),
 )
 
@@ -110,8 +113,12 @@ AGENT_SOURCES = (
     ),
     TraceSource(
         "openseeker_correct", "agent",
-        "AmanPriyanshu/tool-reasoning-sft-RESEARCH-OpenSeeker-v1-Data", "train",
+        "PolarSeeker/OpenSeeker-v1-Data", "train",
         0.20, "openseeker", "mit", max_observation_chars=1400,
+        provenance=(
+            "Official OpenSeeker v1 trajectories; keep trajectory correctness=Correct and "
+            "convert the original compound tool format locally."
+        ),
     ),
 )
 
@@ -196,18 +203,29 @@ def adapt_openr1_math(
         if isinstance(messages, list) and messages and isinstance(messages[0], dict):
             user = messages[0].get("content")
     generations = row.get("generations")
-    if not isinstance(user, str) or not isinstance(generations, list):
-        return None
     complete = row.get("is_reasoning_complete")
-    verified = row.get("correctness_math_verify")
-    if not isinstance(complete, list):
-        complete = [True] * len(generations)
-    if not isinstance(verified, list):
-        verified = [True] * len(generations)
+    math_verified = row.get("correctness_math_verify")
+    llama_verified = row.get("correctness_llama")
+    if (
+        not isinstance(user, str)
+        or not isinstance(generations, list)
+        or not isinstance(complete, list)
+    ):
+        return None
     for i, generation in enumerate(generations):
-        if i >= len(complete) or not complete[i]:
+        if i >= len(complete) or complete[i] is not True:
             continue
-        if i < len(verified) and verified[i] is False:
+        math_ok = (
+            isinstance(math_verified, list)
+            and i < len(math_verified)
+            and math_verified[i] is True
+        )
+        llama_ok = (
+            isinstance(llama_verified, list)
+            and i < len(llama_verified)
+            and llama_verified[i] is True
+        )
+        if not (math_ok or llama_ok):
             continue
         if not isinstance(generation, str):
             continue
@@ -227,7 +245,8 @@ def adapt_openr1_math(
                 "problem_type": row.get("problem_type"),
                 "generation_index": i,
                 "reasoning_complete": True,
-                "math_verify": None if i >= len(verified) else verified[i],
+                "math_verify": math_ok,
+                "llama_verify": llama_ok,
             },
         )
     return None
@@ -463,94 +482,128 @@ def _json_arguments(value: Any) -> str:
 def adapt_openseeker(
     source: TraceSource, row: dict[str, Any], row_index: int
 ) -> dict[str, Any] | None:
-    if str(row.get("trajectory_correctness", "")).lower() != "correct":
+    # Parse PolarSeeker/OpenSeeker-v1-Data directly. Upstream stores calls inside
+    # assistant XML and returns the corresponding tool outputs in the next user turn.
+    correctness = row.get("trajectory correctness", row.get("trajectory_correctness", ""))
+    if str(correctness).lower() != "correct":
         return None
-    raw = row.get("messages")
+    raw = row.get("trajectory")
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
         except json.JSONDecodeError:
             return None
-    if not isinstance(raw, list) or len(raw) < 4:
+    if not isinstance(raw, list) or len(raw) < 3:
         return None
 
+    def blocks(text: str, tag: str) -> list[str]:
+        return [
+            value.strip()
+            for value in re.findall(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, flags=re.DOTALL)
+        ]
+
     messages: list[dict[str, Any]] = []
-    pending_reasoning: str | None = None
-    pending_call_id: str | None = None
+    pending_call_ids: list[str] = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             return None
-        role, content = item.get("role"), str(item.get("content", ""))
+        role = str(item.get("role", "")).lower()
+        content = str(item.get("content", ""))
+
         if role == "system":
             if not messages:
                 messages.append(
                     {
                         "role": "system",
                         "content": (
-                            "You are a deep-research assistant. Use the provided search and visit "
-                            "tools to gather evidence and synthesize an accurate answer."
+                            "You are a deep-research assistant. Use the provided search and "
+                            "visit tools to gather evidence and synthesize an accurate answer."
                         ),
                     }
                 )
-        elif role == "user":
-            messages.append({"role": "user", "content": content})
-        elif role == "reasoning":
-            pending_reasoning = strip_xml_tag(content, "think")
-        elif role == "tool_call":
-            try:
-                payload = parse_tagged_json(content, "tool_call")
-            except Exception:
+            continue
+
+        if role == "user":
+            tool_responses = blocks(content, "tool_response")
+            if pending_call_ids:
+                if len(tool_responses) != len(pending_call_ids):
+                    return None
+                for call_id, response in zip(pending_call_ids, tool_responses):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": truncate_text(response, source.max_observation_chars),
+                        }
+                    )
+                pending_call_ids = []
+            elif tool_responses:
                 return None
-            name = payload.get("name")
-            if not isinstance(name, str) or not name:
-                return None
-            call_id = f"search_{row_index}_{i}"
+            elif content.strip():
+                messages.append({"role": "user", "content": content.strip()})
+            continue
+
+        if role != "assistant" or pending_call_ids:
+            return None
+
+        reasoning_blocks = blocks(content, "think")
+        if len(reasoning_blocks) != 1 or not reasoning_blocks[0]:
+            return None
+        reasoning = reasoning_blocks[0]
+        call_blocks = blocks(content, "tool_call")
+        answer_blocks = blocks(content, "answer")
+        if call_blocks and answer_blocks:
+            return None
+
+        if call_blocks:
+            tool_calls: list[dict[str, Any]] = []
+            for j, raw_call in enumerate(call_blocks):
+                try:
+                    payload = json.loads(raw_call)
+                except json.JSONDecodeError:
+                    return None
+                name = payload.get("name")
+                if name not in {"search", "visit"}:
+                    return None
+                call_id = f"search_{row_index}_{i}_{j}"
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": _json_arguments(
+                                payload.get("arguments", payload.get("parameters", {}))
+                            ),
+                        },
+                    }
+                )
+                pending_call_ids.append(call_id)
             messages.append(
                 {
                     "role": "assistant",
                     "content": "",
-                    "reasoning_content": pending_reasoning or None,
-                    "tool_calls": [
-                        {
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": _json_arguments(
-                                    payload.get("arguments", payload.get("parameters", {}))
-                                ),
-                            },
-                        }
-                    ],
+                    "reasoning_content": reasoning,
+                    "tool_calls": tool_calls,
                 }
             )
-            pending_reasoning, pending_call_id = None, call_id
-        elif role == "tool_output":
-            if pending_call_id is None:
-                return None
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": pending_call_id,
-                    "content": truncate_text(
-                        strip_xml_tag(content, "tool_response"), source.max_observation_chars
-                    ),
-                }
-            )
-            pending_call_id = None
-        elif role == "answer":
-            messages.append(
-                {
-                    "role": "assistant",
-                    "reasoning_content": pending_reasoning or None,
-                    "content": strip_xml_tag(content, "answer"),
-                }
-            )
-            pending_reasoning = None
-        else:
-            return None
+            continue
 
-    if pending_call_id is not None or not any(m.get("role") == "assistant" for m in messages):
+        if len(answer_blocks) != 1 or not answer_blocks[0]:
+            return None
+        messages.append(
+            {
+                "role": "assistant",
+                "reasoning_content": reasoning,
+                "content": answer_blocks[0],
+            }
+        )
+
+    if pending_call_ids:
+        return None
+    if not messages or messages[-1].get("role") != "assistant":
+        return None
+    if not str(messages[-1].get("content", "")).strip():
         return None
     try:
         return normalize_agent_trace(
@@ -563,9 +616,12 @@ def adapt_openseeker(
                     "dataset": source.dataset,
                     "source": source.key,
                     "trajectory_correctness": "Correct",
+                    "number_of_tool_calls": row.get("number of tool calls"),
+                    "expected_answer": row.get("answer"),
                 },
             },
             default_reasoning_effort=75,
+            policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
         )
     except Exception:
         return None
