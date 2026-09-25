@@ -19,8 +19,16 @@ The port preserves the nano V4.1 mechanisms that matter for inference:
 
 ## Install
 
+CPU model only:
+
 ```bash
 pip install -e '.[cpu]'
+```
+
+CPU model plus DeepSeek-compatible HTTP/protocol support:
+
+```bash
+pip install -e '.[api]'
 ```
 
 ## Load an exported checkpoint
@@ -83,8 +91,50 @@ The cache is intentionally an ordinary Torch correctness structure rather than a
 
 Packed ratio-2 decode requires segment boundaries to fall on completed compression groups, matching the packed training invariant; the runtime raises instead of compressing across a segment boundary.
 
+## DeepSeek V4.1 API protocols
+
+DeepSeek V4.1 does not use a simple local Jinja chat template as its authoritative protocol definition. The CPU serving layer therefore uses the maintained `deepseek-recipe` package to normalize requests, render V4.1 prompts, and parse generated thinking/tool syntax back into the requested response format.
+
+`NanoDeepSeekProtocolBackend` exposes four text-generation endpoint families:
+
+- `POST /v1/completions` — classic raw-prompt completions; **no chat template is applied**;
+- `POST /v1/chat/completions` — OpenAI-style Chat Completions rendered as DeepSeek V4.1;
+- `POST /v1/responses` — OpenAI Responses requests rendered as DeepSeek V4.1;
+- `POST /v1/messages` — Anthropic Messages requests rendered as DeepSeek V4.1.
+
+The HTTP app also exposes `GET /v1/models` and `GET /health`.
+
+```python
+from nano_dsv41f.vllm_v41_cpu.api import (
+    NanoDeepSeekProtocolBackend,
+    create_app,
+)
+
+backend = NanoDeepSeekProtocolBackend.from_pretrained(
+    "/path/to/exported-checkpoint",
+    tokenizer_path="/path/to/tokenizer.json",
+)
+app = create_app(backend)
+```
+
+The correctness-first HTTP adapter currently returns complete responses. Token-by-token HTTP streaming is deliberately left for the vLLM scheduler integration, while the protocol rendering/parsing itself is already the DeepSeek V4.1 implementation rather than an approximation.
+
+## Public Kaggle chat notebook
+
+`notebooks/nano_dsv41f_cpu_chat.ipynb` is the visitor-facing demo, separate from the training notebook. Before publishing it on Kaggle, attach an input containing the exported checkpoint and frozen tokenizer. A visitor can then use Kaggle's normal **Copy & Edit** flow, start a CPU session, choose **Run All**, and use the notebook's persistent `chat()` helper for multi-turn conversation.
+
+The notebook intentionally uses ordinary executable cells rather than relying on notebook widgets. It also includes an optional local FastAPI launch cell for endpoint testing inside the Kaggle runtime.
+
+Regenerate it with:
+
+```bash
+python scripts/build_cpu_chat_notebook.py
+```
+
+For a fully offline public demo, publish a Kaggle input containing both the checkpoint/tokenizer and a wheel/source bundle plus dependency wheelhouse, then replace the notebook's Git/PyPI install cell with installation from `/kaggle/input`. Until that bundle exists, the notebook expects Kaggle Internet access for package installation.
+
 ## Current execution boundary
 
-This CPU milestone is a cache-correct semantic runtime, not yet a registered vLLM engine model. The next serving step is to wrap these validated semantics in an out-of-tree `vllm.general_plugins` model and map the local/compressed/indexer cache state onto vLLM's scheduler and paged cache allocation.
+The CPU runtime is now cache-correct and protocol-aware, but it is not yet registered as a vLLM engine model. The next vLLM-specific step is to map the validated local/compressed/indexer cache state onto vLLM's scheduler and paged cache allocation. The DeepSeek request/response protocol layer does not need to wait for that work.
 
 DSpark speculative decoding remains deferred until the ordinary vLLM cached path is integrated. Quantization/QAT configuration remains checkpoint metadata, while this CPU reference executes the loaded tensors in the selected Torch dtype rather than reproducing production packed FP4/FP8 cache layouts.
