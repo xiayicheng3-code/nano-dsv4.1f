@@ -70,7 +70,9 @@ def to_torch(
     if isinstance(value, torch.Tensor):
         tensor = value.detach().to(device=device)
     else:
-        tensor = torch.as_tensor(np.asarray(value), device=device)
+        # Some JAX-backed NumPy views are read-only. Copy once when crossing the
+        # framework boundary so Torch never holds a tensor with unsafe write semantics.
+        tensor = torch.as_tensor(np.array(value, copy=True), device=device)
     if tensor.is_floating_point():
         tensor = tensor.to(dtype=dtype)
     return tensor.contiguous()
