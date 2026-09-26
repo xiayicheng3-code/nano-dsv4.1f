@@ -1,0 +1,40 @@
+name: temporary-agent-source-patch
+
+on:
+  push:
+    branches:
+      - codex/agent-source-refresh
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/agent-source-refresh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Apply source refresh
+        run: python scripts/_patch_agent_sources_temp.py
+      - name: Install test dependencies
+        run: pip install -e '.[dev]'
+      - name: Validate source adapters
+        run: |
+          python -m py_compile scripts/prepare_trace_corpus.py
+          pytest -q tests/test_trace_source_selection.py
+      - name: Commit source refresh
+        shell: bash
+        run: |
+          rm .github/workflows/patch-agent-sources-temp.yml scripts/_patch_agent_sources_temp.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scripts/prepare_trace_corpus.py docs/corpus_8k_agent_data.md docs/corpus_curriculum.md tests/test_trace_source_selection.py .github/workflows/patch-agent-sources-temp.yml scripts/_patch_agent_sources_temp.py
+          git commit -m "Replace legacy Nemotron SFT traces with verified agent sources"
+          git push origin HEAD:codex/agent-source-refresh
