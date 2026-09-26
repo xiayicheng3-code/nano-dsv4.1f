@@ -98,29 +98,57 @@ REASONING_SOURCES = (
 
 AGENT_SOURCES = (
     TraceSource(
-        "swe_success", "agent", "nebius/SWE-agent-trajectories", "train", 0.40,
+        "swe_success", "agent", "nebius/SWE-agent-trajectories", "train", 0.20,
         "swe_agent", "cc-by-4.0 + source-repository terms + upstream model-output notice",
-        max_observation_chars=6000,
+        max_observation_chars=5000,
+        provenance="Successful SWE-agent trajectories only (target=True).",
     ),
     TraceSource(
-        "nemotron_interactive", "agent", "nvidia/Nemotron-SFT-Agentic-v2",
-        "interactive_agent", 0.25, "nemotron", "cc-by-4.0; additional apache-2.0/mit",
-        max_observation_chars=4000,
-    ),
-    TraceSource(
-        "nemotron_search", "agent", "nvidia/Nemotron-SFT-Agentic-v2", "search",
-        0.15, "nemotron", "cc-by-4.0; additional apache-2.0/mit", max_observation_chars=1800,
+        "openthoughts_execution", "agent",
+        "open-thoughts/OpenThoughts-Agent-SFT-ColdStartForRL-10K", "train", 0.20,
+        "openthoughts", "apache-2.0", max_observation_chars=2400,
+        provenance=(
+            "OpenThoughts cold-start SFT trajectories on SWE-Smith tasks with sandbox tests; "
+            "the release is oracle-verified by construction."
+        ),
     ),
     TraceSource(
         "openseeker_correct", "agent",
-        "PolarSeeker/OpenSeeker-v1-Data", "train",
-        0.20, "openseeker", "mit", max_observation_chars=1400,
+        "PolarSeeker/OpenSeeker-v1-Data", "train", 0.15,
+        "openseeker", "mit", max_observation_chars=1400,
         provenance=(
             "Official OpenSeeker v1 trajectories; keep trajectory correctness=Correct and "
             "convert the original compound tool format locally."
         ),
     ),
+    TraceSource(
+        "openresearcher", "agent", "OpenResearcher/OpenResearcher-Dataset", "train", 0.15,
+        "openresearcher", "mit", max_observation_chars=1800,
+        provenance=(
+            "Long-horizon GPT-OSS-120B deep-research trajectories with native browser tools; "
+            "convert a deterministic next-action window instead of forcing 100+ turns into 8K."
+        ),
+    ),
+    TraceSource(
+        "xlam_verified", "agent", "Salesforce/xlam-function-calling-60k", "train", 0.15,
+        "xlam", "cc-by-4.0 + Hugging Face access conditions", max_observation_chars=1600,
+        provenance=(
+            "APIGen function-calling data verified by format checks, real function execution and "
+            "semantic verification; official repository requires accepting its access conditions."
+        ),
+    ),
+    TraceSource(
+        "nemotron_conversational_pivot", "agent",
+        "nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1", "train", 0.15,
+        "nemotron_pivot", "cc-by-4.0", max_observation_chars=1800,
+        provenance=(
+            "NVIDIA conversational tool-use pivot: each row is a behavior-cloning context with "
+            "an expected expert action rather than an unfiltered whole generated trajectory."
+        ),
+    ),
 )
+
+
 
 
 def _validate_source_weights(sources: tuple[TraceSource, ...]) -> None:
@@ -423,29 +451,514 @@ def adapt_swe_agent(
         return None
 
 
-def adapt_nemotron(
+
+def _terminal_batch_tool() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal_batch",
+                "description": "Execute an ordered batch of terminal keystroke commands.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "commands": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "keystrokes": {"type": "string"},
+                                    "duration": {"type": "number"},
+                                },
+                                "required": ["keystrokes"],
+                            },
+                        }
+                    },
+                    "required": ["commands"],
+                },
+            },
+        }
+    ]
+
+
+def _terminal_action(content: str, *, call_id: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    analysis = str(payload.get("analysis") or "").strip()
+    plan = str(payload.get("plan") or "").strip()
+    reasoning = "\n\n".join(part for part in (analysis, plan) if part)
+    commands = payload.get("commands")
+    if isinstance(commands, list) and commands:
+        clean_commands = []
+        for command in commands:
+            if not isinstance(command, dict) or not str(command.get("keystrokes") or "").strip():
+                return None
+            item = {"keystrokes": str(command["keystrokes"])}
+            if command.get("duration") is not None:
+                item["duration"] = command["duration"]
+            clean_commands.append(item)
+        return {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": reasoning or None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "terminal_batch",
+                        "arguments": json.dumps({"commands": clean_commands}, ensure_ascii=False),
+                    },
+                }
+            ],
+        }
+    if payload.get("task_complete") is True:
+        final = plan or analysis or "Task complete."
+        return {"role": "assistant", "content": final, "reasoning_content": analysis or None}
+    return None
+
+
+def adapt_openthoughts(
     source: TraceSource, row: dict[str, Any], row_index: int
 ) -> dict[str, Any] | None:
-    messages, tools = row.get("messages"), row.get("tools", [])
-    if not isinstance(messages, list) or not messages:
+    raw = row.get("conversations")
+    if not isinstance(raw, list) or len(raw) < 3:
         return None
-    kwargs = row.get("chat_template_kwargs")
-    thinking = bool(kwargs.get("thinking", True)) if isinstance(kwargs, dict) else True
+    prefix: list[dict[str, Any]] = []
+    steps: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    pending: dict[str, Any] | None = None
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            return None
+        role = str(item.get("role", "")).lower()
+        content = str(item.get("content", ""))
+        if role in ("system", "user") and not steps and pending is None:
+            prefix.append({"role": role, "content": content})
+            continue
+        if role == "assistant":
+            if pending is not None:
+                steps.append((pending, None))
+            pending = _terminal_action(content, call_id=f"terminal_{row_index}_{i}")
+            if pending is None:
+                return None
+            continue
+        if role in ("user", "tool", "environment", "observation") and pending is not None:
+            calls = pending.get("tool_calls", [])
+            if calls:
+                result = {
+                    "role": "tool",
+                    "tool_call_id": calls[0]["id"],
+                    "content": truncate_text(content, source.max_observation_chars),
+                }
+                steps.append((pending, result))
+            else:
+                steps.append((pending, None))
+                prefix.append({"role": "user", "content": truncate_text(content, 1200)})
+            pending = None
+            continue
+    if pending is not None:
+        steps.append((pending, None))
+    if not steps:
+        return None
+
+    target_index = row_index % len(steps)
+    context_steps = steps[max(0, target_index - 3) : target_index]
+    messages = prefix[:2]
+    for action, result in context_steps:
+        messages.append(action)
+        if result is not None:
+            messages.append(result)
+    messages.append(steps[target_index][0])
     try:
         return normalize_agent_trace(
             {
                 "messages": messages,
-                "tools": tools if isinstance(tools, (list, dict)) else [],
-                "thinking_mode": "thinking" if thinking else "chat",
+                "tools": _terminal_batch_tool(),
+                "thinking_mode": "thinking",
                 "metadata": {
                     "id": _identity(source, row, row_index),
                     "dataset": source.dataset,
                     "source": source.key,
-                    "model": row.get("model"),
-                    "domain": row.get("domain"),
+                    "task": row.get("task"),
+                    "trace_source": row.get("trace_source"),
+                    "teacher": row.get("model"),
+                    "oracle_verified_release": True,
+                    "selected_step": target_index,
+                    "trajectory_steps": len(steps),
                 },
             },
-            default_reasoning_effort=75,
+            default_reasoning_effort=70,
+            policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
+        )
+    except Exception:
+        return None
+
+
+def _content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return "" if value is None else str(value)
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            text = item.get("text", item.get("content", item.get("output_text", "")))
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _responses_context(raw: Any, *, row_index: int, max_observation_chars: int) -> list[dict[str, Any]] | None:
+    if not isinstance(raw, list):
+        return None
+    messages: list[dict[str, Any]] = []
+    pending_ids: set[str] = set()
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type", ""))
+        role = str(item.get("role", ""))
+        if kind == "function_call":
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            call_id = str(item.get("call_id") or item.get("id") or f"resp_{row_index}_{i}")
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": _json_arguments(item.get("arguments", {})),
+                            },
+                        }
+                    ],
+                }
+            )
+            pending_ids.add(call_id)
+            continue
+        if kind in ("function_call_output", "tool_result"):
+            call_id = str(item.get("call_id") or item.get("tool_call_id") or "")
+            if call_id and call_id in pending_ids:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": truncate_text(
+                            item.get("output", item.get("content", "")), max_observation_chars
+                        ),
+                    }
+                )
+                pending_ids.discard(call_id)
+            continue
+        if role == "developer":
+            role = "system"
+        if role in ("system", "user"):
+            text = _content_text(item.get("content"))
+            if text:
+                messages.append({"role": role, "content": text})
+            continue
+        if role == "assistant":
+            content = item.get("content")
+            if isinstance(content, list):
+                reasoning_parts, final_parts, calls = [], [], []
+                for j, part in enumerate(content):
+                    if not isinstance(part, dict):
+                        continue
+                    channel = str(part.get("channel", ""))
+                    text = _content_text([part])
+                    recipient = part.get("recipient", part.get("to"))
+                    if recipient and recipient != "assistant":
+                        call_id = f"harmony_{row_index}_{i}_{j}"
+                        calls.append(
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": str(recipient),
+                                    "arguments": _json_arguments(text or {}),
+                                },
+                            }
+                        )
+                        pending_ids.add(call_id)
+                    elif channel == "analysis":
+                        if text:
+                            reasoning_parts.append(text)
+                    elif text:
+                        final_parts.append(text)
+                if calls or final_parts or reasoning_parts:
+                    msg: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": "\n".join(final_parts),
+                    }
+                    if reasoning_parts:
+                        msg["reasoning_content"] = "\n".join(reasoning_parts)
+                    if calls:
+                        msg["tool_calls"] = calls
+                    messages.append(msg)
+            else:
+                text = _content_text(content)
+                if text:
+                    messages.append({"role": "assistant", "content": text})
+            continue
+        if role.startswith("browser.") or role == "tool":
+            call_id = str(item.get("tool_call_id") or item.get("call_id") or "")
+            if not call_id and len(pending_ids) == 1:
+                call_id = next(iter(pending_ids))
+            if call_id and call_id in pending_ids:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": truncate_text(_content_text(item.get("content")), max_observation_chars),
+                    }
+                )
+                pending_ids.discard(call_id)
+    return messages or None
+
+
+def _browser_tools() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {"type": "object", "additionalProperties": True},
+            },
+        }
+        for name, description in (
+            ("browser.search", "Search the research corpus or web index."),
+            ("browser.open", "Open a result or page and inspect its content."),
+            ("browser.find", "Find a pattern in the currently opened page."),
+        )
+    ]
+
+
+def _window_to_target(messages: list[dict[str, Any]], row_index: int) -> list[dict[str, Any]] | None:
+    targets = [i for i, msg in enumerate(messages) if msg.get("role") == "assistant"]
+    if not targets:
+        return None
+    target = targets[row_index % len(targets)]
+    first_context = [msg for msg in messages[:target] if msg.get("role") in ("system", "user")][:2]
+    tail = messages[max(0, target - 8) : target]
+    call_ids = {
+        call["id"]
+        for msg in tail
+        for call in msg.get("tool_calls", [])
+        if isinstance(call, dict) and call.get("id")
+    }
+    tail = [
+        msg
+        for msg in tail
+        if msg.get("role") != "tool" or msg.get("tool_call_id") in call_ids
+    ]
+    out: list[dict[str, Any]] = []
+    for msg in first_context + tail:
+        if msg not in out:
+            out.append(msg)
+    out.append(messages[target])
+    return out
+
+
+def adapt_openresearcher(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    messages = _responses_context(
+        row.get("messages"), row_index=row_index, max_observation_chars=source.max_observation_chars
+    )
+    if messages is None:
+        return None
+    window = _window_to_target(messages, row_index)
+    if window is None:
+        return None
+    try:
+        return normalize_agent_trace(
+            {
+                "messages": window,
+                "tools": _browser_tools(),
+                "thinking_mode": "thinking",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "qid": row.get("qid"),
+                    "question": row.get("question"),
+                    "reference_answer": row.get("answer"),
+                    "selected_action_window": True,
+                },
+            },
+            default_reasoning_effort=80,
+            policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
+        )
+    except Exception:
+        return None
+
+
+def _xlam_tools(raw: Any) -> list[dict[str, Any]] | None:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, list) or not raw:
+        return None
+    tools = []
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            return None
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        params = item.get("parameters", {})
+        if isinstance(params, dict):
+            for name, spec in params.items():
+                if not isinstance(spec, dict):
+                    continue
+                properties[name] = {
+                    key: value
+                    for key, value in spec.items()
+                    if key in ("type", "description", "enum", "items")
+                }
+                if spec.get("required") is True:
+                    required.append(name)
+        schema: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            schema["required"] = required
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": item["name"],
+                    "description": item.get("description", ""),
+                    "parameters": schema,
+                },
+            }
+        )
+    return tools
+
+
+def adapt_xlam(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    query = row.get("query")
+    tools = _xlam_tools(row.get("tools"))
+    answers = row.get("answers")
+    if isinstance(answers, str):
+        try:
+            answers = json.loads(answers)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(query, str) or not query.strip() or not tools or not isinstance(answers, list):
+        return None
+    calls = []
+    valid_names = {tool["function"]["name"] for tool in tools}
+    for i, answer in enumerate(answers):
+        if not isinstance(answer, dict) or answer.get("name") not in valid_names:
+            return None
+        calls.append(
+            {
+                "id": f"xlam_{row_index}_{i}",
+                "type": "function",
+                "function": {
+                    "name": answer["name"],
+                    "arguments": _json_arguments(answer.get("arguments", {})),
+                },
+            }
+        )
+    if not calls:
+        return None
+    try:
+        return normalize_agent_trace(
+            {
+                "messages": [
+                    {"role": "user", "content": query.strip()},
+                    {"role": "assistant", "content": "", "tool_calls": calls},
+                ],
+                "tools": tools,
+                "thinking_mode": "chat",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "apigen_verified": True,
+                },
+            },
+            default_thinking_mode="chat",
+            default_reasoning_effort=25,
+        )
+    except Exception:
+        return None
+
+
+def adapt_nemotron_pivot(
+    source: TraceSource, row: dict[str, Any], row_index: int
+) -> dict[str, Any] | None:
+    params = row.get("responses_create_params")
+    expected = row.get("expected_action")
+    if not isinstance(params, dict) or not isinstance(expected, dict):
+        return None
+    messages = _responses_context(
+        params.get("input"), row_index=row_index, max_observation_chars=source.max_observation_chars
+    )
+    if messages is None:
+        return None
+    action_type = expected.get("type")
+    if action_type == "function_call":
+        name = expected.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"pivot_{row_index}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": _json_arguments(expected.get("arguments", {})),
+                        },
+                    }
+                ],
+            }
+        )
+    elif action_type == "message":
+        content = _content_text(expected.get("content"))
+        if not content:
+            return None
+        messages.append({"role": "assistant", "content": content})
+    else:
+        return None
+    tools = params.get("tools", [])
+    try:
+        return normalize_agent_trace(
+            {
+                "messages": messages,
+                "tools": tools if isinstance(tools, list) else [],
+                "thinking_mode": "chat",
+                "metadata": {
+                    "id": _identity(source, row, row_index),
+                    "dataset": source.dataset,
+                    "source": source.key,
+                    "trajectory_id": row.get("trajectory_id"),
+                    "expected_action_type": action_type,
+                    "num_unique_actions": row.get("num_unique_actions"),
+                    "pass_rate": row.get("pass_rate"),
+                },
+            },
+            default_thinking_mode="chat",
+            default_reasoning_effort=25,
             policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
         )
     except Exception:
@@ -632,7 +1145,10 @@ ADAPTERS: dict[str, Callable[[TraceSource, dict[str, Any], int], dict[str, Any] 
     "chimera_science": adapt_chimera_science,
     "xcoder": adapt_xcoder,
     "swe_agent": adapt_swe_agent,
-    "nemotron": adapt_nemotron,
+    "openthoughts": adapt_openthoughts,
+    "openresearcher": adapt_openresearcher,
+    "xlam": adapt_xlam,
+    "nemotron_pivot": adapt_nemotron_pivot,
     "openseeker": adapt_openseeker,
 }
 
@@ -730,7 +1246,8 @@ def collect_source_cases(
         if batch:
             flush()
 
-    if accepted_tokens < target_tokens:
+    exhausted_before_target = accepted_tokens < target_tokens
+    if exhausted_before_target and source.pool != "agent":
         raise RuntimeError(
             f"{source.key} exhausted at {accepted_tokens:,} tokens; target={target_tokens:,}; "
             f"drops={dict(drops)}"
@@ -740,6 +1257,7 @@ def collect_source_cases(
         "rows_adapter_or_quality_rejected": rows_rejected,
         "accepted_cases": len(cases),
         "accepted_tokens_before_effort_relabel": accepted_tokens,
+        "exhausted_before_target": exhausted_before_target,
         **{f"dropped_{k}": int(v) for k, v in drops.items()},
     }
 
@@ -1052,7 +1570,7 @@ def main() -> None:
     parser.add_argument("--pool", choices=("all", "reasoning", "agent"), default="all")
     parser.add_argument("--seq-len", type=int, default=DEFAULT_TRACE_SEQ_LEN)
     parser.add_argument("--reasoning-target-tokens", type=int, default=4_000_000)
-    parser.add_argument("--agent-target-tokens", type=int, default=8_000_000)
+    parser.add_argument("--agent-target-tokens", type=int, default=16_000_000)
     parser.add_argument("--tokenize-batch-size", type=int, default=64)
     parser.add_argument("--shuffle-buffer", type=int, default=2_000)
     parser.add_argument("--shard-rows", type=int, default=128)
