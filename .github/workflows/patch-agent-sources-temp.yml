@@ -28,8 +28,6 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          # Keep finite, verified agent datasets quality-first: their per-source token
-          # shares are desired materialization caps, not quotas that must be filled.
           p = Path('scripts/prepare_trace_corpus.py')
           text = p.read_text()
           old = '''    if accepted_tokens < target_tokens:\n        raise RuntimeError(\n            f"{source.key} exhausted at {accepted_tokens:,} tokens; target={target_tokens:,}; "\n            f"drops={dict(drops)}"\n        )\n'''
@@ -40,14 +38,9 @@ jobs:
           marker = '        "accepted_tokens_before_effort_relabel": accepted_tokens,\n'
           if marker not in text:
               raise SystemExit('collection stats marker not found')
-          text = text.replace(
-              marker,
-              marker + '        "exhausted_before_target": exhausted_before_target,\n',
-              1,
-          )
+          text = text.replace(marker, marker + '        "exhausted_before_target": exhausted_before_target,\n', 1)
           p.write_text(text)
 
-          # Repair the synthetic fixture without embedding escaped JSON inside Python.
           p = Path('tests/test_trace_source_selection.py')
           lines = p.read_text().splitlines()
           for i, line in enumerate(lines):
@@ -81,8 +74,9 @@ jobs:
         shell: bash
         run: |
           rm .github/workflows/patch-agent-sources-temp.yml scripts/_patch_agent_sources_temp.py
+          rm -f .agent-source-refresh-trigger
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add scripts/prepare_trace_corpus.py docs/corpus_8k_agent_data.md docs/corpus_curriculum.md tests/test_trace_source_selection.py .github/workflows/patch-agent-sources-temp.yml scripts/_patch_agent_sources_temp.py
+          git add -A scripts/prepare_trace_corpus.py docs/corpus_8k_agent_data.md docs/corpus_curriculum.md tests/test_trace_source_selection.py .github/workflows/patch-agent-sources-temp.yml scripts/_patch_agent_sources_temp.py .agent-source-refresh-trigger
           git commit -m "Replace legacy Nemotron SFT traces with verified agent sources"
           git push origin HEAD:codex/agent-source-refresh
