@@ -43,12 +43,18 @@ jobs:
 
           p = Path('tests/test_trace_source_selection.py')
           lines = p.read_text().splitlines()
+          fixed_nemotron = fixed_researcher = False
           for i, line in enumerate(lines):
               if '"expected_action": {"type":"function_call","name":"get_project_status"' in line:
                   lines[i] = '        "expected_action": {"type": "function_call", "name": "get_project_status", "arguments": {"project_id": "CER-1122"}},'
-                  break
-          else:
+                  fixed_nemotron = True
+              if '"recipient":"browser.search"' in line and 'X author' in line:
+                  lines[i] = '                {"channel": "analysis", "recipient": "browser.search", "text": "X author"},'
+                  fixed_researcher = True
+          if not fixed_nemotron:
               raise SystemExit('Nemotron expected_action fixture not found')
+          if not fixed_researcher:
+              raise SystemExit('OpenResearcher browser fixture not found')
           p.write_text('\n'.join(lines) + '\n')
 
           p = Path('docs/corpus_8k_agent_data.md')
