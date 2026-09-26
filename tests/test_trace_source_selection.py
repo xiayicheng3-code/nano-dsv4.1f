@@ -82,3 +82,97 @@ def test_official_openseeker_trajectory_is_converted_directly() -> None:
     assert trace_corpus.adapt_openseeker(
         source, {**row, "trajectory correctness": "Incorrect"}, 7
     ) is None
+
+
+
+def test_agent_catalog_replaces_legacy_nemotron_sft_splits() -> None:
+    catalog = {source.key: source for source in trace_corpus.AGENT_SOURCES}
+    assert set(catalog) == {
+        "swe_success",
+        "openthoughts_execution",
+        "openseeker_correct",
+        "openresearcher",
+        "xlam_verified",
+        "nemotron_conversational_pivot",
+    }
+    assert all(source.dataset != "nvidia/Nemotron-SFT-Agentic-v2" for source in catalog.values())
+    assert catalog["openthoughts_execution"].license == "apache-2.0"
+    assert catalog["openresearcher"].license == "mit"
+    assert catalog["xlam_verified"].license.startswith("cc-by-4.0")
+    assert catalog["nemotron_conversational_pivot"].dataset.endswith("Conversational-Tool-Use-Pivot-v1")
+    assert abs(sum(source.weight for source in catalog.values()) - 1.0) < 1e-9
+
+
+def test_openthoughts_terminal_batch_window() -> None:
+    source = _source(trace_corpus.AGENT_SOURCES, "openthoughts_execution")
+    row = {
+        "task": "fix the failing test",
+        "model": "teacher",
+        "conversations": [
+            {"role": "system", "content": "terminal agent"},
+            {"role": "user", "content": "Fix it."},
+            {"role": "assistant", "content": '{"analysis":"inspect","plan":"run tests","commands":[{"keystrokes":"pytest -q\\n","duration":0.1}],"task_complete":false}'},
+            {"role": "user", "content": "1 failed"},
+            {"role": "assistant", "content": '{"analysis":"patch","plan":"edit file","commands":[{"keystrokes":"sed -i s/a/b/ x.py\\n","duration":0.1}],"task_complete":false}'},
+        ],
+    }
+    case = trace_corpus.adapt_openthoughts(source, row, 1)
+    assert case is not None
+    assert case["messages"][-1]["tool_calls"][0]["function"]["name"] == "terminal_batch"
+    assert case["metadata"]["oracle_verified_release"] is True
+
+
+def test_xlam_verified_function_call_conversion() -> None:
+    source = _source(trace_corpus.AGENT_SOURCES, "xlam_verified")
+    row = {
+        "query": "Weather in Toronto?",
+        "tools": '[{"name":"weather","description":"Get weather","parameters":{"city":{"type":"string","description":"city","required":true}}}]',
+        "answers": '[{"name":"weather","arguments":{"city":"Toronto"}}]',
+    }
+    case = trace_corpus.adapt_xlam(source, row, 3)
+    assert case is not None
+    assert case["messages"][-1]["tool_calls"][0]["function"]["name"] == "weather"
+    assert case["metadata"]["apigen_verified"] is True
+
+
+def test_nemotron_pivot_uses_expected_action_not_whole_trajectory() -> None:
+    source = _source(trace_corpus.AGENT_SOURCES, "nemotron_conversational_pivot")
+    row = {
+        "trajectory_id": 17,
+        "responses_create_params": {
+            "input": [
+                {"role": "system", "content": "customer-service policy"},
+                {"role": "user", "content": "Check project status."},
+            ],
+            "tools": [{"type":"function","name":"get_project_status","description":"status","parameters":{"type":"object"}}],
+        },
+        "expected_action": {"type": "function_call", "name": "get_project_status", "arguments": {"project_id": "CER-1122"}},
+    }
+    case = trace_corpus.adapt_nemotron_pivot(source, row, 2)
+    assert case is not None
+    assert case["metadata"]["expected_action_type"] == "function_call"
+    assert case["messages"][-1]["tool_calls"][0]["function"]["name"] == "get_project_status"
+
+
+def test_openresearcher_harmony_window_conversion() -> None:
+    source = _source(trace_corpus.AGENT_SOURCES, "openresearcher")
+    row = {
+        "qid": 9,
+        "question": "Who wrote X?",
+        "answer": "Ada",
+        "messages": [
+            {"role": "user", "content": "Who wrote X?"},
+            {"role": "assistant", "content": [
+                {"channel":"analysis","text":"Need a source."},
+                {"channel": "analysis", "recipient": "browser.search", "text": "X author"},
+            ]},
+            {"role": "browser.search", "call_id": "harmony_9_1_1", "content": "Ada wrote X."},
+            {"role": "assistant", "content": [
+                {"channel":"analysis","text":"Found the author."},
+                {"channel":"final","text":"Ada"},
+            ]},
+        ],
+    }
+    case = trace_corpus.adapt_openresearcher(source, row, 1)
+    assert case is not None
+    assert case["metadata"]["reference_answer"] == "Ada"

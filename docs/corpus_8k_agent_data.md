@@ -63,20 +63,26 @@ This replaces the earlier `open-r1/Mixture-of-Thoughts` dependency. It is not a 
 
 ## Agent pool
 
-Default target: 8M accepted nano-tokenizer tokens.
-
-> **Target semantics.** The 4M reasoning / 8M agent values are corpus-construction defaults for accepted rendered trace tokens, not a scaling-law-derived SFT budget. Only assistant targets contribute SFT loss, so supervised-token counts are lower. Revisit these defaults after final filtering using the generated manifest's actual trace and supervised-token statistics.
+Default soft materialization target: **16M accepted nano-tokenizer tokens**. This is deliberately larger than the earlier 8M construction target; it is a data-preparation allowance, not the SFT sampling ratio or a requirement to consume every token.
 
 | source | weight | acceptance policy | role |
 | --- | ---: | --- | --- |
-| Nebius SWE-agent trajectories | 40% | `target=True` only | repository/SWE actions |
-| NVIDIA Nemotron Agentic v2 interactive | 25% | curated source rows | multi-turn tools/customer workflows |
-| NVIDIA Nemotron Agentic v2 search | 15% | curated source rows | repeated web-search decisions |
-| Official OpenSeeker v1 | 20% | `trajectory correctness=Correct` only | long-horizon search/visit research |
+| Nebius SWE-agent trajectories | 20% | `target=True` only | repository/SWE actions |
+| OpenThoughts Agent ColdStartForRL | 20% | oracle/test-verified release; deterministic next-action windows | terminal execution |
+| Official OpenSeeker v1 | 15% | `trajectory correctness=Correct` only | search/visit research |
+| OpenResearcher | 15% | official long-horizon trajectories; deterministic next-action windows | native browser research |
+| Salesforce xLAM Function Calling 60K | 15% | APIGen execution + semantic verification | generic API/function calling |
+| NVIDIA Conversational Tool-Use Pivot v1 | 15% | expected expert action per behavior-cloning context | stateful conversational tools |
 
-Successful SWE-style traces are converted to the canonical `swe_environment` tool interface rather than training a second fenced-command protocol. Official OpenSeeker search/visit trajectories are converted directly from the original compound tool format to canonical tool-call IDs/results. Oversized observations are explicitly truncated with a visible marker rather than silently rewritten.
+The old `Nemotron-SFT-Agentic-v2` `interactive_agent` and `search` splits are no longer used. The conversational capability is supplied by NVIDIA's newer pivot dataset, which turns expert trajectories into explicit context -> expected-action examples. Search diversity comes from official OpenSeeker plus OpenResearcher instead of the old Nemotron search split.
 
-Before any source is included in the final run, verify its license and training/redistribution terms separately.
+Long OpenThoughts/OpenResearcher trajectories are not naively squeezed into one 8K row. Their adapters deterministically choose a local next-action training window with bounded tool observations, preserving agent behavior while respecting the nano model's row length.
+
+xLAM's official Hugging Face repository is CC-BY-4.0 but gated behind acknowledgement of its access conditions. Kaggle/data-prep runs therefore need an authenticated Hugging Face token for which those conditions have already been accepted; do not substitute an unofficial mirror.
+
+**Target semantics.** The 16M agent value is only a corpus-construction default; verified agent sources may exhaust below their requested share without failing the build. The stage-aware SFT sampler remains separately configured at 1/3 reasoning and 2/3 agent, so increasing the materialized agent pool does not silently change the training mixture. Only assistant targets contribute SFT loss, and manifests should be used to inspect actual supervised-token counts before the final run.
+
+
 
 ## DeepSeek V4.1 rendering
 
