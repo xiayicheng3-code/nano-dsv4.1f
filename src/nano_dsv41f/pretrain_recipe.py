@@ -1,7 +1,9 @@
-"""Shared 8K TPU benchmark recipe.
+"""Shared 8K TPU model/optimizer recipe.
 
-This factory defines synthetic stress/profiling workloads, not the production
-pretraining budget. The canonical training plan is token-budgeted pretrain ->
+This factory's defaults define stress/profiling workloads, not the production
+pretraining budget. The production launcher explicitly supplies the full-budget
+step horizon and overrides native kernels with the validated preset.
+The canonical training plan is token-budgeted pretrain ->
 mid-train -> SFT (see ``training_stages`` / ``docs/training_stages.md``).
 The default 10k-step coordinate system below is retained only so historical TPU
 benchmarks keep their original LR/indexer phase locations; production launchers
