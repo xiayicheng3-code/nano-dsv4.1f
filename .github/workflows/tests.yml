@@ -27,16 +27,38 @@ jobs:
         run: >-
           pytest -q tests/test_operator_pass.py tests/test_indexer_query_budget.py tests/test_tokamax_moe.py
           -k "dropless_expert_forward_and_backward or router_loads_cross_outer_2x4_into_flat_tp or context_sharded_query_budget or ragged_ep or invalid_expert_mesh"
-      - name: Build and parse Kaggle notebook
+      - name: Build and parse Kaggle notebooks
         env:
           JAX_PLATFORMS: cpu
         run: |
           python scripts/build_notebook.py --output /tmp/nano_dsv41f_kaggle.ipynb
+          python scripts/build_cpu_chat_notebook.py --output /tmp/nano_dsv41f_cpu_chat.ipynb
           python - <<'PY'
           import nbformat
-          path = '/tmp/nano_dsv41f_kaggle.ipynb'
-          nb = nbformat.read(path, as_version=4)
-          nbformat.validate(nb)
-          assert len(nb.cells) >= 4
-          print(f'validated {path}: {len(nb.cells)} cells')
+          for path, minimum in [
+              ('/tmp/nano_dsv41f_kaggle.ipynb', 4),
+              ('/tmp/nano_dsv41f_cpu_chat.ipynb', 7),
+          ]:
+              nb = nbformat.read(path, as_version=4)
+              nbformat.validate(nb)
+              assert len(nb.cells) >= minimum
+              print(f'validated {path}: {len(nb.cells)} cells')
           PY
+
+  cpu-inference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install CPU Torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install project
+        run: pip install -e '.[dev,export,api]' 'jax==0.10.2' 'jaxlib==0.10.2'
+      - name: Test V4.1 CPU inference and API protocol
+        env:
+          JAX_PLATFORMS: cpu
+        run: pytest -q tests/test_vllm_v41_cpu.py tests/test_v41_api_protocol.py
