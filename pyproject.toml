@@ -15,7 +15,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "nbformat>=5.10"]
+dev = [
+  "pytest>=8",
+  "nbformat>=5.10",
+  # Posttraining tests exercise real tokenization and V4.1 trace rendering.
+  "tokenizers>=0.21",
+  "deepseek-recipe>=0.1",
+]
 export = ["safetensors>=0.6"]
 cpu = ["torch>=2.4", "safetensors>=0.6"]
 data = ["datasets>=3.0", "tokenizers>=0.21", "deepseek-recipe>=0.1", "kagglehub>=0.3"]
