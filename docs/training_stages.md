@@ -6,7 +6,12 @@ The canonical training plan is now three explicit stages:
 2. **Mid-train** — one curated, long-context stage that enriches code/math and introduces reasoning/agent trajectories while training the retriever/indexer.
 3. **SFT** — assistant-only supervised fine-tuning on cleaned structured conversations and trajectories.
 
-These stages have **independent budgets**. They are not three fractions of one 0–1 optimizer schedule. In particular, the 3B-token pretraining target is independent of the number of mid-training or SFT steps chosen later.
+These are separate **data and supervision regimes**; their budgets are configured
+by the experiment. The current Kaggle experiment allocates **2.4B tokens to
+pretraining and 600M to mid-training**, sharing a continuous full-3B optimizer
+schedule. SFT remains separate. This replaces the earlier experiment allocation
+of 3B base tokens plus independently budgeted mid-training; it does not restore
+the old early/middle/late-mid data stages. See [the run guide](pretrain_run.md).
 
 The machine-readable policy is `nano_dsv41f.training_stages.DEFAULT_TRAINING_STAGES`.
 
@@ -22,7 +27,7 @@ The candidate-mask column is the intended stage policy. The current training run
 
 ## 1. Pretrain
 
-Use the dedicated pretraining-only pipeline rather than the old staged corpus builder. The current target is:
+Use the dedicated pretraining-only pipeline rather than the old staged corpus builder. The prepared corpus target is:
 
 - **3,000,000,000** non-padding training tokens measured with the frozen nano tokenizer;
 - **10,000,000** validation tokens;
@@ -32,7 +37,10 @@ Use the dedicated pretraining-only pipeline rather than the old staged corpus bu
 - no reasoning/agent mixture and no assistant-only loss mask;
 - the existing late selective indexer auxiliary may remain enabled, with candidate masking off.
 
-The implementation currently lives on the pretraining-data line (`codex/pretrain-only-3b`) and should be integrated into the surviving branch history rather than reimplemented here.
+The data preparation implementation is integrated into main. The production
+notebook consumes **2.4B** non-padding tokens from this 3B-token corpus, then saves
+a full continuation checkpoint. Preparing 3B corpus tokens does not require
+training on every row in the first stage.
 
 Pretraining is deliberately simple at the data level. Its job is to acquire broad language/statistical capacity before we spend substantial mixture budget on tool syntax and reasoning formats. The configured late indexer auxiliary can still begin training retrieval before the dedicated mid-training stage.
 
@@ -65,7 +73,13 @@ All mid-training document rows are Q-aware. We keep the existing query-budget di
 
 Mid-training continues the selective indexer-distillation auxiliary objective. The hierarchical L3→L5 candidate restriction remains **off** here so the student can learn against all legal compressed history.
 
-Mid-training has its own `--total-steps` value. That argument means **mid-training steps**, not a fraction of pretraining.
+The data-preparation wrapper has its own `--total-steps` value. That argument
+sizes the **mid-training corpus**; it does not reset the optimizer schedule.
+For the current 80/20 experiment the mid-training training budget is 600M tokens,
+and its launcher must preserve the full-3B optimizer schedule and learned state.
+The source mixtures below remain preparation defaults; the proposed 50% broad /
+25% extra code-technical / 15% math-solutions / 10% agent mixture will be selected
+when preparing the second notebook, not by this pretraining launcher.
 
 ## 3. SFT
 

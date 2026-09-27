@@ -38,6 +38,15 @@ compact shards with bounded memory, and resumes completed source files. It runs
 independently of mid-training and SFT/agent-trace preparation. See
 [the data guide](docs/pretrain_data.md) for storage, restart, and training-loader details.
 
+## Run pretraining on Kaggle
+
+Use [the pretraining notebook](notebooks/nano_dsv41f_pretrain.ipynb) on a fresh
+TPU v5e-8 session with the prepared corpus and tokenizer attached. It runs the
+validated four-row, tile1024, quarter-buffer preset for **2.4B non-padding tokens**,
+reserving **600M** of this experiment's 3B budget for mid-training. It includes
+held-out validation, full resumable checkpoints and an eight-hour session deadline.
+See [the run guide](docs/pretrain_run.md) for the exact schedule and resume procedure.
+
 ## Why I built it
 
 Large-model architecture papers often make individual ideas look simple in isolation, while the hard part is how they interact in an executable system. This repo reconstructs those interactions explicitly and makes them small enough to inspect:
