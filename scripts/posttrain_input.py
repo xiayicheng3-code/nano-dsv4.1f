@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from pretrain_checkpoint import digest_file
 
-FORMAT = 'nano-dsv41f-posttrain-v1'
+FORMAT = 'nano-dsv41f-posttrain-v2'
 
 
 def inspect(root):
@@ -17,6 +17,8 @@ def inspect(root):
     root = matches[0].parent
     manifest = json.loads(matches[0].read_text())
     if manifest.get('format') != FORMAT or not manifest.get('complete'):
+        if manifest.get('format') == 'nano-dsv41f-posttrain-v1':
+            raise ValueError('This corpus uses the old shared midtrain/SFT trace view; rebuild it with the v2 CPU notebook')
         raise ValueError('Incomplete/unsupported posttrain corpus')
     if digest_file(root / 'tokenizer.json') != manifest['identity']['tokenizer_sha256']:
         raise ValueError('Tokenizer checksum mismatch')

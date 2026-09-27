@@ -3,6 +3,7 @@
 Run `notebooks/nano_dsv41f_prepare_midtrain8k_sft16k_cpu.ipynb` on Kaggle CPU,
 then `notebooks/nano_dsv41f_midtrain8k_sft16k_tpu.ipynb` on TPU v5e-8.
 Pretraining preparation and the 2.4B base run remain separate notebooks.
+The corpus format is `nano-dsv41f-posttrain-v2`; regenerate any older v1 output.
 
 ## Corpus and selection
 
@@ -15,9 +16,19 @@ The checkpoint/corpus/tokenizer identities must agree before tail extraction.
 
 The reasoning and agent source catalog stays unchanged. Each source is streamed
 once, with no observation character truncation in this path. Canonical normalized
-histories are retained as gzip JSONL. Batched Rust tokenization produces independent
-8K and 16K views. A view keeps the longest complete original prefix ending at an
-assistant EOS that fits; it never removes earlier context or clips a tool result.
+histories are retained as gzip JSONL. Batched Rust tokenization builds both
+possible views, then an independent selector assigns each source-local task to
+either midtrain or SFT. The selected record is written once, so it cannot be
+repacked into both stages. SFT has separate 30M reasoning and 60M agent
+collection targets before the same 10% preparation headroom, with a configurable
+share of genuinely long (>8K) individual traces. xLAM is explicitly short-only.
+
+A view keeps the longest complete original prefix ending at an assistant EOS that
+fits; it never removes earlier context or clips a tool result. A task with no
+complete 8K prefix is SFT-only. When a complete 16K view is genuinely longer than
+8K, it is reserved for SFT while that source's long quota has capacity. Otherwise
+a stable task hash assigns dual-eligible tasks to one stage. Once a task is owned,
+later variants cannot cross stages. Short rows never backfill the long SFT bucket.
 Long single-answer reasoning examples are rejected for the short view. Pivot
 examples are rejected if the expected action cannot fit, and only that last
 expected action receives SFT loss. Other traces supervise all retained assistant
@@ -33,20 +44,22 @@ accepted trajectory per task. Correct final answers do not verify every action. 
 certificate. No additional LLM judge is introduced.
 
 A stable source + task-ID (or initial-user-text) hash selects a 2% trace validation holdout
-before both packing views, preventing the same exact task's different generations
+before stage selection, preventing the same exact task's different generations
 from crossing the split within a source. This is not fuzzy cross-source benchmark
-decontamination. Documents reserve about 2% of shards for validation; chunks from
-a document can occur on both sides, so document validation is only a monitoring
-signal. Train manifests report genuine >8K trace counts separately from 16K row
-occupancy. Packing remains compression-pair-aligned and Q-aware with segment
+decontamination: task IDs are source-local and the builder does not claim semantic
+deduplication between datasets. Documents reserve about 2% of shards for validation;
+chunks from a document can occur on both sides, so document validation is only a
+monitoring signal. Train manifests report genuine >8K trace counts separately from
+16K row occupancy, plus per-source selection targets and shortfalls. Packing remains compression-pair-aligned and Q-aware with segment
 boundaries. CPU memory is bounded per trace buffer; the document packer retains
 its document-token arrays in RAM. At 480M tokens that component requires several
 GB including intermediate arrays; use a normal Kaggle CPU RAM allocation.
 
 Completed source units can be reused after copying saved outputs into the CPU
 output directory. A changed tokenizer/budget/seed/builder requires a new directory.
-The TPU reader verifies shard checksums before training. Interrupted source units
-are rebuilt rather than trusted.
+The v2 TPU reader verifies shard checksums before training and rejects a v1 corpus,
+because v1 duplicated selected traces across stages. Interrupted source units are
+rebuilt rather than trusted.
 
 ## Training
 

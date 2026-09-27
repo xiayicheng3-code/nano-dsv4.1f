@@ -299,7 +299,7 @@ def test_jitted_sft_compiler_passes_separate_mask_without_masking_context(monkey
     assert int(metrics['visible'])==8 and int(metrics['targets'])==3
 
 
-def test_real_renderer_tokenizer_collection_writes_both_views(tmp_path,monkeypatch):
+def test_real_renderer_tokenizer_collection_writes_disjoint_stage_records(tmp_path,monkeypatch):
     from types import SimpleNamespace
     import gzip
     from tokenizers import Tokenizer,models,pre_tokenizers,AddedToken
@@ -312,7 +312,9 @@ def test_real_renderer_tokenizer_collection_writes_both_views(tmp_path,monkeypat
     rows=[{'question':f'Question {i}','solution':'Reason '* (i+1),'answer':'42',
            'subject':'Physics','correctness':True} for i in range(100)]
     monkeypatch.setattr(data,'source_stream',lambda *a:iter(rows))
-    args=SimpleNamespace(output=tmp_path,midtrain_tokens=1_000_000,headroom=1.1,seed=1701,
+    args=SimpleNamespace(output=tmp_path,midtrain_tokens=1_000_000,
+                         sft_reasoning_tokens=1_000_000,sft_agent_tokens=1_000_000,
+                         sft_long_token_fraction=0.0,headroom=1.1,seed=1701,
                          shard_rows=2,tokenize_batch_size=16)
     result=data.build_trace_source(source,args,tok)
     assert result['collection']['canonical_records']==100
@@ -322,9 +324,117 @@ def test_real_renderer_tokenizer_collection_writes_both_views(tmp_path,monkeypat
         saved=[json.loads(x) for x in f]
     assert len(saved)==100
     assert all(1<=c['reasoning_effort']<=100 for c in saved)
+    assert len({c['metadata']['task_sha256'] for c in saved}) == 100
+    assert result['selection']['cross_stage_task_overlap'] == 0
+    assert sum(result['views'][stage][split].get('records', 0)
+               for stage in ('midtrain','sft') for split in ('train','validation')) == 100
     for stage,length in [('midtrain',8192),('sft',16384)]:
         for split in ('train','validation'):
             for shard in result['views'][stage][split]['shards']:
                 with np.load(tmp_path/stage/source.key/split/shard['file']) as a:
                     assert a['input_ids'].shape[1]==length
                     assert not (a['sft_loss_mask'].astype(bool)&~a['token_mask'].astype(bool)).any()
+
+
+def selection_fixture(midtrain_tokens=2_000, sft_reasoning_tokens=200, long_fraction=.5):
+    source = replace(next(s for s in adapters.REASONING_SOURCES if s.key == 'chimera_science'), weight=1.0)
+    from types import SimpleNamespace
+    args = SimpleNamespace(midtrain_tokens=midtrain_tokens,
+        sft_reasoning_tokens=sft_reasoning_tokens, sft_agent_tokens=200,
+        sft_long_token_fraction=long_fraction, headroom=1.0)
+    return source, data.StageSelection(source, args)
+
+
+def trace_of_length(length):
+    return data.TokenizedTrace(np.zeros(length, np.uint16), np.ones(length, np.uint8),
+                               'chimera_science', 0, 0, {})
+
+
+def task_with_parity(source, parity, prefix='task'):
+    for i in range(10_000):
+        task = f'{prefix}-{i}'
+        digest = hashlib.sha256((source.key + '\n' + task).encode()).hexdigest()
+        if int(digest[8:16], 16) % 2 == parity:
+            return task
+    raise AssertionError('could not find a stable task hash')
+
+
+def test_sft_selection_continues_after_midtrain_fills_and_short_cannot_fill_long():
+    source, selection = selection_fixture()
+    mid_task = task_with_parity(source, 1)
+    assert selection.select(mid_task, {'midtrain': trace_of_length(100),
+                                       'sft': trace_of_length(100)})[0] == 'midtrain'
+    sft_task = task_with_parity(source, 0, 'sft')
+    assert selection.select(sft_task, {'midtrain': trace_of_length(100),
+                                       'sft': trace_of_length(100)})[0] == 'sft'
+    assert selection.tokens['midtrain'] == selection.targets['midtrain']
+    assert selection.tokens['sft_short'] == selection.targets['sft_short']
+    short_late = task_with_parity(source, 0, 'short-late')
+    assert selection.select(short_late, {'midtrain': trace_of_length(100),
+                                         'sft': trace_of_length(100)}) is None
+    long_only = 'late-long-answer'
+    selected = selection.select(long_only, {'midtrain': None, 'sft': trace_of_length(10_000)})
+    assert selected[0:3] == ('sft', 'train', 'sft_long')
+    assert selection.done
+    assert selection.audit()['cross_stage_task_overlap'] == 0
+
+
+def test_variants_of_an_owned_task_cannot_cross_stages():
+    source, selection = selection_fixture()
+    task = task_with_parity(source, 1, 'owned')
+    assert selection.select(task, {'midtrain': trace_of_length(100),
+                                   'sft': trace_of_length(100)})[0] == 'midtrain'
+    assert selection.select(task, {'midtrain': None, 'sft': trace_of_length(10_000)}) is None
+    assert selection.audit()['cross_stage_task_overlap'] == 0
+
+
+def test_sft_quotas_are_independent_of_midtrain_and_xlam_is_short_only():
+    source, selection = selection_fixture(midtrain_tokens=20_000, sft_reasoning_tokens=400)
+    assert selection.targets['midtrain'] == 1_000
+    assert selection.targets['sft_short'] == 200
+    assert selection.targets['sft_long'] == 200
+    xlam = replace(next(s for s in adapters.AGENT_SOURCES if s.key == 'xlam_verified'), weight=1.0)
+    from types import SimpleNamespace
+    xsel = data.StageSelection(xlam, SimpleNamespace(midtrain_tokens=20_000,
+        sft_reasoning_tokens=200, sft_agent_tokens=400, sft_long_token_fraction=.5, headroom=1.0))
+    task = task_with_parity(xlam, 0, 'xlam')
+    assert xsel.select(task, {'midtrain': trace_of_length(100), 'sft': trace_of_length(10_000)}) is None
+    short = xsel.select('xlam-short', {'midtrain': None, 'sft': trace_of_length(100)})
+    assert short[0:3] == ('sft', 'train', 'sft_short')
+    assert xsel.targets['sft_long'] == 0
+
+
+def test_old_shared_corpus_is_rejected(tmp_path):
+    (tmp_path / 'posttrain_manifest.json').write_text(json.dumps({
+        'format': 'nano-dsv41f-posttrain-v1', 'complete': True}))
+    with pytest.raises(ValueError, match='old shared'):
+        inputs.inspect(tmp_path)
+
+
+def test_builder_reads_later_long_reasoning_after_midtrain_quota(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer, models, pre_tokenizers, AddedToken
+    vocab = {token: i for i, token in enumerate(SPECIAL_TOKENS)}
+    vocab['[UNK]'] = len(vocab)
+    tok = Tokenizer(models.WordLevel(vocab, unk_token='[UNK]'))
+    tok.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok.add_special_tokens([AddedToken(x, special=True) for x in SPECIAL_TOKENS])
+    source = next(s for s in adapters.REASONING_SOURCES if s.key == 'chimera_science')
+    question = next(f'first-{i}' for i in range(1000)
+                    if int(hashlib.sha256((source.key + '\n' + f'first-{i}').encode()).hexdigest()[8:16], 16) % 2)
+    rows = [
+        {'question': question, 'solution': 'Reason ' * 40, 'answer': '42',
+         'subject': 'Physics', 'correctness': True},
+        {'question': 'later-long', 'solution': 'Reason ' * 10_000, 'answer': '42',
+         'subject': 'Physics', 'correctness': True},
+    ]
+    monkeypatch.setattr(data, 'source_stream', lambda *a: iter(rows))
+    args = SimpleNamespace(output=tmp_path, midtrain_tokens=2_000,
+        sft_reasoning_tokens=200, sft_agent_tokens=200, sft_long_token_fraction=0.5,
+        headroom=1.0, seed=1701, shard_rows=2, tokenize_batch_size=1)
+    result = data.build_trace_source(source, args, tok)
+    assert result['collection']['rows_seen'] == 2
+    assert result['views']['midtrain']['train']['records'] == 1
+    assert result['views']['sft']['train']['records'] == 1
+    assert result['views']['sft']['train']['genuine_over_8k_records'] == 1
+    assert result['selection']['cross_stage_task_overlap'] == 0

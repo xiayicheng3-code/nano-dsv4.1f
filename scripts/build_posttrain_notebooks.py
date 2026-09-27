@@ -29,9 +29,12 @@ Select **CPU**, turn **Internet on**, attach the tokenizer dataset
 
 Builds a **600M-token midtrain allocation** (480M documents / 30M reasoning /
 90M agents), with 10% preparation headroom. Canonical full histories are saved
-before the independent 8192/16384 packing passes. SFT uses the same selected
-source pool with **16K complete prefixes**, assistant-only labels, and a separate
-1:2 reasoning/agent sampler. Its one-pass budget is computed after materialization.
+before stage selection. SFT has its own 30M reasoning / 60M agent collection
+targets and a configurable share of genuinely long (>8K) individual traces;
+stage ownership is task-disjoint, so selected SFT traces are not repacked into
+midtrain. A trace that has no complete 8K prefix is retained directly for SFT.
+Its one-pass training budget is computed after materialization at a separate 1:2
+reasoning/agent ratio.
 
 To reuse the unused FineWeb pretrain tail, also attach the pretrain-tokenized
 dataset and completed pretrain checkpoint; set both paths below. The checkpoint's
@@ -42,11 +45,12 @@ Tool observations are preserved. Overlong conversations end at a complete assist
 turn; this retains the original prefix, never a disconnected tail. Overlong single
 reasoning answers and Pivot targets that cannot fit are dropped. Canonical JSONL
 is retained for later repacking. A stable task hash holds out 2% of trace tasks
-before packing, shared across both stages. OpenResearcher requires a conservative exact final-answer match to its reference;
+before packing. OpenResearcher requires a conservative exact final-answer match to its reference;
 completion status alone is not accepted as correctness. This does not verify every action.
 
-Source exhaustion is reported; the TPU runner refuses an underfilled 600M mix
-instead of repeating data or substituting another pool silently.'''),
+Source exhaustion and any unfilled SFT-long quota are reported; the audit stops
+before TPU training rather than repeating data, substituting a short trace for a
+long quota, or silently reusing a task across stages.'''),
         code('''import os
 from pathlib import Path
 import subprocess
@@ -59,7 +63,10 @@ TOKENIZER_ROOT = Path('/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-to
 PRETRAIN_CORPUS = ''
 PRETRAIN_CHECKPOINT = ''  # directory containing manifest.json or latest.json
 MIDTRAIN_TOKENS = 600_000_000
-OUTPUT = Path('/kaggle/working/posttrain-corpus')
+SFT_REASONING_TOKENS = 30_000_000
+SFT_AGENT_TOKENS = 60_000_000
+SFT_LONG_TOKEN_FRACTION = 0.50
+OUTPUT = Path('/kaggle/working/posttrain-corpus-v2')
 # Resume CPU preparation from saved outputs by copying posttrain-corpus to OUTPUT.
 # Completed source manifests are reused only with identical build settings.
 ROOT = Path('/kaggle/working/nano-dsv4.1f')
@@ -99,6 +106,9 @@ if bool(PRETRAIN_CORPUS) != bool(PRETRAIN_CHECKPOINT):
 command = [sys.executable,'-u','scripts/prepare_posttrain_corpus.py',
     '--tokenizer',str(TOKENIZER),'--output',str(OUTPUT),
     '--midtrain-tokens',str(MIDTRAIN_TOKENS),'--headroom','1.10',
+    '--sft-reasoning-tokens',str(SFT_REASONING_TOKENS),
+    '--sft-agent-tokens',str(SFT_AGENT_TOKENS),
+    '--sft-long-token-fraction',str(SFT_LONG_TOKEN_FRACTION),
     '--tokenize-batch-size','16','--shard-rows','128','--seed','1701']
 if PRETRAIN_CORPUS:
     command += ['--pretrain-corpus',PRETRAIN_CORPUS,'--pretrain-checkpoint',PRETRAIN_CHECKPOINT]
@@ -121,6 +131,13 @@ for stage in ('midtrain','sft'):
         if source['exhausted_before_target']:
             print('  Source exhausted before requested quota:',source['collection'])
 print('Initial one-pass SFT raw-token budget:',sft_budget(manifest))
+overlap = {s['source']['key']: s['selection']['cross_stage_task_overlap'] for s in manifest['sources']
+           if s['selection']['cross_stage_task_overlap']}
+if overlap: raise RuntimeError(f'Task overlap between stages: {overlap}')
+long_shortfalls = {s['source']['key']: s['selection']['shortfall_tokens']['sft_long']
+                   for s in manifest['sources'] if s['selection']['shortfall_tokens']['sft_long']}
+if long_shortfalls:
+    raise RuntimeError(f'SFT long-trace quotas underfilled; inspect source exhaustion before training: {long_shortfalls}')
 long_records = sum(s['views']['sft']['train'].get('genuine_over_8k_records',0) for s in manifest['sources'])
 if not long_records: raise RuntimeError('No genuine >8K traces survived: inspect source length rejection statistics')
 for pool, weight in manifest['pool_mix']['midtrain'].items():
@@ -140,7 +157,8 @@ them; choose dataset visibility and attribution when you create the Kaggle datas
     tpu = save('midtrain8k_sft16k_tpu', [
         md('''# TPU v5e-8: 8K midtrain -> 16K SFT
 
-Select **TPU v5e-8**, enable Internet, attach the prepared posttrain corpus and the
+Select **TPU v5e-8**, enable Internet, attach the **v2** prepared posttrain corpus
+(the CPU builder rejects/rebuilds the old shared-view corpus) and the
 **completed 2.4B pretrain checkpoint**. Set their paths below. This notebook runs
 both remaining stages in order, with no new model initialization for training.
 

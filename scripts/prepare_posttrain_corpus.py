@@ -23,7 +23,7 @@ from nano_dsv41f.reasoning_effort import assign_length_guided_reasoning_effort, 
 from nano_dsv41f.trace_corpus import TokenizedTrace, assistant_sft_loss_mask, render_case_v41
 from nano_dsv41f.training_stages import MIDTRAIN_DOCUMENT_PHASE
 
-FORMAT = 'nano-dsv41f-posttrain-v1'
+FORMAT = 'nano-dsv41f-posttrain-v2'
 LENGTHS = {'midtrain': 8192, 'sft': 16384}
 
 
@@ -109,13 +109,91 @@ def source_stream(source, seed):
         yield from traces.load_stream(replace(source, config=config), seed=seed + offset, shuffle_buffer=128)
 
 
+class StageSelection:
+    """Assign each source-local task to exactly one post-training stage."""
+    def __init__(self, source, args):
+        mid_mix = 0.05 if source.pool == 'reasoning' else 0.15
+        mid_target = args.midtrain_tokens * mid_mix * source.weight * args.headroom
+        sft_total = ((args.sft_reasoning_tokens if source.pool == 'reasoning'
+                      else args.sft_agent_tokens) * source.weight * args.headroom)
+        long_fraction = 0.0 if source.key == 'xlam_verified' else args.sft_long_token_fraction
+        self.source = source
+        self.targets = {
+            'midtrain': math.ceil(mid_target),
+            'sft_short': math.ceil(sft_total * (1.0 - long_fraction)),
+            'sft_long': math.ceil(sft_total * long_fraction),
+        }
+        self.tokens = Counter()
+        self.owners = {}
+        self.accepted_tasks = {'midtrain': set(), 'sft': set()}
+        self.stats = Counter()
+
+    @property
+    def done(self):
+        return all(self.tokens[bucket] >= target for bucket, target in self.targets.items())
+
+    def select(self, task, views):
+        available = {stage: view for stage, view in views.items() if view is not None}
+        if not available:
+            self.stats['no_complete_prefix'] += 1
+            return None
+        task_hash = hashlib.sha256(
+            (self.source.key + '\n' + task).encode('utf-8')
+        ).hexdigest()
+        owner = self.owners.get(task_hash)
+        if owner is None:
+            long_view = available.get('sft') is not None and len(available['sft'].tokens) > 8192
+            if 'sft' in available and 'midtrain' not in available:
+                owner = 'sft'
+                self.stats['sft_only_tasks_reserved'] += 1
+            elif long_view and self.tokens['sft_long'] < self.targets['sft_long']:
+                owner = 'sft'
+                self.stats['long_tasks_reserved'] += 1
+            elif 'midtrain' in available and 'sft' in available:
+                owner = 'sft' if int(task_hash[8:16], 16) % 2 == 0 else 'midtrain'
+            else:
+                owner = next(iter(available))
+            self.owners[task_hash] = owner
+        view = available.get(owner)
+        if view is None:
+            self.stats['owner_missing_view'] += 1
+            return None
+        if owner == 'midtrain':
+            bucket = 'midtrain'
+        else:
+            bucket = 'sft_long' if len(view.tokens) > 8192 else 'sft_short'
+        if self.tokens[bucket] >= self.targets[bucket]:
+            self.stats[f'{bucket}_quota_full'] += 1
+            return None
+        split = 'validation' if int(task_hash[:8], 16) % 50 == 0 else 'train'
+        if split == 'train':
+            self.tokens[bucket] += len(view.tokens)
+        self.accepted_tasks[owner].add(task_hash)
+        return owner, split, bucket, task_hash, view
+
+    def audit(self):
+        overlap = self.accepted_tasks['midtrain'] & self.accepted_tasks['sft']
+        if overlap:
+            raise AssertionError('a task was selected for both post-training stages')
+        return {
+            'targets': dict(self.targets),
+            'accepted_train_tokens': dict(self.tokens),
+            'shortfall_tokens': {
+                bucket: max(0, target - self.tokens[bucket])
+                for bucket, target in self.targets.items()
+            },
+            'selected_tasks': {stage: len(tasks) for stage, tasks in self.accepted_tasks.items()},
+            'cross_stage_task_overlap': len(overlap),
+            'stats': dict(self.stats),
+        }
+
+
 def build_trace_source(source, args, tokenizer):
     source = replace(source, max_observation_chars=None, preserve_history=True)
     key = source.key
     canonical = args.output / 'canonical' / f'{key}.jsonl.gz'
     canonical.parent.mkdir(parents=True, exist_ok=True)
-    target = math.ceil(args.midtrain_tokens * (0.05 if source.pool == 'reasoning' else 0.15)
-                       * source.weight * args.headroom)
+    selection = StageSelection(source, args)
     writers = {(stage, split): Writer(args.output / stage / key / split, length, args.seed, args.shard_rows)
                for stage, length in LENGTHS.items() for split in ('train', 'validation')}
     stats = Counter()
@@ -154,26 +232,28 @@ def build_trace_source(source, args, tokenizer):
                 if not any(v is not None for v in views.values()):
                     stats['no_complete_prefix'] += 1
                     continue
-                seen_tasks.add(task)
+                choice = selection.select(task, views)
+                if choice is None:
+                    stats['selection_rejected'] += 1
+                    continue
+                stage, split, bucket, task_hash, view = choice
                 case['metadata'].update(canonical_sha256=digest,
                     supervision='final_expected_action' if key == 'nemotron_conversational_pivot' else 'assistant_spans',
-                    effort_assignment='batch_reasoning_token_percentile_v1')
+                    effort_assignment='batch_reasoning_token_percentile_v1',
+                    selected_stage=stage, selected_split=split, selected_bucket=bucket,
+                    task_sha256=task_hash, selected_view_tokens=len(view.tokens))
                 out.write(json.dumps(case, ensure_ascii=False) + '\n')
                 stats['canonical_records'] += 1
-                task_hash = hashlib.sha256((key + '\n' + task).encode()).hexdigest()
-                split = 'validation' if int(task_hash[:8], 16) % 50 == 0 else 'train'
-                for stage, view in views.items():
-                    if view is not None:
-                        writers[stage, split].add(view)
-                    else:
-                        stats[f'{stage}_too_long'] += 1
+                writers[stage, split].add(view)
+                if key == 'openresearcher':
+                    seen_tasks.add(task)
             batch.clear()
 
         for index, row in enumerate(source_stream(source, args.seed)):
             stats['rows_seen'] += 1
             if stats['rows_seen'] % 250 == 0:
-                print(key, 'rows', stats['rows_seen'], 'accepted midtrain tokens',
-                      writers['midtrain', 'train'].counts['real_tokens'], flush=True)
+                print(key, 'rows', stats['rows_seen'], 'selected tokens',
+                      dict(selection.tokens), 'targets', selection.targets, flush=True)
             case = traces.ADAPTERS[source.adapter](source, row, index)
             if case is None:
                 stats['adapter_rejected'] += 1
@@ -181,17 +261,20 @@ def build_trace_source(source, args, tokenizer):
             batch.append(case)
             if len(batch) >= args.tokenize_batch_size:
                 flush()
-                if writers['midtrain', 'train'].counts['real_tokens'] >= target:
+                if selection.done:
                     break
         flush()
-    result = {'source': asdict(source), 'pool': source.pool, 'target_midtrain_tokens': target,
+    audit = selection.audit()
+    result = {'source': asdict(source), 'pool': source.pool,
+              'target_midtrain_tokens': selection.targets['midtrain'],
+              'target_sft_tokens': selection.targets['sft_short'] + selection.targets['sft_long'],
+              'selection': audit,
               'configs': [f'seed_{i}' for i in range(42,58)] if key == 'openresearcher' else [source.config],
               'canonical': str(canonical.relative_to(args.output)), 'collection': dict(stats),
               'views': {stage: {split: writers[stage, split].finish() for split in ('train', 'validation')}
                         for stage in LENGTHS}}
-    result['exhausted_before_target'] = result['views']['midtrain']['train'].get('real_tokens', 0) < target
-    if any(v['train']['rows'] == 0 for v in result['views'].values()):
-        raise RuntimeError(f'{key}: empty stage view; inspect adapter/length rejection statistics: {stats}')
+    result['exhausted_before_target'] = any(audit['shortfall_tokens'].values())
+    result['exhausted_buckets'] = [bucket for bucket, shortfall in audit['shortfall_tokens'].items() if shortfall]
     atomic_json(args.output / 'canonical' / f'{key}.manifest.json', result)
     print(json.dumps({k: v for k, v in result.items() if k != 'views'}), flush=True)
     return result
@@ -251,7 +334,11 @@ def run(args):
         if tokenizer.token_to_id(token) != ident:
             raise ValueError(f'Tokenizer contract mismatch: {token}')
     identity = {'tokenizer_sha256': traces.sha256_file(args.tokenizer),
-                'midtrain_tokens': args.midtrain_tokens, 'headroom': args.headroom, 'seed': args.seed,
+                'midtrain_tokens': args.midtrain_tokens,
+                'sft_reasoning_tokens': args.sft_reasoning_tokens,
+                'sft_agent_tokens': args.sft_agent_tokens,
+                'sft_long_token_fraction': args.sft_long_token_fraction,
+                'selection_version': 2, 'headroom': args.headroom, 'seed': args.seed,
                 'tokenize_batch_size': args.tokenize_batch_size, 'shard_rows': args.shard_rows,
                 'pretrain_corpus': str(args.pretrain_corpus), 'pretrain_checkpoint': str(args.pretrain_checkpoint),
                 'builder_sha256': hashlib.sha256(Path(__file__).read_bytes() + Path(traces.__file__).read_bytes()).hexdigest()}
@@ -268,10 +355,15 @@ def run(args):
         sources.append(json.loads(path.read_text()) if path.exists() else build_trace_source(source, args, tokenizer))
     manifest = {'format': FORMAT, 'complete': True, 'identity': identity,
         'lengths': LENGTHS, 'midtrain_target_tokens': args.midtrain_tokens,
+        'sft_collection_targets': {'reasoning_tokens': args.sft_reasoning_tokens,
+                                   'agent_tokens': args.sft_agent_tokens,
+                                   'long_token_fraction': args.sft_long_token_fraction},
         'documents': {'path': 'documents/midtrain', **doc['packed']}, 'sources': sources,
+        'selection_audit': {s['source']['key']: s['selection'] for s in sources},
         'pool_mix': {'midtrain': {'document': .8, 'reasoning': .05, 'agent': .15},
                      'sft': {'reasoning': 1/3, 'agent': 2/3}},
-        'sft_policy': 'one-pass maximum at 1:2 pool ratio; limit set from materialized capacity; no implicit repeats',
+        'selection_policy': 'source-local task ownership: each accepted trace belongs to exactly one stage; long complete >8K traces are reserved for SFT while its long quota has capacity; SFT-only prefixes are retained; short rows never backfill the long bucket',
+        'sft_policy': 'independent collection targets with a one-pass maximum at 1:2 pool ratio; limit set from materialized capacity; no implicit repeats',
         'context_policy': 'complete original prefix through assistant EOS; no observation truncation or disconnected tails'}
     atomic_json(args.output / 'posttrain_manifest.json', manifest)
     print('Completed:', args.output / 'posttrain_manifest.json', flush=True)
@@ -282,6 +374,9 @@ def parse_args():
     p.add_argument('--tokenizer', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--midtrain-tokens', type=int, default=600_000_000)
+    p.add_argument('--sft-reasoning-tokens', type=int, default=30_000_000)
+    p.add_argument('--sft-agent-tokens', type=int, default=60_000_000)
+    p.add_argument('--sft-long-token-fraction', type=float, default=0.5)
     p.add_argument('--headroom', type=float, default=1.10)
     p.add_argument('--seed', type=int, default=1701)
     p.add_argument('--shard-rows', type=int, default=128)
@@ -291,7 +386,9 @@ def parse_args():
     a = p.parse_args()
     if bool(a.pretrain_corpus) != bool(a.pretrain_checkpoint):
         p.error('Pass both pretrain corpus and completed checkpoint to reuse unused rows')
-    if a.midtrain_tokens <= 0 or a.headroom < 1 or min(a.shard_rows, a.tokenize_batch_size) <= 0:
+    if (min(a.midtrain_tokens, a.sft_reasoning_tokens, a.sft_agent_tokens,
+            a.shard_rows, a.tokenize_batch_size) <= 0 or a.headroom < 1 or
+            not 0 <= a.sft_long_token_fraction <= 1):
         p.error('Require positive budgets/batches and headroom >= 1')
     return a
 
