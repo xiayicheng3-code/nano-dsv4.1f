@@ -365,6 +365,6 @@ Primary references are the DeepSeek-V4.1-Flash technical report/released configu
 
 This project is unaffiliated with DeepSeek.
 
-## 8K midtrain and 16K SFT
+## 8K midtrain and 32K SFT
 
-The [CPU preparation notebook](notebooks/nano_dsv41f_prepare_midtrain8k_sft16k_cpu.ipynb) builds separate stage corpora and saves canonical traces. The [TPU training notebook](notebooks/nano_dsv41f_midtrain8k_sft16k_tpu.ipynb) continues a completed pretrain checkpoint through both stages. See [budgets, selection and resume behavior](docs/posttrain_8k_16k.md).
+The [CPU preparation notebook](notebooks/nano_dsv41f_prepare_midtrain8k_sft32k_cpu.ipynb) builds separate stage corpora and saves canonical traces. The [TPU training notebook](notebooks/nano_dsv41f_midtrain8k_sft32k_tpu.ipynb) continues a completed pretrain checkpoint through both stages. See [budgets, selection and resume behavior](docs/posttrain_8k_32k.md).

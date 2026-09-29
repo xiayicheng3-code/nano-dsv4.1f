@@ -20,21 +20,30 @@ def save(name, cells):
 
 def build():
     md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
-    cpu = save('prepare_midtrain8k_sft16k_cpu', [
-        md('''# Prepare 8K midtrain + 16K SFT on CPU
+    cpu = save('prepare_midtrain8k_sft32k_cpu', [
+        md('''# Prepare 8K midtrain + 32K SFT on CPU
 
 Select **CPU**, turn **Internet on**, attach the tokenizer dataset
 `xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb`, and enable the Kaggle secret
 `HF_TOKEN` after accepting the official Salesforce xLAM dataset access conditions.
 
 Builds a **600M-token midtrain allocation** (480M documents / 30M reasoning /
-90M agents), with 10% preparation headroom. Canonical full histories are saved
-before stage selection. SFT has its own 30M reasoning / 60M agent collection
+90M agents), with 10% preparation headroom. Full canonical histories are saved for selected traces. SFT has its own 30M reasoning / 60M agent collection
 targets and a configurable share of genuinely long (>8K) individual traces;
 stage ownership is task-disjoint, so selected SFT traces are not repacked into
 midtrain. A trace that has no complete 8K prefix is retained directly for SFT.
 Its one-pass training budget is computed after materialization at a separate 1:2
-reasoning/agent ratio.
+reasoning/agent ratio. Pivot uses a separate 5% long-token target (capped by the
+global fraction); xLAM remains short-only. These are collection targets, not measured yields.
+
+Successful SWE `submit` actions are preserved without fabricating a tool response.
+For successful source-context-limit exits, the unobserved final action is removed
+and the observed prefix retained, with the policy recorded in canonical metadata.
+
+This is a **v3, 32K SFT rebuild**. Use the fresh output directory below; old v2
+source manifests/shards and posttrain checkpoints are incompatible. The completed
+pretrain checkpoint remains the starting point. The 600M midtrain pool-capacity
+audit is still required; switching SFT to 32K does not fill an 8K midtrain shortfall.
 
 To reuse the unused FineWeb pretrain tail, also attach the pretrain-tokenized
 dataset and completed pretrain checkpoint; set both paths below. The checkpoint's
@@ -66,7 +75,8 @@ MIDTRAIN_TOKENS = 600_000_000
 SFT_REASONING_TOKENS = 30_000_000
 SFT_AGENT_TOKENS = 60_000_000
 SFT_LONG_TOKEN_FRACTION = 0.50
-OUTPUT = Path('/kaggle/working/posttrain-corpus-v2')
+SFT_PIVOT_LONG_TOKEN_FRACTION = 0.05  # mostly short expert-action contexts
+OUTPUT = Path('/kaggle/working/posttrain-corpus-v3')
 # Resume CPU preparation from saved outputs by copying posttrain-corpus to OUTPUT.
 # Completed source manifests are reused only with identical build settings.
 ROOT = Path('/kaggle/working/nano-dsv4.1f')
@@ -109,6 +119,7 @@ command = [sys.executable,'-u','scripts/prepare_posttrain_corpus.py',
     '--sft-reasoning-tokens',str(SFT_REASONING_TOKENS),
     '--sft-agent-tokens',str(SFT_AGENT_TOKENS),
     '--sft-long-token-fraction',str(SFT_LONG_TOKEN_FRACTION),
+    '--sft-pivot-long-token-fraction',str(SFT_PIVOT_LONG_TOKEN_FRACTION),
     '--tokenize-batch-size','16','--shard-rows','128','--seed','1701']
 if PRETRAIN_CORPUS:
     command += ['--pretrain-corpus',PRETRAIN_CORPUS,'--pretrain-checkpoint',PRETRAIN_CHECKPOINT]
@@ -127,7 +138,7 @@ for stage in ('midtrain','sft'):
     for source in manifest['sources']:
         v = source['views'][stage]['train']
         print(source['source']['key'], {
-            k:v.get(k,0) for k in ('records','real_tokens','supervised_tokens','genuine_over_8k_records')})
+            k:v.get(k,0) for k in ('records','real_tokens','supervised_tokens','genuine_over_8k_records','genuine_over_16k_records')})
         if source['exhausted_before_target']:
             print('  Source exhausted before requested quota:',source['collection'])
 print('Initial one-pass SFT raw-token budget:',sft_budget(manifest))
@@ -140,6 +151,9 @@ if long_shortfalls:
     raise RuntimeError(f'SFT long-trace quotas underfilled; inspect source exhaustion before training: {long_shortfalls}')
 long_records = sum(s['views']['sft']['train'].get('genuine_over_8k_records',0) for s in manifest['sources'])
 if not long_records: raise RuntimeError('No genuine >8K traces survived: inspect source length rejection statistics')
+long32_records = sum(s['views']['sft']['train'].get('genuine_over_16k_records',0) for s in manifest['sources'])
+if not long32_records: raise RuntimeError('No genuine >16K SFT traces survived the 32K build')
+print('Genuine >16K SFT training traces:',long32_records)
 for pool, weight in manifest['pool_mix']['midtrain'].items():
     available = capacities(manifest,'midtrain')[pool]
     required = MIDTRAIN_TOKENS*weight + 4*8192
@@ -154,10 +168,10 @@ notebook. Keep `posttrain_manifest.json`, `tokenizer.json`, `documents/`, `midtr
 and TPU reads; no extra ZIP copy is made. Canonical/source manifests preserve licenses,
 provenance, rejection counts and task-split metadata. Saving outputs does not publish
 them; choose dataset visibility and attribution when you create the Kaggle dataset.''')])
-    tpu = save('midtrain8k_sft16k_tpu', [
-        md('''# TPU v5e-8: 8K midtrain -> 16K SFT
+    tpu = save('midtrain8k_sft32k_tpu', [
+        md('''# TPU v5e-8: 8K midtrain -> 32K SFT
 
-Select **TPU v5e-8**, enable Internet, attach the **v2** prepared posttrain corpus
+Select **TPU v5e-8**, enable Internet, attach the **v3** prepared posttrain corpus
 (the CPU builder rejects/rebuilds the old shared-view corpus) and the
 **completed 2.4B pretrain checkpoint**. Set their paths below. This notebook runs
 both remaining stages in order, with no new model initialization for training.
@@ -165,16 +179,16 @@ both remaining stages in order, with no new model initialization for training.
 1. **Midtrain:** 600M nonpadding tokens, 8K rows, 80/5/15 document/reasoning/agent.
    Restores pretrained parameters **and optimizer**, preserving the original 3B LR
    horizon and global update counter. Candidate masking stays off.
-2. **SFT:** 16K rows, 1:2 reasoning/agent, assistant-only targets. Resets optimizer
+2. **SFT:** 32K rows, 1:2 reasoning/agent, assistant-only targets. Resets optimizer
    and uses a new low-LR schedule. Enables compressed-layer YaRN with original
-   length 8192 / factor 2 and the planned SFT candidate mask. Pure local RoPE stays
+   length 8192 / factor 4 and the planned SFT candidate mask. Pure local RoPE stays
    unchanged. `SFT_TOKENS=0` computes a one-pass budget from actual pool capacity;
    it does not mean train zero tokens or concatenate every source indiscriminately.
 
-The 16K workload has **not yet been measured on your TPU**. First compilation and
+The 32K workload has **not yet been measured on your TPU**. First compilation and
 update validate the native path, loss-mask count, finite loss and zero dropped
 MoE assignments. A checkpoint is saved before compilation and after the first
-successful update. There is no automatic fallback to 8K if 16K cannot compile.
+successful update. There is no automatic fallback to 8K if 32K cannot compile.
 
 An eight-hour deadline includes setup, leaving margin before Kaggle's nine-hour
 limit. The runner pauses safely between updates and resumes the current stage,

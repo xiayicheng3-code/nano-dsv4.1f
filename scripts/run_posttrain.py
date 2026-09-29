@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resume pretrained weights+optimizer, train 8K midtrain, then 16K assistant-only SFT."""
+"""Resume pretrained weights+optimizer, train 8K midtrain, then 32K assistant-only SFT."""
 from __future__ import annotations
 import argparse
 from dataclasses import asdict, replace
@@ -14,7 +14,7 @@ import traceback
 import numpy as np
 
 from pretrain_checkpoint import atomic_json, load_checkpoint, read_metadata, save_checkpoint
-from posttrain_input import Pool, batch_counts, capacities, catalog, choose_pool, inspect, sft_budget
+from posttrain_input import LENGTHS, Pool, batch_counts, capacities, catalog, choose_pool, inspect, sft_budget
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,11 +40,11 @@ def stage_recipe(base_recipe, stage, sft_tokens, sft_lr, sft_steps=None):
     if stage == 'sft':
         config = replace(config,
             attention=replace(config.attention, rope=replace(config.attention.rope,
-                original_seq_len=8192, rope_factor=2.0)),
+                original_seq_len=LENGTHS['midtrain'], rope_factor=LENGTHS['sft'] / LENGTHS['midtrain'])),
             indexer_training=replace(config.indexer_training, apply_candidate_mask=True,
                 start_fraction=0.0, end_fraction=1.0))
-        train = TrainConfig(total_steps=sft_steps or max(1, math.ceil(sft_tokens / (4 * 16384))),
-            seq_len=16384, learning_rate=sft_lr, min_learning_rate=sft_lr * .1,
+        train = TrainConfig(total_steps=sft_steps or max(1, math.ceil(sft_tokens / (4 * LENGTHS['sft']))),
+            seq_len=LENGTHS['sft'], learning_rate=sft_lr, min_learning_rate=sft_lr * .1,
             warmup_steps=20, cosine_decay_start_fraction=0.0)
     return config, train, native
 
@@ -145,7 +145,7 @@ def run(args):
 
         while True:
             stage = state['stage']
-            length = 8192 if stage == 'midtrain' else 16384
+            length = corpus['lengths'][stage]
             weights = corpus['pool_mix'][stage]
             target = corpus['midtrain_target_tokens'] if stage == 'midtrain' else sft_tokens
             pools = {k: Pool(v, seed=args.seed + i, length=length)

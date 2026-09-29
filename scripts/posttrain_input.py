@@ -1,4 +1,4 @@
-"""Checksummed, deterministic, bounded-memory input for 8K midtrain and 16K SFT."""
+"""Checksummed, deterministic, bounded-memory input for 8K midtrain and 32K SFT."""
 from collections import OrderedDict
 import hashlib
 import json
@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 from pretrain_checkpoint import digest_file
 
-FORMAT = 'nano-dsv41f-posttrain-v2'
+FORMAT = 'nano-dsv41f-posttrain-v3'
+LENGTHS = {'midtrain': 8192, 'sft': 32768}
 
 
 def inspect(root):
@@ -18,8 +19,12 @@ def inspect(root):
     manifest = json.loads(matches[0].read_text())
     if manifest.get('format') != FORMAT or not manifest.get('complete'):
         if manifest.get('format') == 'nano-dsv41f-posttrain-v1':
-            raise ValueError('This corpus uses the old shared midtrain/SFT trace view; rebuild it with the v2 CPU notebook')
+            raise ValueError('This corpus uses the old shared midtrain/SFT trace view; rebuild it with the v3 CPU notebook')
+        if manifest.get('format') == 'nano-dsv41f-posttrain-v2':
+            raise ValueError('This is a 16K v2 corpus; rebuild with the 32K v3 CPU notebook')
         raise ValueError('Incomplete/unsupported posttrain corpus')
+    if manifest.get('lengths') != LENGTHS:
+        raise ValueError('Corpus lengths must be 8K midtrain and 32K SFT')
     if digest_file(root / 'tokenizer.json') != manifest['identity']['tokenizer_sha256']:
         raise ValueError('Tokenizer checksum mismatch')
     for stage in ('midtrain', 'sft'):
@@ -110,5 +115,5 @@ def capacities(manifest, stage):
 def sft_budget(manifest):
     capacity = capacities(manifest, 'sft')
     # Leave headroom for one batch per pool and incomplete last batches.
-    return max(0, int(min((capacity[k] - 4 * 16384) / w
+    return max(0, int(min((capacity[k] - 4 * manifest['lengths']['sft']) / w
                          for k, w in manifest['pool_mix']['sft'].items()) * .98))

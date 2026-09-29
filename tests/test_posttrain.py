@@ -120,8 +120,8 @@ def test_sft_recipe_changes_positions_and_mask_but_not_parameter_shapes():
     mid,mt,mn=runner.stage_recipe(base,'midtrain',20_000_000,2.6e-5)
     sft,st,sn=runner.stage_recipe(base,'sft',20_000_000,2.6e-5)
     assert mt == train and mid == config
-    assert st.seq_len == 16384 and st.learning_rate == 2.6e-5
-    assert sft.attention.rope.original_seq_len == 8192 and sft.attention.rope.rope_factor == 2
+    assert st.seq_len == 32768 and st.learning_rate == 2.6e-5
+    assert sft.attention.rope.original_seq_len == 8192 and sft.attention.rope.rope_factor == 4
     assert sft.indexer_training.apply_candidate_mask
     assert not mid.indexer_training.apply_candidate_mask
     assert (sft.d_model,sft.n_layers,sft.n_experts)==(mid.d_model,mid.n_layers,mid.n_experts)
@@ -138,7 +138,7 @@ def test_base_requires_complete_matching_tokenizer_and_remaining_budget():
 
 
 def test_sft_budget_respects_smaller_pool_at_independent_ratio():
-    manifest={'sources':[{'pool':'reasoning','views':{'sft':{'train':{'real_tokens':4_000_000}}}},
+    manifest={'lengths':inputs.LENGTHS,'sources':[{'pool':'reasoning','views':{'sft':{'train':{'real_tokens':4_000_000}}}},
                          {'pool':'agent','views':{'sft':{'train':{'real_tokens':16_000_000}}}}],
               'pool_mix':{'sft':{'reasoning':1/3,'agent':2/3}}}
     budget=inputs.sft_budget(manifest)
@@ -148,8 +148,8 @@ def test_sft_budget_respects_smaller_pool_at_independent_ratio():
 def test_notebooks_compile_and_include_distinct_entrypoints():
     import nbformat
     root=Path(__file__).resolve().parents[1]
-    for name,script in [('prepare_midtrain8k_sft16k_cpu','prepare_posttrain_corpus.py'),
-                        ('midtrain8k_sft16k_tpu','run_posttrain.py')]:
+    for name,script in [('prepare_midtrain8k_sft32k_cpu','prepare_posttrain_corpus.py'),
+                        ('midtrain8k_sft32k_tpu','run_posttrain.py')]:
         nb=nbformat.read(root/'notebooks'/f'nano_dsv41f_{name}.ipynb',as_version=4)
         nbformat.validate(nb)
         for cell in nb.cells:
@@ -208,14 +208,14 @@ def test_runner_transitions_and_resumes_with_real_checkpoints(tmp_path,monkeypat
         file=directory/'shard.npz'
         np.savez(file,input_ids=ids,segment_ids=np.zeros_like(ids),token_mask=np.ones_like(ids,np.uint8),sft_loss_mask=target)
         return {'file':file.name,'rows':32,'bytes':file.stat().st_size,'sha256':hashlib.sha256(file.read_bytes()).hexdigest()}
-    manifest={'format':inputs.FORMAT,'complete':True,'identity':{'tokenizer_sha256':token_hash},
+    manifest={'format':inputs.FORMAT,'complete':True,'lengths':inputs.LENGTHS,'identity':{'tokenizer_sha256':token_hash},
         'midtrain_target_tokens':131072,'sources':[],
         'pool_mix':{'midtrain':{'document':.8,'reasoning':.05,'agent':.15},'sft':{'reasoning':1/3,'agent':2/3}}}
     d=shard(root/'documents/midtrain',8192)
     manifest['documents']={'path':'documents/midtrain','real_tokens':32*8192,'shards':[d]}
     for pool in ('reasoning','agent'):
         views={}
-        for stage,length in [('midtrain',8192),('sft',16384)]:
+        for stage,length in [('midtrain',8192),('sft',32768)]:
             meta=shard(root/stage/pool/'train',length)
             views[stage]={'train':{'real_tokens':32*length,'rows':32,'shards':[meta]},'validation':{'shards':[],'rows':0}}
         manifest['sources'].append({'source':{'key':pool},'pool':pool,'views':views})
@@ -253,7 +253,7 @@ def test_runner_transitions_and_resumes_with_real_checkpoints(tmp_path,monkeypat
     monkeypatch.setattr(nano,'compile_diagnostics',lambda fn,*args:(fn,{'control_plane_test':True}))
     def args(out,resume=None,max_steps=0):
         return SimpleNamespace(corpus=root,output=out,pretrained=basepath if not resume else None,
-            resume=resume,sft_tokens=196608,sft_lr=2.6e-5,seed=1701,
+            resume=resume,sft_tokens=393216,sft_lr=2.6e-5,seed=1701,
             deadline_unix=time.time()+7200,checkpoint_every=2,eval_every=100,
             eval_batches=1,log_every=100,max_steps=max_steps)
     runner.run(args(tmp_path/'first',max_steps=2))
@@ -264,11 +264,11 @@ def test_runner_transitions_and_resumes_with_real_checkpoints(tmp_path,monkeypat
     assert finished['status']=='completed' and finished['stage']=='sft'
     _,meta=read_metadata(finished['checkpoint'])
     assert meta['metadata']['stage_complete'] and meta['metadata']['stage_steps']==3
-    assert meta['metadata']['pool_tokens']=={'agent':131072,'reasoning':65536}
+    assert meta['metadata']['pool_tokens']=={'agent':262144,'reasoning':131072}
     # Four midtrain updates then reset optimizer; final SFT moments count only 3 updates.
     restored,_=load_checkpoint(finished['checkpoint'],trees())
     np.testing.assert_array_equal(np.asarray(restored[1]['w']),[3.,3.])
-    assert (8192,False) in stages and (16384,True) in stages
+    assert (8192,False) in stages and (32768,True) in stages
     # Run uninterrupted and compare the actual final parameter/optimizer arrays.
     runner.run(args(tmp_path/'uninterrupted'))
     final=json.loads((tmp_path/'uninterrupted/summary.json').read_text())
@@ -328,7 +328,7 @@ def test_real_renderer_tokenizer_collection_writes_disjoint_stage_records(tmp_pa
     assert result['selection']['cross_stage_task_overlap'] == 0
     assert sum(result['views'][stage][split].get('records', 0)
                for stage in ('midtrain','sft') for split in ('train','validation')) == 100
-    for stage,length in [('midtrain',8192),('sft',16384)]:
+    for stage,length in [('midtrain',8192),('sft',32768)]:
         for split in ('train','validation'):
             for shard in result['views'][stage][split]['shards']:
                 with np.load(tmp_path/stage/source.key/split/shard['file']) as a:
@@ -409,6 +409,46 @@ def test_old_shared_corpus_is_rejected(tmp_path):
         'format': 'nano-dsv41f-posttrain-v1', 'complete': True}))
     with pytest.raises(ValueError, match='old shared'):
         inputs.inspect(tmp_path)
+
+
+def test_16k_corpus_and_wrong_32k_manifest_lengths_are_rejected(tmp_path):
+    manifest = tmp_path / 'posttrain_manifest.json'
+    manifest.write_text(json.dumps({'format': 'nano-dsv41f-posttrain-v2', 'complete': True}))
+    with pytest.raises(ValueError, match='16K v2'):
+        inputs.inspect(tmp_path)
+    manifest.write_text(json.dumps({'format': inputs.FORMAT, 'complete': True,
+                                   'lengths': {'midtrain': 8192, 'sft': 16384}}))
+    with pytest.raises(ValueError, match='32K SFT'):
+        inputs.inspect(tmp_path)
+
+
+def test_32k_writer_preserves_a_complete_long_trace(tmp_path):
+    assert data.LENGTHS == inputs.LENGTHS == {'midtrain': 8192, 'sft': 32768}
+    ids = [0, ASSISTANT_TOKEN_ID] + [40] * 20_000 + [EOS_TOKEN_ID]
+    trace = data.prefix_view(ids, case('xcoder'), 32768)
+    writer = data.Writer(tmp_path, 32768, 1701, 4)
+    writer.add(trace)
+    audit = writer.finish()
+    assert audit['genuine_over_16k_records'] == 1
+    assert audit['real_tokens'] == len(ids)
+    with np.load(tmp_path / audit['shards'][0]['file']) as shard:
+        assert shard['input_ids'].shape == (1, 32768)
+        np.testing.assert_array_equal(shard['input_ids'][0, :len(ids)], ids)
+        assert int(shard['token_mask'].sum()) == len(ids)
+        assert int(shard['sft_loss_mask'].sum()) == int(trace.sft_loss_mask.sum())
+
+
+def test_pivot_long_share_is_separate_and_capped_by_global_fraction():
+    from types import SimpleNamespace
+    source = next(s for s in adapters.AGENT_SOURCES if s.key == 'nemotron_conversational_pivot')
+    args = SimpleNamespace(midtrain_tokens=600_000_000, sft_reasoning_tokens=30_000_000,
+                           sft_agent_tokens=60_000_000, sft_long_token_fraction=.5,
+                           sft_pivot_long_token_fraction=.05, headroom=1.1)
+    selection = data.StageSelection(source, args)
+    assert selection.audit()['long_token_fraction'] == .05
+    assert selection.targets['sft_long'] == 495000
+    args.sft_long_token_fraction = .01
+    assert data.StageSelection(source, args).audit()['long_token_fraction'] == .01
 
 
 def test_builder_reads_later_long_reasoning_after_midtrain_quota(tmp_path, monkeypatch):

@@ -427,10 +427,26 @@ def adapt_swe_agent(
             continue
         return None
 
-    if pending_call is not None or len(messages) < 3:
+    terminal_call = None
+    end_policy = 'observed_history'
+    if pending_call is not None:
+        # SWE's explicit submit ends the episode: the dataset has no subsequent
+        # environment message. Preserve the action rather than inventing a result.
+        final_action = _split_swe_ai_turn(str(raw[-1].get('text') or ''))[1]
+        if final_action == 'submit' and row.get('exit_status') == 'submitted':
+            terminal_call = pending_call
+            end_policy = 'terminal_submit'
+        elif row.get('exit_status') == 'submitted (exit_context)':
+            # The patch was evaluated successfully, but the source log stops
+            # before observing the final command. Keep only the observed prefix.
+            messages.pop()
+            end_policy = 'observed_prefix_after_context_exit'
+        else:
+            return None
+    if len(messages) < 3 or not any(m['role'] == 'assistant' for m in messages):
         return None
     try:
-        return normalize_agent_trace(
+        case = normalize_agent_trace(
             {
                 "messages": messages,
                 "tools": _swe_tool(),
@@ -443,11 +459,24 @@ def adapt_swe_agent(
                     "model_name": row.get("model_name"),
                     "target": True,
                     "exit_status": row.get("exit_status"),
+                    "swe_end_policy": end_policy,
+                    "dropped_unobserved_final_action": end_policy == 'observed_prefix_after_context_exit',
                 },
             },
             default_reasoning_effort=75,
             policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
         )
+        if terminal_call:
+            # Generic normalization calls every unanswered tool call incomplete;
+            # this source's explicit terminal action deliberately has no result.
+            case['metadata']['terminal_tool_call_ids'] = [terminal_call]
+            unresolved = [c for c in case['metadata'].get('incomplete_tool_calls', [])
+                          if c != terminal_call]
+            if unresolved:
+                case['metadata']['incomplete_tool_calls'] = unresolved
+            else:
+                case['metadata'].pop('incomplete_tool_calls', None)
+        return case
     except Exception:
         return None
 

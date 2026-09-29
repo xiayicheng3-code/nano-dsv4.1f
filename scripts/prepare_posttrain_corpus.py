@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU build: canonical JSONL -> independent 8K midtrain / 16K SFT shards."""
+"""CPU build: canonical JSONL -> independent 8K midtrain / 32K SFT shards."""
 from __future__ import annotations
 import argparse
 from collections import Counter
@@ -23,8 +23,8 @@ from nano_dsv41f.reasoning_effort import assign_length_guided_reasoning_effort, 
 from nano_dsv41f.trace_corpus import TokenizedTrace, assistant_sft_loss_mask, render_case_v41
 from nano_dsv41f.training_stages import MIDTRAIN_DOCUMENT_PHASE
 
-FORMAT = 'nano-dsv41f-posttrain-v2'
-LENGTHS = {'midtrain': 8192, 'sft': 16384}
+FORMAT = 'nano-dsv41f-posttrain-v3'
+LENGTHS = {'midtrain': 8192, 'sft': 32768}
 
 
 def prefix_view(ids, case, length):
@@ -72,7 +72,9 @@ class Writer:
         self.buffer_tokens += n
         self.counts.update(records=1, real_tokens=n, supervised_tokens=int(trace.sft_loss_mask.sum()),
                            genuine_over_8k_records=int(n > 8192),
-                           genuine_over_8k_tokens=n if n > 8192 else 0)
+                           genuine_over_8k_tokens=n if n > 8192 else 0,
+                           genuine_over_16k_records=int(n > 16384),
+                           genuine_over_16k_tokens=n if n > 16384 else 0)
         if self.buffer_tokens >= 2_000_000:
             self.flush()
 
@@ -82,7 +84,7 @@ class Writer:
         block = f'block-{len(self.shards):06d}'
         shards, _ = traces.write_trace_shards(self.root / block, traces=self.buffer,
             seq_len=self.length, shard_rows=self.shard_rows, query_budget=128, q_threshold=640,
-            q_band_edges=(640, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384),
+            q_band_edges=(640, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768),
             seed=self.seed + len(self.shards), compress=False)
         self.shards.extend({**s, 'file': f'{block}/{s["file"]}'} for s in shards)
         self.buffer.clear()
@@ -117,6 +119,9 @@ class StageSelection:
         sft_total = ((args.sft_reasoning_tokens if source.pool == 'reasoning'
                       else args.sft_agent_tokens) * source.weight * args.headroom)
         long_fraction = 0.0 if source.key == 'xlam_verified' else args.sft_long_token_fraction
+        if source.key == 'nemotron_conversational_pivot':
+            long_fraction = min(long_fraction, getattr(args, 'sft_pivot_long_token_fraction', 0.05))
+        self.long_fraction = long_fraction
         self.source = source
         self.targets = {
             'midtrain': math.ceil(mid_target),
@@ -176,6 +181,7 @@ class StageSelection:
         if overlap:
             raise AssertionError('a task was selected for both post-training stages')
         return {
+            'long_token_fraction': self.long_fraction,
             'targets': dict(self.targets),
             'accepted_train_tokens': dict(self.tokens),
             'shortfall_tokens': {
@@ -338,7 +344,9 @@ def run(args):
                 'sft_reasoning_tokens': args.sft_reasoning_tokens,
                 'sft_agent_tokens': args.sft_agent_tokens,
                 'sft_long_token_fraction': args.sft_long_token_fraction,
-                'selection_version': 2, 'headroom': args.headroom, 'seed': args.seed,
+                'sft_pivot_long_token_fraction': args.sft_pivot_long_token_fraction,
+                'lengths': LENGTHS,
+                'selection_version': 3, 'headroom': args.headroom, 'seed': args.seed,
                 'tokenize_batch_size': args.tokenize_batch_size, 'shard_rows': args.shard_rows,
                 'pretrain_corpus': str(args.pretrain_corpus), 'pretrain_checkpoint': str(args.pretrain_checkpoint),
                 'builder_sha256': hashlib.sha256(Path(__file__).read_bytes() + Path(traces.__file__).read_bytes()).hexdigest()}
@@ -357,7 +365,8 @@ def run(args):
         'lengths': LENGTHS, 'midtrain_target_tokens': args.midtrain_tokens,
         'sft_collection_targets': {'reasoning_tokens': args.sft_reasoning_tokens,
                                    'agent_tokens': args.sft_agent_tokens,
-                                   'long_token_fraction': args.sft_long_token_fraction},
+                                   'long_token_fraction': args.sft_long_token_fraction,
+                                   'pivot_long_token_fraction': args.sft_pivot_long_token_fraction},
         'documents': {'path': 'documents/midtrain', **doc['packed']}, 'sources': sources,
         'selection_audit': {s['source']['key']: s['selection'] for s in sources},
         'pool_mix': {'midtrain': {'document': .8, 'reasoning': .05, 'agent': .15},
@@ -377,6 +386,7 @@ def parse_args():
     p.add_argument('--sft-reasoning-tokens', type=int, default=30_000_000)
     p.add_argument('--sft-agent-tokens', type=int, default=60_000_000)
     p.add_argument('--sft-long-token-fraction', type=float, default=0.5)
+    p.add_argument('--sft-pivot-long-token-fraction', type=float, default=0.05)
     p.add_argument('--headroom', type=float, default=1.10)
     p.add_argument('--seed', type=int, default=1701)
     p.add_argument('--shard-rows', type=int, default=128)
@@ -388,7 +398,8 @@ def parse_args():
         p.error('Pass both pretrain corpus and completed checkpoint to reuse unused rows')
     if (min(a.midtrain_tokens, a.sft_reasoning_tokens, a.sft_agent_tokens,
             a.shard_rows, a.tokenize_batch_size) <= 0 or a.headroom < 1 or
-            not 0 <= a.sft_long_token_fraction <= 1):
+            not 0 <= a.sft_long_token_fraction <= 1 or
+            not 0 <= a.sft_pivot_long_token_fraction <= 1):
         p.error('Require positive budgets/batches and headroom >= 1')
     return a
 
