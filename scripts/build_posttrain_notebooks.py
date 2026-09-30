@@ -176,9 +176,14 @@ Select **TPU v5e-8**, enable Internet, attach the **v3** prepared posttrain corp
 **completed 2.4B pretrain checkpoint**. Set their paths below. This notebook runs
 both remaining stages in order, with no new model initialization for training.
 
-1. **Midtrain:** 600M nonpadding tokens, 8K rows, 80/5/15 document/reasoning/agent.
+1. **Midtrain:** configurable nonpadding-token budget, 8K rows, 80/5/15 document/reasoning/agent.
    Restores pretrained parameters **and optimizer**, preserving the original 3B LR
    horizon and global update counter. Candidate masking stays off.
+   `MIDTRAIN_TOKENS=360_000_000` fits the measured v3 corpus; `0` requests the
+   corpus preparation target (normally 600M), which still requires enough data.
+   A shorter budget ends midtrain earlier on the original schedule before SFT.
+   The runner validates capacity and the remaining pretrain allocation; it never
+   silently reduces your requested budget. Existing v3 shards can be reused.
 2. **SFT:** 32K rows, 1:2 reasoning/agent, assistant-only targets. Resets optimizer
    and uses a new low-LR schedule. Enables compressed-layer YaRN with original
    length 8192 / factor 4 and the planned SFT candidate mask. Pure local RoPE stays
@@ -200,6 +205,7 @@ SESSION_HOURS = 8.0
 CORPUS = '/kaggle/input/your-posttrain-corpus-dataset'
 PRETRAINED_CHECKPOINT = '/kaggle/input/your-pretrain-output/training/checkpoints'
 RESUME_CHECKPOINT = ''  # later sessions: current midtrain/sft checkpoint directory
+MIDTRAIN_TOKENS = 360_000_000  # 0 = corpus preparation target; keep unchanged on resume
 SFT_TOKENS = 0  # derive one-pass budget at fixed 1:2 ratio; keep unchanged on resume
 SFT_LR = 2.6e-5
 os.environ['NANO_DSV41F_REF'] = ''' + repr(REF)),
@@ -216,6 +222,7 @@ subprocess.run(['git','archive','--format=tar.gz','-o',str(RUN_ROOT/'source.tar.
 command = [sys.executable,'-u','scripts/run_posttrain.py',
     '--corpus',CORPUS,'--output',str(OUTPUT),
     '--resume' if RESUME_CHECKPOINT else '--pretrained',checkpoint,
+    '--midtrain-tokens',str(MIDTRAIN_TOKENS),
     '--sft-tokens',str(SFT_TOKENS),'--sft-lr',str(SFT_LR),
     '--deadline-unix',str(SESSION_STARTED+SESSION_HOURS*3600)]
 with (RUN_ROOT/'train.log').open('w',buffering=1) as log:
@@ -236,7 +243,7 @@ if rc: raise RuntimeError('Training failed; inspect train.log. The previous comm
 Save these outputs as a Kaggle dataset. `summary.json` reports `paused`, `completed`
 or `failed` and the exact latest checkpoint path. On a fresh session, attach the
 saved output, set `RESUME_CHECKPOINT` to that directory (or its parent containing
-`latest.json`), and keep the source version, corpus, SFT budget, LR and seed unchanged.
+`latest.json`), and keep the source version, corpus, both token budgets, LR and seed unchanged.
 The source commit is printed by bootstrap and archived; pin `NANO_DSV41F_REF` to
 that commit for future resumes if the branch moves.
 

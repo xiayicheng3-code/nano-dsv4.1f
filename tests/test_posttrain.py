@@ -133,8 +133,41 @@ def test_base_requires_complete_matching_tokenizer_and_remaining_budget():
         'corpus':{'tokenizer_sha256':'abc'}}}
     corpus={'identity':{'tokenizer_sha256':'abc'},'midtrain_target_tokens':600_000_000}
     runner.validate_base(state,corpus)
+    runner.validate_base(state,corpus,360_000_000)
+    with pytest.raises(ValueError,match='remaining'):
+        runner.validate_base(state,corpus,650_000_000)
+    with pytest.raises(ValueError,match='positive'):
+        runner.validate_base(state,corpus,0)
     with pytest.raises(ValueError,match='Complete'):runner.validate_base({**state,'real_tokens':10},corpus)
     with pytest.raises(ValueError,match='tokenizers'):runner.validate_base(state,{**corpus,'identity':{'tokenizer_sha256':'def'}})
+
+
+def test_midtrain_override_uses_measured_capacity_without_changing_manifest():
+    manifest={'midtrain_target_tokens':600_000_000,
+        'documents':{'real_tokens':510_180_499},
+        'pool_mix':{'midtrain':{'document':.8,'reasoning':.05,'agent':.15}},
+        'sources':[{'pool':pool,'views':{'midtrain':{'train':{'real_tokens':tokens}}}}
+                   for pool,tokens in [('reasoning',18_473_544),('agent',87_812_768)]]}
+    before=json.dumps(manifest)
+    assert runner.resolve_midtrain_tokens(manifest,360_000_000)==360_000_000
+    assert json.dumps(manifest)==before
+    for requested in (0,600_000_000):
+        with pytest.raises(ValueError,match='reasoning:.*agent:'):
+            runner.resolve_midtrain_tokens(manifest,requested)
+    with pytest.raises(ValueError,match='nonnegative'):
+        runner.resolve_midtrain_tokens(manifest,-1)
+    manifest['midtrain_target_tokens']=360_000_000
+    assert runner.resolve_midtrain_tokens(manifest,0)==360_000_000
+
+
+def test_midtrain_cli_budget(monkeypatch):
+    argv=['run_posttrain.py','--corpus','corpus','--output','out','--pretrained','base']
+    monkeypatch.setattr(sys,'argv',argv)
+    assert runner.parse_args().midtrain_tokens==0
+    monkeypatch.setattr(sys,'argv',argv+['--midtrain-tokens','360000000'])
+    assert runner.parse_args().midtrain_tokens==360_000_000
+    monkeypatch.setattr(sys,'argv',argv+['--midtrain-tokens','-1'])
+    with pytest.raises(SystemExit):runner.parse_args()
 
 
 def test_sft_budget_respects_smaller_pool_at_independent_ratio():
@@ -189,7 +222,8 @@ def test_task_split_groups_pivot_contexts_and_research_seeds():
     assert data.task_key(first)==data.task_key(second)
 
 
-def test_runner_transitions_and_resumes_with_real_checkpoints(tmp_path,monkeypatch):
+@pytest.mark.parametrize('midtrain_tokens',[0,98_304])
+def test_runner_transitions_and_resumes_with_real_checkpoints(tmp_path,monkeypatch,midtrain_tokens):
     """Exercise both stages/control flow using real input files and CPU state trees."""
     import time
     from types import SimpleNamespace
@@ -253,19 +287,27 @@ def test_runner_transitions_and_resumes_with_real_checkpoints(tmp_path,monkeypat
     monkeypatch.setattr(nano,'compile_diagnostics',lambda fn,*args:(fn,{'control_plane_test':True}))
     def args(out,resume=None,max_steps=0):
         return SimpleNamespace(corpus=root,output=out,pretrained=basepath if not resume else None,
-            resume=resume,sft_tokens=393216,sft_lr=2.6e-5,seed=1701,
+            resume=resume,midtrain_tokens=midtrain_tokens,sft_tokens=393216,sft_lr=2.6e-5,seed=1701,
             deadline_unix=time.time()+7200,checkpoint_every=2,eval_every=100,
             eval_batches=1,log_every=100,max_steps=max_steps)
     runner.run(args(tmp_path/'first',max_steps=2))
     first=json.loads((tmp_path/'first/summary.json').read_text())
     assert first['status']=='paused' and first['stage']=='midtrain'
+    expected_midtrain=midtrain_tokens or manifest['midtrain_target_tokens']
+    assert first['budgets']['midtrain_tokens']==expected_midtrain
+    changed=args(tmp_path/'changed-budget',Path(first['checkpoint']))
+    changed.midtrain_tokens=expected_midtrain+32768
+    with pytest.raises(ValueError,match='Resume corpus, code, budget'):
+        runner.run(changed)
     runner.run(args(tmp_path/'resumed',Path(first['checkpoint'])))
     finished=json.loads((tmp_path/'resumed/summary.json').read_text())
     assert finished['status']=='completed' and finished['stage']=='sft'
     _,meta=read_metadata(finished['checkpoint'])
     assert meta['metadata']['stage_complete'] and meta['metadata']['stage_steps']==3
+    assert meta['metadata']['identity']['midtrain_tokens']==expected_midtrain
+    assert meta['metadata']['completed_steps']==100+expected_midtrain//32768+3
     assert meta['metadata']['pool_tokens']=={'agent':262144,'reasoning':131072}
-    # Four midtrain updates then reset optimizer; final SFT moments count only 3 updates.
+    # The chosen midtrain budget ends the stage; final SFT moments count only 3 updates.
     restored,_=load_checkpoint(finished['checkpoint'],trees())
     np.testing.assert_array_equal(np.asarray(restored[1]['w']),[3.,3.])
     assert (8192,False) in stages and (32768,True) in stages

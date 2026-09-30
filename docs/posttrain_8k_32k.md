@@ -7,7 +7,7 @@ The corpus format is `nano-dsv41f-posttrain-v3`; rebuild older v1/v2 outputs.
 
 ## Corpus and selection
 
-The midtrain budget is 600M nonpadding tokens: 480M documents, 30M reasoning,
+The default midtrain collection target is 600M nonpadding tokens: 480M documents, 30M reasoning,
 90M agents. CPU preparation requests 10% headroom. Documents retain the current
 50/5/20/25 FineWeb-Edu/Cosmopedia/permissive-code/FineMath proportions. Supply the
 pretrain corpus and completed checkpoint together to reuse the exact unconsumed
@@ -65,8 +65,17 @@ rebuilt rather than trusted.
 
 Midtrain continues the supported narrow48 CP2/DP4 pretrained parameters, optimizer,
 global steps, and original full-3B LR/indexer schedule. Candidate masking stays
-off. The requested 600M allocation must match the remaining base+midtrain budget,
-within one base batch. Pool scheduling tracks actual nonpadding tokens, not row
+off. Set `MIDTRAIN_TOKENS` in the TPU notebook (`--midtrain-tokens` in the runner)
+to the desired nonpadding-token budget. The notebook defaults to 360M for the
+measured v3 corpus; CLI default `0` uses the corpus preparation target (normally
+600M). The runner checks all pool capacities with a batch margin and rejects
+budgets beyond the remaining base+midtrain allocation, allowing one base batch
+of rounding. It never silently reduces a requested budget. A shorter run preserves
+the original LR/indexer horizon and stops earlier before transitioning to SFT;
+2.4B base + 360M midtrain is about 2.76B tokens before SFT. Existing v3 corpus files
+and their preparation target stay unchanged. Both effective stage budgets are
+printed, saved in `summary.json`, and included in checkpoint identity; keep them
+unchanged on resume. Pool scheduling tracks actual nonpadding tokens, not row
 counts. Pool exhaustion fails explicitly; there is no hidden repetition or fallback
 source. Source proportions reflect actual accepted corpus capacity.
 
@@ -111,5 +120,7 @@ build identity. Build in the new `posttrain-corpus-v3` directory; v2 source unit
 and 16K posttrain checkpoints cannot be reused in this run. The existing completed
 pretrain checkpoint remains valid as the starting point. Genuine >16K record and
 token counts are reported independently of packed 32K row occupancy. The existing
-600M midtrain capacity checks remain in force: increasing SFT length does not
-resolve shortages in the separate 8K midtrain pools.
+midtrain capacity checks apply to the chosen training budget: increasing SFT
+length does not resolve shortages in the separate 8K midtrain pools. The CPU
+notebook's final audit still checks its collection target; a completed v3 corpus
+that falls short of that target can be used with a smaller TPU training budget.

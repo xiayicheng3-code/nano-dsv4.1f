@@ -49,7 +49,26 @@ def stage_recipe(base_recipe, stage, sft_tokens, sft_lr, sft_steps=None):
     return config, train, native
 
 
-def validate_base(state, corpus):
+def resolve_midtrain_tokens(corpus, requested=0):
+    if requested < 0:
+        raise ValueError('Midtrain tokens must be nonnegative; 0 uses the corpus target')
+    target = requested or corpus['midtrain_target_tokens']
+    if target <= 0:
+        raise ValueError('Midtrain budget must be positive')
+    capacity = capacities(corpus, 'midtrain')
+    shortfalls = []
+    for pool, weight in corpus['pool_mix']['midtrain'].items():
+        required = target * weight + 4 * LENGTHS['midtrain']
+        if capacity[pool] < required:
+            shortfalls.append(f'{pool}: {capacity[pool]:,} available < {required:,.0f} required')
+    if shortfalls:
+        raise ValueError(f'Midtrain target {target:,} exceeds corpus capacity: '
+                         + '; '.join(shortfalls)
+                         + '. Lower --midtrain-tokens or prepare more data.')
+    return target
+
+
+def validate_base(state, corpus, midtrain_tokens=None):
     if state.get('stage') != 'pretrain':
         raise ValueError('--pretrained must be a pretrain checkpoint; use --resume for this runner')
     if state['real_tokens'] < state['identity']['base_tokens']:
@@ -57,8 +76,9 @@ def validate_base(state, corpus):
     if state['identity']['corpus']['tokenizer_sha256'] != corpus['identity']['tokenizer_sha256']:
         raise ValueError('Pretrain and posttrain tokenizers differ')
     remaining = state['identity']['total_tokens'] - state['real_tokens']
-    if abs(remaining - corpus['midtrain_target_tokens']) > 4 * 8192:
-        raise ValueError('Midtrain budget must match the remaining full-training allocation (within one base batch)')
+    target = corpus['midtrain_target_tokens'] if midtrain_tokens is None else midtrain_tokens
+    if target <= 0 or target > remaining + 4 * LENGTHS['midtrain']:
+        raise ValueError('Midtrain budget must be positive and fit the remaining full-training allocation (within one base batch)')
 
 
 def run(args):
@@ -84,20 +104,17 @@ def run(args):
     log = (output / 'metrics.jsonl').open('a', buffering=1)
     try:
         root, corpus, corpus_hash = inspect(args.corpus)
+        midtrain_tokens = resolve_midtrain_tokens(corpus, args.midtrain_tokens)
         sft_tokens = args.sft_tokens or sft_budget(corpus)
         if sft_tokens <= 0 or sft_tokens > sft_budget(corpus):
             raise ValueError('SFT target exceeds one-pass capacity at the 1:2 pool ratio')
-        for pool, weight in corpus['pool_mix']['midtrain'].items():
-            available = capacities(corpus, 'midtrain')[pool]
-            if available < corpus['midtrain_target_tokens'] * weight + 4 * 8192:
-                raise ValueError(f'{pool}: only {available:,} tokens; rebuild/increase clean-source capacity before 600M run')
         sft_rows = {pool: sum(source['views']['sft']['train']['rows']
                     for source in corpus['sources'] if source['pool'] == pool)
                     for pool in corpus['pool_mix']['sft']}
         sft_capacity = capacities(corpus, 'sft')
         sft_steps = max(1, math.ceil(sum(sft_tokens * w * sft_rows[k] / (4 * sft_capacity[k])
                                       for k, w in corpus['pool_mix']['sft'].items())))
-        identity = {'corpus_sha256': corpus_hash, 'sft_tokens': sft_tokens,
+        identity = {'corpus_sha256': corpus_hash, 'midtrain_tokens': midtrain_tokens, 'sft_tokens': sft_tokens,
                     'sft_lr': args.sft_lr, 'seed': args.seed, 'code_sha256': code_digest()}
         initial_path = args.resume or args.pretrained
         _, saved = read_metadata(initial_path)
@@ -108,7 +125,7 @@ def run(args):
             base_recipe = old['base_recipe']
             state = old
         else:
-            validate_base(old, corpus)
+            validate_base(old, corpus, midtrain_tokens)
             base_recipe = old['recipe']
             state = {'stage': 'midtrain', 'completed_steps': old['completed_steps'],
                 'base_steps': old['completed_steps'], 'base_real_tokens': old['real_tokens'],
@@ -117,6 +134,9 @@ def run(args):
                 'pool_tokens': {k: 0 for k in corpus['pool_mix']['midtrain']},
                 'stage_complete': False, 'identity': identity, 'base_recipe': base_recipe,
                 'pretrained_manifest_sha256': hashlib.sha256(json.dumps(saved, sort_keys=True).encode()).hexdigest()}
+        report['budgets'] = {'midtrain_tokens': midtrain_tokens, 'sft_tokens': sft_tokens}
+        atomic_json(output / 'summary.json', report)
+        print('Training budgets:', json.dumps(report['budgets']), flush=True)
         config, train, native = stage_recipe(base_recipe, state['stage'], sft_tokens, args.sft_lr, sft_steps)
         validate_v5e_runtime()
         mesh = make_v5e_mesh()
@@ -147,7 +167,7 @@ def run(args):
             stage = state['stage']
             length = corpus['lengths'][stage]
             weights = corpus['pool_mix'][stage]
-            target = corpus['midtrain_target_tokens'] if stage == 'midtrain' else sft_tokens
+            target = midtrain_tokens if stage == 'midtrain' else sft_tokens
             pools = {k: Pool(v, seed=args.seed + i, length=length)
                      for i,(k,v) in enumerate(sorted(catalog(root, corpus, stage).items()))}
             val = {k: Pool(v, seed=args.seed + 500 + i, length=length)
@@ -273,6 +293,8 @@ def parse_args():
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--pretrained', type=Path)
     g.add_argument('--resume', type=Path)
+    p.add_argument('--midtrain-tokens', type=int, default=0,
+                   help='Nonpadding midtrain tokens; 0 uses the corpus preparation target. Keep unchanged on resume.')
     p.add_argument('--sft-tokens', type=int, default=0, help='0: largest safe one-pass budget at 1:2 reasoning/agent')
     p.add_argument('--sft-lr', type=float, default=2.6e-5)
     p.add_argument('--seed', type=int, default=1701)
@@ -284,7 +306,7 @@ def parse_args():
     p.add_argument('--max-steps', type=int, default=0)
     a = p.parse_args()
     if a.deadline_unix is None: a.deadline_unix = time.time() + 8*3600
-    if a.sft_tokens < 0 or a.max_steps < 0 or a.sft_lr <= 0 or min(a.checkpoint_every,a.eval_every,a.eval_batches,a.log_every) <= 0:
+    if a.midtrain_tokens < 0 or a.sft_tokens < 0 or a.max_steps < 0 or a.sft_lr <= 0 or min(a.checkpoint_every,a.eval_every,a.eval_batches,a.log_every) <= 0:
         p.error('Invalid budget, LR or intervals')
     return a
 
