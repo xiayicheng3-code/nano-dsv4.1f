@@ -10,3 +10,4 @@ deepseek-recipe==0.1.1
 ipywidgets>=8
 fastapi>=0.115
 uvicorn>=0.32
+huggingface_hub>=0.34,<2

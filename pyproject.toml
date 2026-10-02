@@ -22,7 +22,7 @@ dev = [
   "tokenizers>=0.21",
   "deepseek-recipe>=0.1",
 ]
-export = ["safetensors>=0.6"]
+export = ["safetensors>=0.6", "huggingface_hub>=0.34,<2"]
 cpu = ["torch>=2.4", "safetensors>=0.6"]
 data = ["datasets>=3.0", "tokenizers>=0.21", "deepseek-recipe>=0.1", "kagglehub>=0.3"]
 interop = ["safetensors>=0.6", "tokenizers>=0.21", "deepseek-recipe>=0.1"]

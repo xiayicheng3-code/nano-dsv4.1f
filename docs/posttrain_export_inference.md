@@ -41,9 +41,25 @@ YaRN factor 4, and SFT candidate-mask configuration. The result includes:
 | `export_manifest.json` | Completion marker, tensor counts, and bundle file hashes |
 
 Additional portable metadata files describe parameter shapes, tokenizer IDs and
-generation defaults. Save the whole output folder as a Kaggle dataset; no automatic
-upload or publication occurs. The bundle omits optimizer state and cannot resume
+generation defaults. Save the whole output folder as a Kaggle dataset. The bundle omits optimizer state and cannot resume
 training. No pretrain dataset or tokenized corpus shards are needed for export.
+
+The export checkout and pip/Hugging Face caches are placed in the marked
+`/kaggle/temp/nano-dsv41f-export` workspace, outside Kaggle's saved output directory.
+The final cell removes that workspace only after verifying the preserved bundle.
+Only the export folder is written under `/kaggle/working`; Kaggle can additionally
+create its standard notebook, HTML, and log files. Attached checkpoint inputs remain
+under `/kaggle/input`.
+
+To upload the export to Hugging Face, set `HF_REPO_ID='your-account/your-dataset'`
+in the configuration cell and enable your write token as the Kaggle secret
+`HF_TOKEN` (or change `HF_SECRET_NAME`). `HF_PRIVATE=True` creates a private dataset
+repository; existing repository visibility is not changed. The upload cell passes
+the token directly to `HfApi`, without printing it or writing a saved login. It
+uploads only the files listed in the verified export manifest plus the manifest
+itself, using `repo_type='dataset'`. The token stays out of the output bundle.
+When the repo ID is blank, upload is skipped. Cleanup runs even if upload fails,
+and the verified bundle is retained for Kaggle saving or retrying the transfer.
 
 CLI equivalent from the repo with CPU dependencies installed:
 

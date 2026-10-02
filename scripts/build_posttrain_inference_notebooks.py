@@ -17,8 +17,8 @@ def code(text):
     return nbf.v4.new_code_cell(dedent(text).strip() + '\n')
 
 
-def bootstrap():
-    return code('''
+def bootstrap(*, temporary_export=False):
+    cell = code('''
         import importlib.util
         import os
         from pathlib import Path
@@ -47,6 +47,21 @@ def bootstrap():
         sys.path.insert(0, str(REPO / 'scripts'))
         print('Source commit:', subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip())
     ''')
+    if temporary_export:
+        cell.source = cell.source.replace("REPO = Path('/kaggle/working/nano-dsv4.1f')", '''EXPORT_WORK = Path('/kaggle/temp/nano-dsv41f-export')
+if EXPORT_WORK.is_symlink():
+    raise RuntimeError('The export temporary directory must not be a symlink')
+marker = EXPORT_WORK / '.export-workspace'
+if EXPORT_WORK.exists() and (not marker.is_file() or marker.read_text().strip() != 'nano-dsv41f-export-workspace-v1'):
+    raise RuntimeError('The export temporary directory belongs to another task')
+EXPORT_WORK.mkdir(parents=True, exist_ok=True)
+marker.write_text('nano-dsv41f-export-workspace-v1')
+os.environ['PIP_CACHE_DIR'] = str(EXPORT_WORK / 'pip-cache')
+os.environ['HF_HOME'] = str(EXPORT_WORK / 'hf-cache')
+os.environ['XDG_CACHE_HOME'] = str(EXPORT_WORK / 'cache')
+REPO = EXPORT_WORK / 'source'
+'''.rstrip())
+    return cell
 
 
 def save(name, cells, output_dir):
@@ -86,8 +101,11 @@ def build(output_dir=ROOT / 'notebooks'):
         code(f'''SOURCE_REF = {REF!r}
 CHECKPOINT = ''  # blank: locate exactly one SFT checkpoint set under /kaggle/input
 OUTPUT = '/kaggle/working/nano-dsv41f-sft32k-safetensors'  # use a fresh directory
+HF_REPO_ID = ''  # set account/repository to upload; blank skips Hugging Face upload
+HF_PRIVATE = True  # visibility when creating a new dataset repository
+HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write token
 '''),
-        bootstrap(),
+        bootstrap(temporary_export=True),
         code('''
         import json
         from export_posttrain_checkpoint import resolve_checkpoint
@@ -115,6 +133,46 @@ OUTPUT = '/kaggle/working/nano-dsv41f-sft32k-safetensors'  # use a fresh directo
             display(FileLink(str(path)))
         '''),
         md('''
+        ## Upload to Hugging Face and clean temporary files
+
+        Set `HF_REPO_ID` above to `your-account/your-dataset`, add your Hugging Face
+        write token as the Kaggle secret `HF_TOKEN`, and enable it for this notebook.
+        This cell creates a **dataset** repo (private by default) and uploads the
+        verified export files at its root. It runs automatically when the repo ID
+        is set; leaving it blank saves only the Kaggle output. The key is passed
+        directly to the API and is not printed or saved as a login file.
+
+        The source checkout and caches live outside `/kaggle/working`. After this
+        cell, the marked temporary workspace is removed, even if an upload fails.
+        The exported bundle remains available for Kaggle saving and retrying upload.
+        '''),
+        code('''
+        from export_bundle_upload import cleanup_export_workspace, upload_export_bundle
+
+        def upload_with_kaggle_secret():
+            from kaggle_secrets import UserSecretsClient
+            try:
+                token = UserSecretsClient().get_secret(HF_SECRET_NAME)
+            except Exception:
+                raise RuntimeError(f'Enable the Kaggle secret {HF_SECRET_NAME} for Hugging Face upload') from None
+            try:
+                return upload_export_bundle(OUTPUT, HF_REPO_ID, token, private=HF_PRIVATE)
+            finally:
+                del token
+
+        try:
+            if HF_REPO_ID:
+                uploaded = upload_with_kaggle_secret()
+                print('Hugging Face dataset:', f'https://huggingface.co/datasets/{HF_REPO_ID}')
+                print('Upload commit:', uploaded.commit_url)
+            else:
+                print('Hugging Face upload skipped: HF_REPO_ID is blank')
+        finally:
+            cleanup_export_workspace(OUTPUT, EXPORT_WORK)
+            print('Temporary export checkout and caches removed')
+            print('Saved bundle:', OUTPUT)
+        '''),
+        md('''
         ## Save and use
 
         Save this notebook version with its outputs, then save the entire
@@ -122,7 +180,9 @@ OUTPUT = '/kaggle/working/nano-dsv41f-sft32k-safetensors'  # use a fresh directo
         together, especially `model.safetensors`, `config.json`, `tokenizer.json`,
         `training_recipe.json`, and `export_manifest.json`. Attach this exported
         dataset to `nano_dsv41f_sft_inference_cpu.ipynb`. GitHub supplies the runtime
-        code; the weights remain in your chosen dataset. No upload is automatic.
+        code; the weights remain in your chosen dataset. Only the bundle is written
+        under `/kaggle/working`; Kaggle may also generate its normal notebook/log files.
+        The optional upload cell publishes the same bundle to your Hugging Face dataset.
         ''')], output_dir)
 
     demo = chat_notebook()
