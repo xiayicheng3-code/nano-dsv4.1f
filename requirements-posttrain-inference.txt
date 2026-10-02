@@ -1,0 +1,12 @@
+# CPU JAX reads the training layout; Torch runs the inference model.
+# Install a CPU Torch wheel separately if Torch is not already installed.
+jax==0.10.2
+jaxlib==0.10.2
+tokamax==0.0.12
+numpy>=1.26
+safetensors>=0.6
+tokenizers>=0.21
+deepseek-recipe==0.1.1
+ipywidgets>=8
+fastapi>=0.115
+uvicorn>=0.32

@@ -50,7 +50,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Install the public repo + CPU/API dependencies.
             # If you attach a source wheel as a Kaggle input later, replace this cell with
             # an offline `pip install /kaggle/input/.../*.whl` for a zero-network demo.
@@ -80,7 +80,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Locate an attached portable checkpoint and frozen tokenizer.
             from pathlib import Path
 
@@ -110,7 +110,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Load the correctness-first incremental CPU runtime.
             import torch
             from nano_dsv41f.vllm_v41_cpu.api import NanoDeepSeekProtocolBackend
@@ -125,7 +125,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Multi-turn DeepSeek V4.1 Chat Completions helper.
             import json
 
@@ -171,7 +171,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Run All reaches this cell and proves the chat path is live.
             reply = chat("Hello! In one short sentence, introduce yourself.", max_tokens=64)
             print_reply(reply)
@@ -187,7 +187,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Kaggle/Jupyter-native chat controls: no public tunnel or separate web app needed.
             import ipywidgets as widgets
             from IPython.display import display
@@ -281,7 +281,7 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
         _code(
-            '''
+            r'''
             # Optional: expose the same model through local OpenAI/Anthropic-compatible HTTP routes.
             # Run this cell only when you want an API server inside the Kaggle session.
             # from nano_dsv41f.vllm_v41_cpu.api import create_app
