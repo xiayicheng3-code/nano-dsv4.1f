@@ -364,3 +364,13 @@ See `docs/implementation_scope.md` for the detailed fidelity matrix.
 Primary references are the DeepSeek-V4.1-Flash technical report/released configuration and inference implementation, vLLM's V4.1 implementation for deployment details, JAX's TPU/Pallas/SplashAttention implementation, and DeepSeek's released DeepSpec DSpark code.
 
 This project is unaffiliated with DeepSeek.
+
+## 8K midtrain and 32K SFT
+
+The [CPU preparation notebook](notebooks/nano_dsv41f_prepare_midtrain8k_sft32k_cpu.ipynb) builds separate stage corpora and saves canonical traces. The [TPU training notebook](notebooks/nano_dsv41f_midtrain8k_sft32k_tpu.ipynb) continues a completed pretrain checkpoint through both stages. See [budgets, selection and resume behavior](docs/posttrain_8k_32k.md).
+
+After SFT completes, run the [CPU safetensors export notebook](notebooks/nano_dsv41f_export_sft_safetensors_cpu.ipynb)
+with the saved TPU output attached. It preserves the effective SFT configuration and
+BF16/FP32 parameters, bundles the verified tokenizer, and omits optimizer state.
+Attach the resulting bundle to the [SFT CPU inference notebook](notebooks/nano_dsv41f_sft_inference_cpu.ipynb)
+for interactive chat and raw completions. See [export and inference instructions](docs/posttrain_export_inference.md).

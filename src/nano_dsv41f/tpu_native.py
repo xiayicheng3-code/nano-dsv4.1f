@@ -641,6 +641,7 @@ def compile_pretrain_step_native(
     mesh: Mesh,
     *,
     include_indexer: bool,
+    assistant_only: bool = False,
     n_segments: int | None = None,
     native_config: TPUNativeConfig | None = None,
 ):
@@ -670,6 +671,7 @@ def compile_pretrain_step_native(
         train_config,
         mesh,
         include_indexer=include_indexer,
+        assistant_only=assistant_only,
         n_segments=n_segments,
     )
     return NativeCompiledStep(jitted, mesh, options)
