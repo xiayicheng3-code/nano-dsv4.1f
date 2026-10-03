@@ -190,7 +190,7 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
     helpers = helpers.replace('_, raw = backend.complete_protocol("chat_completions", payload)',
         '''from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request
     prepared = prepare_protocol_request("chat_completions", payload)
-    prompt_ids = backend.tokenizer.encode_conversation(prepared.conversation_request.conversation)
+    prompt_ids = backend.tokenizer.encode_request(prepared)
     check_context(prompt_ids, max_tokens)
     _, raw = backend.complete_protocol("chat_completions", payload)''')
     inference = save('sft_inference_cpu', [

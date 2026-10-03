@@ -58,7 +58,7 @@ def build_notebook() -> nbf.NotebookNode:
             import subprocess
             import sys
 
-            REPO_REF = os.environ.get("NANO_DSV41F_REF", "codex/v41-cpu-inference")
+            REPO_REF = os.environ.get("NANO_DSV41F_REF", "codex/midtrain8k-sft16k")
             repo = "/kaggle/working/nano-dsv4.1f"
             if not os.path.exists(repo):
                 subprocess.check_call(
@@ -73,6 +73,11 @@ def build_notebook() -> nbf.NotebookNode:
                         repo,
                     ]
                 )
+            if subprocess.check_output(["git", "-C", repo, "status", "--porcelain",
+                                        "--untracked-files=no"], text=True).strip():
+                raise RuntimeError("Preserve tracked edits before updating the source checkout")
+            subprocess.check_call(["git", "-C", repo, "fetch", "--depth", "1", "origin", REPO_REF])
+            subprocess.check_call(["git", "-C", repo, "checkout", "--detach", "FETCH_HEAD"])
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "-q", "-e", f"{repo}[api]"]
             )
@@ -130,16 +135,18 @@ def build_notebook() -> nbf.NotebookNode:
             import json
 
             history = []
-            VALID_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh", "max"}
+            REASONING_EFFORT_PRESETS = {"low": 50, "high": 75, "max": 100}
 
             def reset_chat():
                 history.clear()
 
             def chat(message, *, thinking=False, reasoning_effort="high", max_tokens=128):
-                if reasoning_effort not in VALID_REASONING_EFFORTS:
-                    raise ValueError(
-                        f"reasoning_effort must be one of {sorted(VALID_REASONING_EFFORTS)}"
-                    )
+                if isinstance(reasoning_effort, str):
+                    if reasoning_effort not in REASONING_EFFORT_PRESETS:
+                        raise ValueError("reasoning_effort must be low, high, max, or an integer in [1, 100]")
+                    reasoning_effort = REASONING_EFFORT_PRESETS[reasoning_effort]
+                if type(reasoning_effort) is not int or not 1 <= reasoning_effort <= 100:
+                    raise ValueError("reasoning_effort must be low, high, max, or an integer in [1, 100]")
                 request_messages = history + [{"role": "user", "content": message}]
                 payload = {
                     "model": backend.model_name,
@@ -183,24 +190,36 @@ def build_notebook() -> nbf.NotebookNode:
 
             The next cell creates a small in-notebook chat control. Type a message and press
             **Send**; the conversation history is preserved until you press **Reset**.
-            Thinking mode and DeepSeek reasoning effort can be changed from the controls.
+            Input, Send, Reset, and generation settings are locked while a response is
+            being generated. They unlock after completion or an error.
+            Enable Thinking to choose Low (50), High (75), Max (100), or a custom
+            integer effort from 1 to 100. Max tokens caps the entire generated response,
+            including reasoning; effort is a prompt setting rather than a token limit.
             '''
         ),
         _code(
             r'''
             # Kaggle/Jupyter-native chat controls: no public tunnel or separate web app needed.
+            import asyncio
             import ipywidgets as widgets
             from IPython.display import display
 
+            if globals().get("_chat_task") is not None and not _chat_task.done():
+                raise RuntimeError("Wait for the current response before rebuilding chat controls")
             message_box = widgets.Textarea(
                 placeholder="Type a message…",
                 layout=widgets.Layout(width="100%", height="90px"),
             )
             thinking_box = widgets.Checkbox(value=False, description="Thinking")
             effort_box = widgets.Dropdown(
-                options=["minimal", "low", "medium", "high", "xhigh", "max"],
-                value="high",
+                options=[("Low (50)", 50), ("High (75)", 75), ("Max (100)", 100),
+                         ("Custom (1–100)", "custom")],
+                value=75,
                 description="Effort:",
+                disabled=True,
+            )
+            custom_effort_box = widgets.BoundedIntText(
+                value=75, min=1, max=100, step=1, description="Value:", disabled=True,
             )
             max_tokens_box = widgets.BoundedIntText(
                 value=128,
@@ -212,42 +231,79 @@ def build_notebook() -> nbf.NotebookNode:
             send_button = widgets.Button(description="Send", button_style="primary")
             reset_button = widgets.Button(description="Reset")
             chat_output = widgets.Output(layout=widgets.Layout(border="1px solid #ddd"))
+            status_label = widgets.Label(value="Ready")
+            _chat_busy = False
+            _chat_task = None
+
+            def _update_effort_controls(_=None):
+                if effort_box.value != "custom":
+                    custom_effort_box.value = effort_box.value
+                effort_box.disabled = _chat_busy or not thinking_box.value
+                custom_effort_box.disabled = (_chat_busy or not thinking_box.value
+                                              or effort_box.value != "custom")
+
+            def _set_busy(busy):
+                global _chat_busy
+                _chat_busy = busy
+                for control in (message_box, thinking_box, max_tokens_box, send_button, reset_button):
+                    control.disabled = busy
+                _update_effort_controls()
+                send_button.description = "Generating…" if busy else "Send"
+                status_label.value = "Generating response…" if busy else "Ready"
+
+            async def _generate_reply(message, settings):
+                try:
+                    # Keep the kernel event loop available for widget updates and
+                    # rejecting extra clicks. All widget writes stay on this loop.
+                    reply = await asyncio.to_thread(chat, message, **settings)
+                    reasoning = reply.get("reasoning_content")
+                    if reasoning:
+                        chat_output.append_stdout(f"Reasoning: {reasoning}\n")
+                    chat_output.append_stdout(f"Assistant: {reply.get('content') or ''}\n\n")
+                except Exception as exc:
+                    message_box.value = message
+                    chat_output.append_stdout(f"Error: {exc}\n\n")
+                finally:
+                    _set_busy(False)
 
             def _send(_):
+                global _chat_task
+                if _chat_busy:
+                    return
                 message = message_box.value.strip()
                 if not message:
                     return
+                settings = dict(thinking=thinking_box.value,
+                                reasoning_effort=custom_effort_box.value,
+                                max_tokens=max_tokens_box.value)
+                _set_busy(True)
                 message_box.value = ""
-                with chat_output:
-                    print(f"You: {message}")
-                    try:
-                        reply = chat(
-                            message,
-                            thinking=thinking_box.value,
-                            reasoning_effort=effort_box.value,
-                            max_tokens=max_tokens_box.value,
-                        )
-                        reasoning = reply.get("reasoning_content")
-                        if reasoning:
-                            print(f"Reasoning: {reasoning}")
-                        print(f"Assistant: {reply.get('content') or ''}\n")
-                    except Exception as exc:
-                        print(f"Error: {exc}\n")
+                chat_output.append_stdout(f"You: {message}\n")
+                try:
+                    _chat_task = asyncio.get_running_loop().create_task(_generate_reply(message, settings))
+                except Exception as exc:
+                    message_box.value = message
+                    _set_busy(False)
+                    chat_output.append_stdout(f"Error: {exc}\n\n")
 
             def _reset(_):
+                if _chat_busy:
+                    return
                 reset_chat()
                 chat_output.clear_output()
-                with chat_output:
-                    print("Conversation reset.\n")
+                chat_output.append_stdout("Conversation reset.\n\n")
 
+            thinking_box.observe(_update_effort_controls, names="value")
+            effort_box.observe(_update_effort_controls, names="value")
             send_button.on_click(_send)
             reset_button.on_click(_reset)
             display(
                 widgets.VBox(
                     [
                         message_box,
-                        widgets.HBox([thinking_box, effort_box, max_tokens_box]),
-                        widgets.HBox([send_button, reset_button]),
+                        widgets.HBox([thinking_box, effort_box, custom_effort_box]),
+                        widgets.HBox([max_tokens_box, send_button, reset_button]),
+                        status_label,
                         chat_output,
                     ]
                 )
@@ -263,8 +319,8 @@ def build_notebook() -> nbf.NotebookNode:
             print_reply(chat("Now explain that more simply."))  # keeps the same history
             ```
 
-            For DeepSeek-style reasoning mode, use the API's named reasoning levels
-            (`minimal`, `low`, `medium`, `high`, `xhigh`, or `max`):
+            For DeepSeek V4.1 reasoning mode, use `low` (50), `high` (75, the default),
+            `max` (100), or any integer in `[1, 100]`, matching the open-weight encoder:
 
             ```python
             print_reply(
@@ -275,6 +331,7 @@ def build_notebook() -> nbf.NotebookNode:
                     max_tokens=256,
                 )
             )
+            print_reply(chat("Try a shorter explanation.", thinking=True, reasoning_effort=30))
             ```
 
             Use `reset_chat()` to start a fresh conversation.
@@ -291,6 +348,8 @@ def build_notebook() -> nbf.NotebookNode:
             '''
         ),
     ]
+    for i, cell in enumerate(nb.cells):
+        cell.id = f"cpu-chat-{i:02d}"
     return nb
 
 

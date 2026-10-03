@@ -86,6 +86,19 @@ Torch CPU runtime. It uses FP32 arithmetic and incremental cached generation.
 context length. Start with short inputs/outputs on CPU. The 32K training context
 does not establish CPU latency or long-context task quality.
 
+The chat widget runs generation in a worker thread so notebook controls stay
+responsive. It disables message input, Send, Reset, and generation settings during
+each request, ignores additional clicks while busy, and restores controls after a
+reply or error. An unsuccessful request restores the message for retrying.
+
+Thinking controls match the [official V4.1 open-weight encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/encoding/README.md):
+Low = 50, High = 75 (default), Max = 100, or a custom integer from 1 through 100.
+The helper also accepts these three preset names. Effort is disabled in chat mode;
+`max_tokens` separately caps all generated tokens, including reasoning. Numeric
+effort uses the same initial-prefix adjustment as the canonical SFT renderer because
+the pinned `deepseek-recipe` bindings only accept named presets. Context checks and
+generation tokenize this exact adjusted prompt.
+
 Tool calls are returned for inspection and are not executed. Optional local HTTP
 serving uses the existing API backend. DSpark weights are preserved for future
 use; this runtime still uses ordinary autoregressive decoding. This custom model

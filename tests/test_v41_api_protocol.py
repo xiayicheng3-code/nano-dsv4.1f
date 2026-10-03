@@ -36,6 +36,80 @@ def test_deepseek_recipe_renders_chat_completions():
     assert prepared.conversation_request.conversation.thinking_mode is True
 
 
+@pytest.mark.parametrize('effort', [1, 37, 50, 75, 100])
+@pytest.mark.parametrize('transport', ['dict', 'str', 'bytes'])
+def test_numeric_effort_changes_only_initial_prompt_prefix(effort, transport):
+    import json
+    from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request
+
+    payload = {'model': 'nano', 'messages': [{'role': 'user', 'content': 'Reasoning Effort: 75'}],
+               'thinking': {'type': 'enabled'}, 'reasoning_effort': effort, 'max_tokens': 32}
+    body = payload if transport == 'dict' else json.dumps(payload)
+    if transport == 'bytes':
+        body = body.encode()
+    prepared = prepare_protocol_request('chat_completions', body)
+    baseline = prepare_protocol_request('chat_completions', {**payload, 'reasoning_effort': 'high'})
+    assert prepared.prompt == baseline.prompt.replace('Reasoning Effort: 75', f'Reasoning Effort: {effort}', 1)
+    assert 'Reasoning Effort: 75<｜Assistant｜>' in prepared.prompt
+    assert prepared.numeric_reasoning_effort == effort
+    assert prepared.inference_options.max_tokens == 32
+    assert payload['reasoning_effort'] == effort
+
+
+@pytest.mark.parametrize('effort', [0, 101, True, 37.0])
+def test_numeric_effort_rejects_invalid_values(effort):
+    from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request
+    with pytest.raises(ValueError, match='integer'):
+        prepare_protocol_request('chat_completions', {'model': 'nano', 'messages': [],
+                                 'reasoning_effort': effort})
+
+
+@pytest.mark.parametrize('body', ['[]', 'null', '"text"'])
+def test_chat_request_requires_json_object(body):
+    from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request
+    with pytest.raises(ValueError, match='JSON object'):
+        prepare_protocol_request('chat_completions', body)
+
+
+def test_nonthinking_ignores_numeric_effort():
+    from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request
+    prepared = prepare_protocol_request('chat_completions', {'model': 'nano',
+        'messages': [{'role': 'user', 'content': 'Hello'}],
+        'thinking': {'type': 'disabled'}, 'reasoning_effort': 37})
+    assert 'Reasoning Effort:' not in prepared.prompt
+    assert prepared.numeric_reasoning_effort is None
+    assert prepared.prompt.endswith('<｜Assistant｜></think>')
+
+
+def test_generation_uses_exact_numeric_prompt_and_presets(tmp_path):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from nano_dsv41f.chat_protocol import SPECIAL_TOKENS
+    from nano_dsv41f.vllm_v41_cpu.api import NanoTokenizer, NanoDeepSeekProtocolBackend
+
+    vocab = {s: i for i, s in enumerate(SPECIAL_TOKENS)}
+    vocab.update({s: len(vocab) + i for i, s in enumerate(['[UNK]', '37', '50', '75', '100'])})
+    tokenizer = Tokenizer(models.WordLevel(vocab, unk_token='[UNK]'))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tokenizer.add_special_tokens(list(SPECIAL_TOKENS))
+    path = tmp_path / 'tokenizer.json'
+    tokenizer.save(str(path))
+    class StubModel:
+        device = torch.device('cpu')
+        def generate(self, input_ids, **kwargs):
+            self.received = input_ids[0].tolist()
+            return torch.cat((input_ids, torch.tensor([[EOS_TOKEN_ID]])), dim=-1)
+    model = StubModel()
+    backend = NanoDeepSeekProtocolBackend(model, NanoTokenizer(path))
+    for effort in [37, 'low', 'high', 'max']:
+        prepared, _ = backend.complete_protocol('chat_completions', {'model': 'nano',
+            'messages': [{'role': 'user', 'content': 'Hello'}],
+            'thinking': {'type': 'enabled'}, 'reasoning_effort': effort, 'max_tokens': 1})
+        expected = backend.tokenizer.recipe_tokenizer.encode(prepared.prompt)
+        assert model.received == expected
+        value = {'low': 50, 'high': 75, 'max': 100}.get(effort, effort)
+        assert vocab[str(value)] in model.received
+
+
 def test_deepseek_recipe_renders_responses_api():
     from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request
 
