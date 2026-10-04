@@ -225,3 +225,4 @@ def test_distillation_notebook_regenerates_and_compiles(tmp_path):
         if cell.cell_type == 'code':
             compile(cell.source, 'dspark-notebook', 'exec')
     assert json.loads(generated.read_text()) == json.loads((ROOT/'notebooks/nano_dsv41f_dspark_distillation.ipynb').read_text())
+    assert "SOURCE_REF = 'main'" in generated.read_text()
