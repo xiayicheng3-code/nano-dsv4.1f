@@ -238,6 +238,7 @@ def causal_lm_loss(
     segment_ids: jax.Array,
     *,
     token_mask: jax.Array | None = None,
+    target_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Packed next-token cross entropy that never predicts across segment boundaries."""
     if logits.ndim != 3 or input_ids.ndim != 2 or segment_ids.shape != input_ids.shape:
@@ -252,6 +253,10 @@ def causal_lm_loss(
     valid = segment_ids[:, :-1] == segment_ids[:, 1:]
     if token_mask is not None:
         valid = valid & token_mask[:, :-1] & token_mask[:, 1:]
+    if target_mask is not None:
+        if target_mask.shape != input_ids.shape:
+            raise ValueError("target_mask must match input_ids")
+        valid = valid & target_mask[:, 1:].astype(jnp.bool_)
     # Avoid materializing a second full [B,T,V] log-probability array.
     target = jnp.take_along_axis(pred, labels[..., None], axis=-1)[..., 0]
     nll = jax.nn.logsumexp(pred, axis=-1) - target
@@ -496,6 +501,7 @@ def pretrain_loss(
     *,
     segment_ids: jax.Array,
     token_mask: jax.Array | None = None,
+    target_mask: jax.Array | None = None,
     include_indexer: bool = False,
     n_segments: int | None = None,
     step: jax.Array | int = 0,
@@ -515,7 +521,7 @@ def pretrain_loss(
         compute_indexer=False,
     )
     lm, lm_tokens = causal_lm_loss(
-        logits, input_ids, segment_ids, token_mask=token_mask
+        logits, input_ids, segment_ids, token_mask=token_mask, target_mask=target_mask
     )
     if include_indexer and config.indexer_training.enabled:
         index_loss, index_aux = _selective_indexer_from_backbone_aux(
@@ -578,6 +584,7 @@ def pretrain_step(
     segment_ids: jax.Array,
     step: jax.Array,
     token_mask: jax.Array | None = None,
+    target_mask: jax.Array | None = None,
     include_indexer: bool = False,
     n_segments: int | None = None,
 ):
@@ -595,6 +602,7 @@ def pretrain_step(
             input_ids,
             segment_ids=segment_ids,
             token_mask=token_mask,
+            target_mask=target_mask,
             include_indexer=include_indexer,
             n_segments=n_segments,
             step=step,

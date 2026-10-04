@@ -95,6 +95,8 @@ def apply_engram_step(
     allowing an n-gram to cross a real segment boundary.
     """
     ec = model.config.engram
+    input_ids_history = input_ids_history[:, -ec.max_ngram_size:]
+    segment_ids_history = segment_ids_history[:, -ec.max_ngram_size:]
     pad = max(ec.max_ngram_size - input_ids_history.shape[-1], 0)
     if pad:
         id_pad = torch.full(
@@ -127,15 +129,17 @@ def apply_engram_step(
     return _inject_engram(model, streams, hashes, layer_id)
 
 
-def apply_moe(model: Any, x: torch.Tensor, layer_id: int) -> torch.Tensor:
-    prefix = f"blocks.{layer_id}.moe"
+def apply_moe(model: Any, x: torch.Tensor, layer_id: int | None = None, *,
+              prefix: str | None = None, top_k: int | None = None) -> torch.Tensor:
+    prefix = prefix or f"blocks.{layer_id}.moe"
+    top_k = model.config.experts_per_token if top_k is None else top_k
     logits = torch.matmul(
         x.float(), model._w(f"{prefix}.router_weight").float()
     )
     raw = torch.sqrt(F.softplus(logits))
     selection = raw + model._w(f"{prefix}.router_bias").float()
     indices = torch.topk(
-        selection, k=model.config.experts_per_token, dim=-1
+        selection, k=top_k, dim=-1
     ).indices
     weights = raw.gather(-1, indices)
     weights = weights / weights.sum(

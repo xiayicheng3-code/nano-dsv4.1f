@@ -41,6 +41,7 @@ class NanoDeepseekV41CPU:
             for key, value in flat_weights.items()
         }
         self.specs = build_layer_specs(config)
+        self.max_context = 32768
 
     @classmethod
     def from_pretrained(
@@ -64,7 +65,9 @@ class NanoDeepseekV41CPU:
         tensors = load_file(
             str(root / "model.safetensors"), device=str(device)
         )
-        return cls(config, tensors, device=device, dtype=dtype)
+        model = cls(config, tensors, device=device, dtype=dtype)
+        model.max_context = int(payload.get("max_position_embeddings", 32768))
+        return model
 
     def _w(self, path: str) -> torch.Tensor:
         key = path if path.startswith("nano.") else f"nano.{path}"
@@ -221,9 +224,9 @@ class NanoDeepseekV41CPU:
             ),
         }
 
-    def new_cache(self) -> NanoDecodeCache:
+    def new_cache(self, capacity: int | None = None) -> NanoDecodeCache:
         """Create an empty single-sequence cache for incremental CPU decoding."""
-        return NanoDecodeCache.empty(device=self.device)
+        return NanoDecodeCache.empty(device=self.device, capacity=self.max_context if capacity is None else capacity)
 
     @torch.inference_mode()
     def forward_step(
@@ -263,13 +266,13 @@ class NanoDeepseekV41CPU:
             if current_segment.shape != (1, 1):
                 raise ValueError("segment_ids for forward_step must have shape [1,1]")
 
-        cache.input_ids = torch.cat((cache.input_ids, token_ids), dim=1)
-        cache.segment_ids = torch.cat(
-            (cache.segment_ids, current_segment), dim=1
-        )
-        position = segment_local_positions(cache.segment_ids)[:, -1:]
         if sparse_retrieval:
             compute_indexer = True
+        mode = (compute_indexer, sparse_retrieval)
+        if cache.mode is not None and cache.mode != mode:
+            raise ValueError("attention mode changed; start a fresh decode cache")
+        cache.mode = mode
+        position = cache.append_token(token_ids, current_segment)
 
         streams = self._w("embed")[token_ids]
         streams = streams.unsqueeze(-2).expand(
@@ -285,6 +288,7 @@ class NanoDeepseekV41CPU:
         state: TorchCSA2State | None = None
         context_final: torch.Tensor | None = None
         layer_aux: list[dict[str, Any]] = []
+        draft_features = []
 
         for spec in self.specs:
             layer_id = spec.layer_id
@@ -301,6 +305,9 @@ class NanoDeepseekV41CPU:
                     cache.segment_ids,
                     layer_id,
                 )
+
+            if cache.collect_draft and layer_id in self.config.dspark.target_layer_ids:
+                draft_features.append(streams.mean(dim=-2))
 
             residual = streams
             attn_mhc = f"blocks.{layer_id}.mhc_attn"
@@ -358,10 +365,14 @@ class NanoDeepseekV41CPU:
             incoming_pre = ffn_pre
             layer_aux.append(aux)
 
+        if draft_features:
+            from .dspark import record_context
+            record_context(self, cache, torch.cat(draft_features, dim=-1), position)
         hidden = self._norm(
             pre_mix(streams, incoming_pre), "final_norm"
         )
         logits = linear(hidden, self._w("lm_head"))
+        cache.next_logits = logits[:, -1].float()
         return logits, cache, {
             "final_hidden": hidden,
             "context_final": context_final,
@@ -379,6 +390,8 @@ class NanoDeepseekV41CPU:
         segment_ids: torch.Tensor | None = None,
         compute_indexer: bool = True,
         sparse_retrieval: bool = True,
+        cache: NanoDecodeCache | None = None,
+        return_all_logits: bool = True,
     ) -> tuple[torch.Tensor, NanoDecodeCache]:
         """Build the incremental reference cache token-by-token and return all logits."""
         ids = input_ids.to(device=self.device, dtype=torch.long)
@@ -393,7 +406,9 @@ class NanoDeepseekV41CPU:
             if segments.shape != ids.shape:
                 raise ValueError("segment_ids must match input_ids")
 
-        cache = self.new_cache()
+        cache = self.new_cache() if cache is None else cache
+        if cache.length + ids.shape[1] > cache.capacity:
+            raise ValueError("prefill exceeds cache capacity")
         rows: list[torch.Tensor] = []
         for position in range(ids.shape[1]):
             logits, cache, _ = self.forward_step(
@@ -403,8 +418,9 @@ class NanoDeepseekV41CPU:
                 compute_indexer=compute_indexer,
                 sparse_retrieval=sparse_retrieval,
             )
-            rows.append(logits)
-        return torch.cat(rows, dim=1), cache
+            if return_all_logits:
+                rows.append(logits)
+        return (torch.cat(rows, dim=1) if return_all_logits else logits), cache
 
     @staticmethod
     def _sample_next(
@@ -441,37 +457,8 @@ class NanoDeepseekV41CPU:
         top_p: float = 1.0,
         sparse_retrieval: bool = True,
     ) -> torch.Tensor:
-        """Autoregressive CPU generation using the cache-correct incremental path."""
-        ids = input_ids.to(device=self.device, dtype=torch.long)
-        if ids.ndim == 1:
-            ids = ids.unsqueeze(0)
-        if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] == 0:
-            raise ValueError("generate requires a non-empty single-sequence prompt")
-        if max_new_tokens < 0:
-            raise ValueError("max_new_tokens must be non-negative")
-        if max_new_tokens == 0:
-            return ids
-
-        logits, cache = self.prefill_cache(
-            ids, sparse_retrieval=sparse_retrieval
-        )
-        next_logits = logits[:, -1].float()
-        output = ids
-        for step in range(max_new_tokens):
-            next_id = self._sample_next(
-                next_logits, temperature=temperature, top_p=top_p
-            )
-            output = torch.cat((output, next_id), dim=-1)
-            if (
-                eos_token_id is not None
-                and torch.all(next_id == eos_token_id)
-            ):
-                break
-            if step + 1 < max_new_tokens:
-                step_logits, cache, _ = self.forward_step(
-                    next_id,
-                    cache,
-                    sparse_retrieval=sparse_retrieval,
-                )
-                next_logits = step_logits[:, -1].float()
-        return output
+        """Stateless convenience API; use InferenceSession for prefix reuse/statistics."""
+        from .session import InferenceSession
+        return InferenceSession(self).generate(
+            input_ids, max_new_tokens=max_new_tokens, eos_token_id=eos_token_id,
+            temperature=temperature, top_p=top_p, sparse_retrieval=sparse_retrieval)
