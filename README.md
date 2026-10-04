@@ -375,3 +375,5 @@ BF16/FP32 parameters, bundles the verified tokenizer, and omits optimizer state.
 Attach the resulting bundle to the [SFT CPU inference notebook](notebooks/nano_dsv41f_sft_inference_cpu.ipynb)
 for interactive chat and raw completions with persistent prefix caching and per-turn
 prefill/decode statistics. See [export and inference instructions](docs/posttrain_export_inference.md).
+
+Train the exported model's draft head with the [DSpark distillation notebook](notebooks/nano_dsv41f_dspark_distillation.ipynb). It freezes the backbone, reuses SFT data, and measures held-out agreement and rollout acceptance. See [training, resume and export instructions](docs/dspark_distillation.md).

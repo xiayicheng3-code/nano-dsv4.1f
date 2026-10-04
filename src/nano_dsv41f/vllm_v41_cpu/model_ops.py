@@ -130,7 +130,8 @@ def apply_engram_step(
 
 
 def apply_moe(model: Any, x: torch.Tensor, layer_id: int | None = None, *,
-              prefix: str | None = None, top_k: int | None = None) -> torch.Tensor:
+              prefix: str | None = None, top_k: int | None = None,
+              return_router_indices: bool = False):
     prefix = prefix or f"blocks.{layer_id}.moe"
     top_k = model.config.experts_per_token if top_k is None else top_k
     logits = torch.matmul(
@@ -184,4 +185,5 @@ def apply_moe(model: Any, x: torch.Tensor, layer_id: int | None = None, *,
             -model.config.swiglu_limit, model.config.swiglu_limit
         )
     shared = torch.matmul(F.silu(shared_gate) * shared_up, shared_w2)
-    return (routed.to(x.dtype) + shared.to(x.dtype)).to(x.dtype)
+    out = (routed.to(x.dtype) + shared.to(x.dtype)).to(x.dtype)
+    return (out, indices) if return_router_indices else out

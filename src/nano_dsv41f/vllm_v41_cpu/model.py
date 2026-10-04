@@ -100,6 +100,9 @@ class NanoDeepseekV41CPU:
         token_mask: torch.Tensor | None = None,
         compute_indexer: bool = True,
         sparse_retrieval: bool = True,
+        collect_draft_features: bool = False,
+        logit_positions: torch.Tensor | None = None,
+        return_layer_aux: bool = True,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         input_ids = input_ids.to(
             device=self.device, dtype=torch.long
@@ -139,6 +142,7 @@ class NanoDeepseekV41CPU:
         state: TorchCSA2State | None = None
         context_final: torch.Tensor | None = None
         layer_aux: list[dict[str, Any]] = []
+        draft_features = []
 
         for spec in self.specs:
             layer_id = spec.layer_id
@@ -156,6 +160,9 @@ class NanoDeepseekV41CPU:
                     layer_id,
                     token_mask,
                 )
+
+            if collect_draft_features and layer_id in self.config.dspark.target_layer_ids:
+                draft_features.append(streams.mean(dim=-2))
 
             residual = streams
             attn_mhc = f"blocks.{layer_id}.mhc_attn"
@@ -209,14 +216,22 @@ class NanoDeepseekV41CPU:
                 residual, ffn_out, ffn_comb, ffn_post
             )
             incoming_pre = ffn_pre
-            layer_aux.append(aux)
+            if return_layer_aux:
+                layer_aux.append(aux)
 
         hidden = self._norm(
             pre_mix(streams, incoming_pre), "final_norm"
         )
-        logits = linear(hidden, self._w("lm_head"))
+        selected_hidden = hidden
+        if logit_positions is not None:
+            positions = logit_positions.to(device=self.device, dtype=torch.long)
+            if positions.ndim != 2 or positions.shape[0] != hidden.shape[0]:
+                raise ValueError("logit_positions must have shape [batch, selected_tokens]")
+            selected_hidden = hidden.gather(1, positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+        logits = linear(selected_hidden, self._w("lm_head"))
         return logits, {
             "final_hidden": hidden,
+            "dspark_context_features": torch.cat(draft_features, dim=-1) if draft_features else None,
             "context_final": context_final,
             "layers": tuple(layer_aux),
             "final_global_source_layer": (

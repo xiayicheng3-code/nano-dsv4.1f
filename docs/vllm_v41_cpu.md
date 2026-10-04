@@ -209,7 +209,7 @@ output_ids = session.generate(input_ids, max_new_tokens=32, temperature=0)
 print(format_inference_stats(session.last_stats))
 ```
 
-After actually training a draft head, use `draft_trained=True` instead. This is a
+Use the [DSpark distillation notebook](dspark_distillation.md) for a dedicated frozen-backbone training stage on existing SFT data. After training a draft head, use `draft_trained=True` instead. This is a
 caller assertion, not an inferred property of checkpoint tensor names. Nonzero
 temperature is currently rejected in MTP mode. Default sampling is unchanged.
 Quantization/QAT configuration remains checkpoint metadata; this runtime executes
