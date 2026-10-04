@@ -16,12 +16,9 @@ def record_context(model, cache, features, position):
     kv = model._norm(linear(main, model._w("dspark.kv.weight")), "dspark.kv_norm")
     kv = partial_rope(kv, position, rotary_dim=model.config.attention.rope.rope_head_dim,
                       **rope_kwargs(model.config, 0))
-    if cache.draft_kv is None:
-        cache.draft_kv = kv.new_empty((1, window, kv.shape[-1]))
-        cache.draft_positions = position.new_empty((1, window))
-    slot = (cache.length - 1) % window
-    cache.draft_kv[:, slot:slot+1].copy_(kv)
-    cache.draft_positions[:, slot:slot+1].copy_(position)
+    if cache.transaction is not None:
+        cache.transaction.draft = (kv, position, window)
+    cache.write_draft(kv, position, window, cache.length - kv.shape[1])
 
 
 def draft_from_kv(model, context_kv, context_mask, anchor_ids, anchor_positions, *, return_router_indices=False):

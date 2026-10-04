@@ -116,7 +116,11 @@ def build_notebook() -> nbf.NotebookNode:
         ),
         _code(
             r'''
-            # Load the correctness-first incremental CPU runtime.
+            # Batch prompt tokens and optionally verify trained DSpark blocks.
+            DEVICE = "cpu"  # "cuda" for an available GPU; GPU performance needs measuring
+            PREFILL_CHUNK_SIZE = 32  # 1 restores scalar prefill for comparison
+            USE_MTP = False  # enable after DSpark distillation and acceptance evaluation
+            DRAFT_TRAINED = False  # set True only for your distilled bundle
             import torch
             from nano_dsv41f.vllm_v41_cpu.api import NanoDeepSeekProtocolBackend
 
@@ -124,8 +128,11 @@ def build_notebook() -> nbf.NotebookNode:
             backend = NanoDeepSeekProtocolBackend.from_pretrained(
                 CHECKPOINT_DIR,
                 tokenizer_path=TOKENIZER_PATH,
-                dtype=torch.float32,
+                dtype=torch.float32, device=DEVICE,
             )
+            from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
+            backend.session = InferenceSession(backend.model, mtp=USE_MTP,
+                draft_trained=DRAFT_TRAINED, prefill_chunk_size=PREFILL_CHUNK_SIZE)
             print("Loaded", backend.model_name, "on", backend.model.device)
             '''
         ),
@@ -141,13 +148,15 @@ def build_notebook() -> nbf.NotebookNode:
                 history.clear()
                 backend.reset_cache()
 
-            def chat(message, *, thinking=False, reasoning_effort="high", max_tokens=128):
+            def chat(message, *, thinking=False, reasoning_effort="high", max_tokens=128, temperature=None):
                 if isinstance(reasoning_effort, str):
                     if reasoning_effort not in REASONING_EFFORT_PRESETS:
                         raise ValueError("reasoning_effort must be low, high, max, or an integer in [1, 100]")
                     reasoning_effort = REASONING_EFFORT_PRESETS[reasoning_effort]
                 if type(reasoning_effort) is not int or not 1 <= reasoning_effort <= 100:
                     raise ValueError("reasoning_effort must be low, high, max, or an integer in [1, 100]")
+                if temperature is None:
+                    temperature = 0.0 if getattr(getattr(backend, "session", None), "mtp", False) else 1.0
                 request_messages = history + [{"role": "user", "content": message}]
                 payload = {
                     "model": backend.model_name,
@@ -155,7 +164,7 @@ def build_notebook() -> nbf.NotebookNode:
                     "thinking": {"type": "enabled" if thinking else "disabled"},
                     "reasoning_effort": reasoning_effort,
                     "max_tokens": max_tokens,
-                    "temperature": 1.0,
+                    "temperature": temperature,
                     "top_p": 0.95,
                     "stream": False,
                 }
@@ -199,6 +208,8 @@ def build_notebook() -> nbf.NotebookNode:
             Enable Thinking to choose Low (50), High (75), Max (100), or a custom
             integer effort from 1 to 100. Max tokens caps the entire generated response,
             including reasoning; effort is a prompt setting rather than a token limit.
+            `USE_MTP=True` selects batched greedy verification and makes chat use
+            temperature zero. Prompt prefill is chunked even when MTP is off.
             '''
         ),
         _code(

@@ -126,8 +126,11 @@ step times, and cache arena bytes. Throughput excludes tokenization and protocol
 parsing. Decode includes reasoning, protocol markers and generated EOS, sampling,
 and optional drafting; its first token uses the final prefill logits. GPU clocks
 synchronize if the runtime is manually loaded on CUDA. Cache arena bytes exclude
-weights, working tensors, and the rolling-state prompt checkpoint. Prefill remains
-sequential, and the CPU runtime uses eager operations.
+weights, working tensors, and the rolling-state prompt checkpoint. Prefill processes
+32 tokens per causal target pass by default; configure `prefill_chunk_size` on the
+session or `chunk_size` on `model.prefill_cache`. Setting it to 1 provides the scalar
+baseline. Prompt loading projects only the final position's vocabulary logits
+in each chunk. This remains an eager Torch runtime.
 
 Measure the real exported model with:
 
@@ -194,9 +197,23 @@ Markov correction. Projected context KV is inserted once per target token into a
 fixed SWA ring. Experimental greedy verification accepts matching proposals and
 replaces the first mismatch with the target token, preserving target-model output.
 It reports proposed/verified/accepted counts, acceptance among verified tokens,
-and draft time. The verifier currently runs one target step per token, so this
-path adds overhead; batched verification and sampled speculative acceptance are
-still needed for speculative acceleration.
+and draft time. The verifier now processes a proposal block in **one causal target
+pass**. Correct proposals share target computation across token positions. On
+rejection, a transaction retains the accepted prefix's local rings, compressed KV,
+pending compression token, and draft features without replaying the transformer.
+Only the replacement token needs a new target step. A first-position mismatch is
+known from cached logits and skips the speculative target pass entirely.
+
+Sparse retrieval breaks exact score ties by earliest key. This prevents masked
+future columns from changing earlier queries' selected set, as arbitrary `topk`
+ties could previously do. Tied cases can therefore differ from the old runtime's
+arbitrary selection; scalar, chunked, and full-prefix paths now share the rule.
+
+This batches token positions within **one conversation**. It does not add a
+multi-request scheduler. Greedy verification is supported; distribution-preserving
+sampled speculative decoding is not yet implemented. Tensor kernels can introduce
+normal floating-point differences across chunk sizes/devices; tests check logits
+within tolerance and greedy output equality on fixtures.
 
 The repository's pretrain/midtrain/SFT path freezes DSpark (`train_dspark=False`).
 Existing exports include its parameters but do not establish a trained drafter.
@@ -216,3 +233,28 @@ Quantization/QAT configuration remains checkpoint metadata; this runtime execute
 loaded tensors in the selected Torch dtype rather than reproducing packed FP4/FP8
 cache layouts. CUDA device plumbing exists, but T4 execution and performance have
 not been validated here.
+
+The SFT inference notebook exposes `USE_MTP` and `PREFILL_CHUNK_SIZE`. With MTP on,
+it checks the verified bundle's recorded draft updates and switches chat to greedy
+generation. Ordinary prefill batching is enabled with MTP off too.
+
+For measurements on your trained model:
+
+```bash
+python scripts/benchmark_mtp_inference.py --model-dir /path/to/dspark-bundle \
+    --device cpu --threads 2 --repeats 3 --output /path/to/mtp-results.json
+```
+
+Use `--device cuda` on T4. The command compares scalar/chunked prefill and real
+draft proposals under sequential/batched verification, and fails on greedy output
+drift. It reports end-to-end phase times, accepted counts, target calls, and CUDA
+peak allocated memory. MTP is useful only when acceptance pays for drafting and
+verification. `mtp_verifier="sequential"` retains the old verifier for comparisons.
+
+Stats include `decode_target_calls`, `decode_target_input_tokens`,
+`decode_target_seconds`, `mtp_draft_seconds`, and `mtp_rollback_seconds`.
+`decode_batch_seconds` and `decode_batch_tokens` describe actual block rounds;
+`decode_step_seconds` apportions those rounds across emitted tokens and is marked
+`amortized_within_batch`. These are timings, not token arrival timestamps. Verified
+tokens count only the accepted prefix and first mismatch; target input tokens also
+include the speculative suffix that was computed then discarded.

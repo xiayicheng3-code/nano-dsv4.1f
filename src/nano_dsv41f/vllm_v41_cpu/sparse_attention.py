@@ -171,6 +171,24 @@ def indexer_scores(
     )
 
 
+def causal_topk(scores: torch.Tensor, k: int):
+    """Choose tied scores by earliest key, independent of future masked columns.
+
+    torch.topk alone can change a tied selection when a chunk adds masked keys.
+    Resolve only the boundary ties with a prefix count, then gather the selected
+    keys in index order. No CPU synchronization or full score sort is needed.
+    """
+    boundary = torch.topk(scores, k=k, dim=-1).values[..., -1:]
+    better = scores > boundary
+    tied = scores == boundary
+    slots = k - better.sum(-1, keepdim=True)
+    selected = better | (tied & (tied.long().cumsum(-1) <= slots))
+    key = torch.arange(scores.shape[-1], device=scores.device)
+    order = torch.where(selected, -key, -scores.shape[-1])
+    indices = torch.topk(order, k=k, dim=-1).indices
+    return scores.gather(-1, indices), indices
+
+
 def hierarchical_candidate_mask(
     model: Any,
     scores: torch.Tensor,
@@ -206,7 +224,7 @@ def hierarchical_candidate_mask(
     block_scores.scatter_(-1, newest.unsqueeze(-1), torch.inf)
 
     k = min(ic.candidate_topk_blocks, n_blocks)
-    selected_ids = torch.topk(block_scores, k=k, dim=-1).indices
+    _, selected_ids = causal_topk(block_scores, k)
     selected_blocks = torch.zeros_like(block_scores, dtype=torch.bool)
     selected_blocks.scatter_(-1, selected_ids, True)
     selected_blocks.scatter_(-1, newest.unsqueeze(-1), True)
@@ -240,7 +258,7 @@ def run_indexer(
         scoring_valid, scores, torch.full_like(scores, -torch.inf)
     )
     k = min(model.config.indexer.top_k, scores.shape[-1])
-    values, indices = torch.topk(masked, k=k, dim=-1)
+    values, indices = causal_topk(masked, k)
 
     if layer_id == model.config.indexer.candidate_source_layer:
         candidate = hierarchical_candidate_mask(

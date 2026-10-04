@@ -377,3 +377,11 @@ for interactive chat and raw completions with persistent prefix caching and per-
 prefill/decode statistics. See [export and inference instructions](docs/posttrain_export_inference.md).
 
 Train the exported model's draft head with the [DSpark distillation notebook](notebooks/nano_dsv41f_dspark_distillation.ipynb). It freezes the backbone, reuses SFT data, and measures held-out agreement and rollout acceptance. See [training, resume and export instructions](docs/dspark_distillation.md).
+
+## Batched inference measurements
+
+Prompt prefill now runs in causal token chunks. Trained DSpark heads can use
+batched greedy verification with rollback of rejected cache entries. See the
+[runtime guide](docs/vllm_v41_cpu.md) and
+[synthetic CPU benchmark](docs/experiments/2026-10-04-batched-mtp.md), which separates
+actual random-draft acceptance from a controlled perfect-draft ceiling.

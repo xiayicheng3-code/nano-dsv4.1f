@@ -100,10 +100,9 @@ updates, reporting:
 Teacher-forced overlap is an acceptance proxy at **corpus prefixes**. It is not
 measured speculative acceptance on generated continuations. The separate
 `rollout_greedy_acceptance` metric does measure those continuations, but its short
-sample is only a diagnostic, not a broad evaluation. The verifier remains
-sequential, so this stage establishes a trainable drafter rather than claiming
-speculative acceleration. A useful drafter and batched verification are both
-needed before expecting a speed gain.
+sample is only a diagnostic, not a broad evaluation. Inference now verifies draft blocks in a batched target pass with prefix rollback.
+A useful drafter is still needed before expecting a speed gain; compare real
+acceptance and throughput using `scripts/benchmark_mtp_inference.py`.
 
 Training logs step time, crop size, supervised-token count and gradient norm.
 The runner uses finite-loss/gradient checks and hashes the complete runtime

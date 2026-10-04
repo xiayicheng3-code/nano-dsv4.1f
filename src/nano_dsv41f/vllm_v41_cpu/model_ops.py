@@ -87,7 +87,7 @@ def apply_engram_step(
     segment_ids_history: torch.Tensor,
     layer_id: int,
 ) -> torch.Tensor:
-    """Inject Engram memory for only the newest autoregressive token.
+    """Inject Engram memory for the newest chunk using bounded left context.
 
     A short decode prefix is left-padded to the maximum n-gram width. Padding segment IDs
     are -1, so the synthetic history is rejected by the same packed-boundary comparison
@@ -95,8 +95,9 @@ def apply_engram_step(
     allowing an n-gram to cross a real segment boundary.
     """
     ec = model.config.engram
-    input_ids_history = input_ids_history[:, -ec.max_ngram_size:]
-    segment_ids_history = segment_ids_history[:, -ec.max_ngram_size:]
+    width = streams.shape[1] + ec.max_ngram_size - 1
+    input_ids_history = input_ids_history[:, -width:]
+    segment_ids_history = segment_ids_history[:, -width:]
     pad = max(ec.max_ngram_size - input_ids_history.shape[-1], 0)
     if pad:
         id_pad = torch.full(
@@ -125,7 +126,7 @@ def apply_engram_step(
         n_hash_heads=ec.n_hash_heads,
         pad_token_id=ec.pad_token_id,
         seed=layer_id * 97,
-    )[..., -1:, :]
+    )[..., -streams.shape[1]:, :]
     return _inject_engram(model, streams, hashes, layer_id)
 
 

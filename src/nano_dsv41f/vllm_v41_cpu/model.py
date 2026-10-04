@@ -244,7 +244,7 @@ class NanoDeepseekV41CPU:
         return NanoDecodeCache.empty(device=self.device, capacity=self.max_context if capacity is None else capacity)
 
     @torch.inference_mode()
-    def forward_step(
+    def forward_chunk(
         self,
         token_ids: torch.Tensor,
         cache: NanoDecodeCache | None = None,
@@ -252,14 +252,15 @@ class NanoDeepseekV41CPU:
         segment_ids: torch.Tensor | None = None,
         compute_indexer: bool = True,
         sparse_retrieval: bool = True,
+        return_all_logits: bool = True,
     ) -> tuple[torch.Tensor, NanoDecodeCache, dict[str, Any]]:
-        """Decode one token while updating SWA and V4.1 compressed/indexer caches."""
+        """Process a causal token chunk in one target pass and update the cache."""
         token_ids = token_ids.to(device=self.device, dtype=torch.long)
         if token_ids.ndim == 0:
             token_ids = token_ids.reshape(1, 1)
         elif token_ids.ndim == 1:
-            token_ids = token_ids.unsqueeze(-1)
-        if token_ids.shape != (1, 1):
+            token_ids = token_ids.unsqueeze(0)
+        if token_ids.ndim != 2 or token_ids.shape[0] != 1 or token_ids.shape[1] == 0:
             raise ValueError("incremental CPU reference currently supports batch size 1")
         if cache is None:
             cache = self.new_cache()
@@ -270,16 +271,16 @@ class NanoDeepseekV41CPU:
             current_segment = (
                 torch.zeros_like(token_ids)
                 if cache.length == 0
-                else cache.segment_ids[:, -1:]
+                else cache.segment_ids[:, -1:].expand_as(token_ids)
             )
         else:
             current_segment = segment_ids.to(device=self.device, dtype=torch.long)
             if current_segment.ndim == 0:
                 current_segment = current_segment.reshape(1, 1)
             elif current_segment.ndim == 1:
-                current_segment = current_segment.unsqueeze(-1)
-            if current_segment.shape != (1, 1):
-                raise ValueError("segment_ids for forward_step must have shape [1,1]")
+                current_segment = current_segment.unsqueeze(0)
+            if current_segment.shape != token_ids.shape:
+                raise ValueError("segment_ids must match the token chunk")
 
         if sparse_retrieval:
             compute_indexer = True
@@ -287,14 +288,14 @@ class NanoDeepseekV41CPU:
         if cache.mode is not None and cache.mode != mode:
             raise ValueError("attention mode changed; start a fresh decode cache")
         cache.mode = mode
-        position = cache.append_token(token_ids, current_segment)
+        position = cache.append_tokens(token_ids, current_segment)
 
         streams = self._w("embed")[token_ids]
         streams = streams.unsqueeze(-2).expand(
-            1, 1, self.config.mhc_streams, self.config.d_model
+            1, token_ids.shape[1], self.config.mhc_streams, self.config.d_model
         ).clone()
         incoming_pre = torch.zeros(
-            (1, 1, self.config.mhc_streams),
+            (1, token_ids.shape[1], self.config.mhc_streams),
             device=self.device,
             dtype=torch.float32,
         )
@@ -386,8 +387,8 @@ class NanoDeepseekV41CPU:
         hidden = self._norm(
             pre_mix(streams, incoming_pre), "final_norm"
         )
-        logits = linear(hidden, self._w("lm_head"))
-        cache.next_logits = logits[:, -1].float()
+        logits = linear(hidden if return_all_logits else hidden[:, -1:], self._w("lm_head"))
+        cache.next_logits = logits[:, -1].float().clone()
         return logits, cache, {
             "final_hidden": hidden,
             "context_final": context_final,
@@ -396,6 +397,14 @@ class NanoDeepseekV41CPU:
                 None if state is None else state.source_layer
             ),
         }
+
+    @torch.inference_mode()
+    def forward_step(self, token_ids, cache=None, **kwargs):
+        """Single-token compatibility entry point using the shared chunk operators."""
+        token_ids = torch.as_tensor(token_ids, device=self.device, dtype=torch.long)
+        if token_ids.numel() != 1:
+            raise ValueError("forward_step requires one token; use forward_chunk")
+        return self.forward_chunk(token_ids.reshape(1, 1), cache, **kwargs)
 
     @torch.inference_mode()
     def prefill_cache(
@@ -407,15 +416,19 @@ class NanoDeepseekV41CPU:
         sparse_retrieval: bool = True,
         cache: NanoDecodeCache | None = None,
         return_all_logits: bool = True,
+        chunk_size: int = 32,
     ) -> tuple[torch.Tensor, NanoDecodeCache]:
-        """Build the incremental reference cache token-by-token and return all logits."""
+        """Prefill in bounded causal chunks; chunk_size=1 is the scalar baseline."""
+        if type(chunk_size) is not int or chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer")
         ids = input_ids.to(device=self.device, dtype=torch.long)
         if ids.ndim == 1:
             ids = ids.unsqueeze(0)
         if ids.ndim != 2 or ids.shape[0] != 1 or ids.shape[1] == 0:
             raise ValueError("prefill_cache requires a non-empty [1,tokens] input")
         if segment_ids is None:
-            segments = torch.zeros_like(ids)
+            segments = (torch.zeros_like(ids) if cache is None or cache.length == 0
+                        else cache.segment_ids[:, -1:].expand_as(ids))
         else:
             segments = segment_ids.to(device=self.device, dtype=torch.long)
             if segments.shape != ids.shape:
@@ -425,13 +438,14 @@ class NanoDeepseekV41CPU:
         if cache.length + ids.shape[1] > cache.capacity:
             raise ValueError("prefill exceeds cache capacity")
         rows: list[torch.Tensor] = []
-        for position in range(ids.shape[1]):
-            logits, cache, _ = self.forward_step(
-                ids[:, position : position + 1],
+        for position in range(0, ids.shape[1], chunk_size):
+            logits, cache, _ = self.forward_chunk(
+                ids[:, position : position + chunk_size],
                 cache,
-                segment_ids=segments[:, position : position + 1],
+                segment_ids=segments[:, position : position + chunk_size],
                 compute_indexer=compute_indexer,
                 sparse_retrieval=sparse_retrieval,
+                return_all_logits=return_all_logits,
             )
             if return_all_logits:
                 rows.append(logits)

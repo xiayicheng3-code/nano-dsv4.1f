@@ -171,8 +171,8 @@ def build(output=ROOT/'notebooks/nano_dsv41f_dspark_distillation.ipynb'):
     trained bundle, load its model, then use
     `InferenceSession(model, mtp=True, draft_trained=True)` and `temperature=0`.
     Training a head does not guarantee useful acceptance. Compare held-out metrics
-    before choosing it for serving; the current sequential verifier still adds
-    overhead and needs batched verification for acceleration.
+    before choosing it for serving. Target verification now batches proposal tokens
+    and rolls back rejected suffixes; measure throughput against MTP-off decoding.
 
     This stage leaves backbone chat quality unchanged. Additional assistant SFT
     would be a separate experiment, followed by refreshing the drafter against the

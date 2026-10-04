@@ -209,6 +209,9 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
         '''),
         code(f'''SOURCE_REF = {REF!r}
 MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/input
+DEVICE = 'cpu'  # 'cuda' on a GPU session; benchmark throughput on your hardware
+PREFILL_CHUNK_SIZE = 32
+USE_MTP = False  # requires a bundle from the DSpark distillation notebook
 '''),
         bootstrap(),
         code('''
@@ -228,7 +231,11 @@ MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/in
         config = json.loads((model_root / 'config.json').read_text())
         MAX_CONTEXT = int(config['max_position_embeddings'])
         torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
-        backend = NanoDeepSeekProtocolBackend.from_pretrained(model_root, dtype=torch.float32)
+        backend = NanoDeepSeekProtocolBackend.from_pretrained(model_root, dtype=torch.float32, device=DEVICE)
+        from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
+        draft_trained = report.get("dspark_steps", 0) > 0
+        backend.session = InferenceSession(backend.model, mtp=USE_MTP,
+            draft_trained=draft_trained, prefill_chunk_size=PREFILL_CHUNK_SIZE)
         print('Loaded SFT checkpoint:', report['checkpoint'])
         print('Context:', MAX_CONTEXT, 'RoPE:', config['nano_config']['attention']['rope'])
 
@@ -264,21 +271,25 @@ MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/in
 
         Prefix caches persist in session RAM until reset/restart. When the protocol
         rewrites a previous reply, the runtime reuses the last matching prompt checkpoint
-        or rebuilds safely. Prefill is still sequential; no fused GPU kernels are used.
+        or rebuilds safely. Prompt prefill batches up to `PREFILL_CHUNK_SIZE` tokens
+        per target pass; set it to 1 for the scalar comparison. No fused GPU kernels
+        or independent-request batching are used.
 
-        DSpark/MTP is off by default: the current training step freezes its weights.
-        A diagnostic cell can enable it with:
-        ```python
-        from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
-        backend.session = InferenceSession(backend.model, mtp=True, allow_untrained_draft=True)
-        result = complete("The capital of France is", max_tokens=32, temperature=0.0)
-        print(backend.last_stats)
-        ```
-        This implements block proposals and exact greedy target verification. The verifier
-        currently runs sequentially, so it adds overhead rather than providing the speedup
-        of batched speculative verification. Use it to measure acceptance and validate
-        future draft training. Sampled chat is rejected in this experimental MTP mode.
-        Restore normal chat with `backend.session = InferenceSession(backend.model)`.
+        To accelerate greedy decoding, attach the bundle from the DSpark distillation
+        notebook and set `USE_MTP=True`. The verified export must record completed
+        draft updates. Chat automatically uses temperature zero in this mode.
+        One causal target pass verifies a proposal block. The first mismatch is
+        replaced with the target token, and rejected cache entries are rolled back
+        without recomputing the accepted prefix. Output matches greedy target decoding
+        within normal floating-point limits. Speed depends on acceptance and hardware;
+        an inaccurate drafter can still make decoding slower.
+
+        `backend.last_stats` includes target calls/input tokens, drafting time,
+        verification time, rollback time, and accepted/verified/proposed counts.
+        Batch times and emitted counts are recorded separately; per-token step times
+        are amortized within each batch. Set `USE_MTP=False` to compare normal decoding.
+        For a real-bundle benchmark, run `scripts/benchmark_mtp_inference.py` with
+        `--model-dir`, `--device cpu` or `cuda`, and `--output /path/to/results.json`.
         The optional local API cell below serves the same loaded model.
         '''),
         demo.cells[9]], output_dir)

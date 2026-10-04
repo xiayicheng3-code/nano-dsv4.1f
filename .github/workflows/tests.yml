@@ -61,4 +61,4 @@ jobs:
       - name: Test V4.1 CPU inference and API protocol
         env:
           JAX_PLATFORMS: cpu
-        run: pytest -q tests/test_vllm_v41_cpu.py tests/test_inference_session.py tests/test_dspark_training.py tests/test_v41_api_protocol.py tests/test_posttrain_export.py tests/test_export_bundle_upload.py tests/test_posttrain_inference_notebooks.py
+        run: pytest -q tests/test_vllm_v41_cpu.py tests/test_inference_session.py tests/test_batched_inference.py tests/test_dspark_training.py tests/test_v41_api_protocol.py tests/test_posttrain_export.py tests/test_export_bundle_upload.py tests/test_posttrain_inference_notebooks.py
