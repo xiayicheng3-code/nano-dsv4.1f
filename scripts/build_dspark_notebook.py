@@ -39,7 +39,7 @@ def build(output=ROOT/'notebooks/nano_dsv41f_dspark_distillation.ipynb'):
     This notebook has CPU correctness coverage; T4 throughput is not yet measured.
     ''')
     code('''
-    SOURCE_REF = 'codex/dspark-distillation'  # use main after this PR and its dependency merge
+    SOURCE_REF = 'main'  # durable default for the maintained notebook
     MODEL_DIR = ''  # blank: locate exactly one export_manifest.json under /kaggle/input
     CORPUS_DIR = ''  # blank: locate exactly one posttrain_manifest.json under /kaggle/input
     RESUME = ''  # optional prior run directory, attached under /kaggle/input
