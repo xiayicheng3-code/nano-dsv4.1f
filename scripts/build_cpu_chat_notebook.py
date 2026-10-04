@@ -58,7 +58,7 @@ def build_notebook() -> nbf.NotebookNode:
             import subprocess
             import sys
 
-            REPO_REF = os.environ.get("NANO_DSV41F_REF", "codex/v41-cpu-inference")
+            REPO_REF = os.environ.get("NANO_DSV41F_REF", "main")
             repo = "/kaggle/working/nano-dsv4.1f"
             if not os.path.exists(repo):
                 subprocess.check_call(
