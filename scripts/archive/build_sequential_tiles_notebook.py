@@ -34,7 +34,7 @@ Compiler HBM estimates do not establish VMEM usage or spilling.'''),
 # Edit this dictionary if needed. Explicit assignment prevents stale settings from
 # the previous broad experiment (including its pinned commit) from carrying over.
 SETTINGS = {
-    'NANO_DSV41F_REF': 'codex/attention-replay-mixed-precision',
+    'NANO_DSV41F_REF': 'main',
     'NANO_PROFILE_CORPUS': '/kaggle/input/datasets/xiayicheng3gmailcom/nanodsv4-1f-pretrain-tokenized',
     'NANO_PROFILE_TOKENIZER': '/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb',
     'NANO_ATTN_ROWS': '8',

@@ -26,7 +26,7 @@ Default: compare CP8/DP1 against CP2/DP4 at the **same four-row global batch**, 
 48 width-128 experts with top-4 routing. EP remains 8 and its reshards are included in end-to-end timings.
 Each case runs two warmup + ten measured steps per phase. Compilation can take minutes.
 Real TPU timings and HBM cannot be inferred from CPU validation."""),
-        nbf.v4.new_code_cell("import os\nos.environ.setdefault('NANO_DSV41F_REF', 'codex/pretrain-stress-8k')"),
+        nbf.v4.new_code_cell("import os\nos.environ.setdefault('NANO_DSV41F_REF', 'main')"),
         nbf.v4.new_code_cell((ROOT / "scripts/kaggle_bootstrap.py").read_text()),
         nbf.v4.new_markdown_cell("""## Choose the comparison
 
