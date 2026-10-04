@@ -412,6 +412,7 @@ def compile_pretrain_step(
     mesh: Mesh,
     *,
     include_indexer: bool,
+    assistant_only: bool = False,
     n_segments: int | None = None,
 ):
     """Compile one static base or late-indexer step for the v5e mesh.
@@ -430,7 +431,7 @@ def compile_pretrain_step(
     batch_sharding = batch_named_sharding(config, mesh)
     scalar_sharding = NamedSharding(mesh, P())
 
-    def step_fn(p, opt, ids, seg, step, mask):
+    def step_fn(p, opt, ids, seg, step, mask, targets=None):
         return pretrain_step(
             p,
             opt,
@@ -440,6 +441,7 @@ def compile_pretrain_step(
             segment_ids=seg,
             step=step,
             token_mask=mask,
+            target_mask=targets,
             include_indexer=include_indexer,
             n_segments=n_segments,
         )
@@ -453,7 +455,7 @@ def compile_pretrain_step(
             batch_sharding,
             scalar_sharding,
             batch_sharding,
-        ),
+        ) + ((batch_sharding,) if assistant_only else ()),
         out_shardings=(param_shardings, state_shardings, None),
         donate_argnums=(0, 1),
     )

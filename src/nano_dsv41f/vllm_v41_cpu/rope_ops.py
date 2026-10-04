@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
 
@@ -50,6 +51,7 @@ def rope_kwargs(config: ModelConfig, compress_ratio: int) -> dict[str, float | i
     }
 
 
+@lru_cache(maxsize=64)
 def yarn_inv_freq(
     rotary_dim: int,
     *,
