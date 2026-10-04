@@ -42,13 +42,13 @@ block dimension; it is a pressure/scheduling probe, not a promised optimization.
 Inspect compiler placement and usable spill/DMA evidence with the exported HLO
 and traces. Compiler HBM estimates do not measure VMEM occupancy.
 
-Protocol: [registered hypotheses](https://github.com/xiayicheng3-code/nano-dsv4.1f/blob/codex/pretrain-stress-8k/docs/experiments/2026-09-21-pretrain-profile.md).
+Protocol: [registered hypotheses](https://github.com/xiayicheng3-code/nano-dsv4.1f/blob/main/docs/experiments/2026-09-21-pretrain-profile.md).
 The sink-cotangent dtype correction applies to both schedules; forward sink values
 and kernel math are unchanged. The 2026-09-22 failed run collected no timings and
 is not a performance baseline. This experiment does not launch pretraining.'''),
     code('''import os
 DEFAULTS = {
-    'NANO_DSV41F_REF': 'codex/attention-replay-mixed-precision',
+    'NANO_DSV41F_REF': 'main',
     'NANO_PROFILE_CORPUS': '/kaggle/input/datasets/xiayicheng3gmailcom/nanodsv4-1f-pretrain-tokenized',
     'NANO_PROFILE_TOKENIZER': '/kaggle/input/datasets/xiayicheng3gmailcom/nano-dsv41f-tokenizer-fineweb',
     'NANO_ATTN_ROWS': '4,8',                 # optionally 4,8,24
