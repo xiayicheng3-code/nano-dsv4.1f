@@ -202,7 +202,7 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
         training corpus, or separate tokenizer input is needed.
 
         The runtime comes from GitHub and uses the project's Torch CPU implementation
-        with incremental decoding and DeepSeek V4.1 chat encoding. CPU execution uses
+        with bounded caches, prefix reuse between turns, and DeepSeek V4.1 chat encoding. CPU execution uses
         FP32; the saved weights keep their original precision. Start with short prompts
         and outputs: the stored 32K context limit does not promise fast CPU inference.
         This notebook loads your trained weights; it never initializes a replacement model.
@@ -255,6 +255,30 @@ MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/in
         Both functions check prompt plus requested output against the saved context limit.
         For tool-call inspection, examine the returned reply dictionary; this notebook
         does not execute generated tool calls. Use `reset_chat()` for a new conversation.
+        Every reply reports prefill/decode token counts, elapsed seconds, tokens/second,
+        reused prompt tokens, first-token latency, and reserved cache arena size.
+        Prefill throughput counts only newly processed tokens. Decode counts include
+        reasoning, protocol tokens, and EOS when generated; its time includes sampling
+        and any drafting. The cache arena figure excludes weights, temporary tensors,
+        and the small prompt checkpoint. Detailed step times are in `backend.last_stats`.
+
+        Prefix caches persist in session RAM until reset/restart. When the protocol
+        rewrites a previous reply, the runtime reuses the last matching prompt checkpoint
+        or rebuilds safely. Prefill is still sequential; no fused GPU kernels are used.
+
+        DSpark/MTP is off by default: the current training step freezes its weights.
+        A diagnostic cell can enable it with:
+        ```python
+        from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
+        backend.session = InferenceSession(backend.model, mtp=True, allow_untrained_draft=True)
+        result = complete("The capital of France is", max_tokens=32, temperature=0.0)
+        print(backend.last_stats)
+        ```
+        This implements block proposals and exact greedy target verification. The verifier
+        currently runs sequentially, so it adds overhead rather than providing the speedup
+        of batched speculative verification. Use it to measure acceptance and validate
+        future draft training. Sampled chat is rejected in this experimental MTP mode.
+        Restore normal chat with `backend.session = InferenceSession(backend.model)`.
         The optional local API cell below serves the same loaded model.
         '''),
         demo.cells[9]], output_dir)

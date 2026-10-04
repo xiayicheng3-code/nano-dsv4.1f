@@ -100,9 +100,16 @@ the pinned `deepseek-recipe` bindings only accept named presets. Context checks 
 generation tokenize this exact adjusted prompt.
 
 Tool calls are returned for inspection and are not executed. Optional local HTTP
-serving uses the existing API backend. DSpark weights are preserved for future
-use; this runtime still uses ordinary autoregressive decoding. This custom model
-is not registered as a stock Transformers AutoModel or vLLM engine model.
+serving uses the existing API backend. Requests now reuse compatible prefix caches
+in RAM, with bounded local rings and preallocated compressed/index buffers. Reset
+clears both history and the cache. Replies show separate prefill/decode token counts,
+seconds and tokens/s, prefix hits, first-token latency and reserved cache bytes.
+See [cache behavior and MTP diagnostics](vllm_v41_cpu.md) for metric definitions.
+
+Experimental DSpark block proposals and greedy verification are available, but off
+by default: current training freezes that head, and verification is still sequential.
+This path validates correctness/acceptance; it does not yet accelerate inference.
+The custom model is not registered as a stock Transformers AutoModel or vLLM engine model.
 
 ## Validation
 

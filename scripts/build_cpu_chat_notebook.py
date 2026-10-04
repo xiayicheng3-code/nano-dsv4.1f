@@ -139,6 +139,7 @@ def build_notebook() -> nbf.NotebookNode:
 
             def reset_chat():
                 history.clear()
+                backend.reset_cache()
 
             def chat(message, *, thinking=False, reasoning_effort="high", max_tokens=128):
                 if isinstance(reasoning_effort, str):
@@ -168,6 +169,7 @@ def build_notebook() -> nbf.NotebookNode:
                 if assistant.get("tool_calls"):
                     saved["tool_calls"] = assistant["tool_calls"]
                 history.append(saved)
+                assistant["_inference_stats"] = dict(getattr(backend, "last_stats", {}))
                 return assistant
 
             def print_reply(reply):
@@ -175,6 +177,8 @@ def build_notebook() -> nbf.NotebookNode:
                 if reasoning:
                     print("Reasoning:\n" + reasoning + "\n")
                 print("Assistant:\n" + (reply.get("content") or ""))
+                from nano_dsv41f.vllm_v41_cpu.session import format_inference_stats
+                print(format_inference_stats(reply.get("_inference_stats", {})))
             '''
         ),
         _code(
@@ -259,7 +263,9 @@ def build_notebook() -> nbf.NotebookNode:
                     reasoning = reply.get("reasoning_content")
                     if reasoning:
                         chat_output.append_stdout(f"Reasoning: {reasoning}\n")
-                    chat_output.append_stdout(f"Assistant: {reply.get('content') or ''}\n\n")
+                    chat_output.append_stdout(f"Assistant: {reply.get('content') or ''}\n")
+                    from nano_dsv41f.vllm_v41_cpu.session import format_inference_stats
+                    chat_output.append_stdout(format_inference_stats(reply.get("_inference_stats", {})) + "\n\n")
                 except Exception as exc:
                     message_box.value = message
                     chat_output.append_stdout(f"Error: {exc}\n\n")

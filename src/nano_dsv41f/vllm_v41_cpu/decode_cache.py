@@ -10,7 +10,6 @@ from .rope_ops import (
     linear,
     partial_rope,
     rope_kwargs,
-    segment_local_positions,
 )
 from .sparse_attention import TorchCSA2State, latent_attention, run_indexer
 
@@ -24,27 +23,119 @@ class OwnerCache:
     pending_gate: torch.Tensor | None = None
     pending_segment: torch.Tensor | None = None
     pending_position: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+    capacity: int = 0
+
+    def append(self, name: str, value: torch.Tensor) -> None:
+        old = getattr(self.state, name)
+        start = old.shape[1]
+        if start + value.shape[1] > self.capacity:
+            raise ValueError("compressed cache capacity exceeded")
+        if name not in self.buffers:
+            self.buffers[name] = value.new_empty((1, self.capacity, *value.shape[2:]))
+        buf = self.buffers[name]
+        buf.narrow(1, start, value.shape[1]).copy_(value)
+        setattr(self.state, name, buf.narrow(1, 0, start + value.shape[1]))
 
 
 @dataclass
 class NanoDecodeCache:
-    """Unpaged correctness cache that mirrors the V4.1 serving state machine."""
+    """Single-sequence arena: fixed global capacity and bounded local rings.
 
-    input_ids: torch.Tensor
-    segment_ids: torch.Tensor
+    Views grow logically; their backing storage never grows. This is not a Mamba
+    recurrence: compressed global attention still stores O(capacity) state.
+    """
+
+    input_buffer: torch.Tensor
+    segment_buffer: torch.Tensor
+    position_buffer: torch.Tensor
+    capacity: int
+    length: int = 0
     local_kv: dict[int, torch.Tensor] = field(default_factory=dict)
+    local_segments: dict[int, torch.Tensor] = field(default_factory=dict)
+    local_positions: dict[int, torch.Tensor] = field(default_factory=dict)
+    local_metadata_length: int = -1
     owners: dict[int, OwnerCache] = field(default_factory=dict)
+    next_logits: torch.Tensor | None = None
+    mode: tuple[bool, bool] | None = None
+    draft_kv: torch.Tensor | None = None
+    draft_positions: torch.Tensor | None = None
+    collect_draft: bool = False
 
     @classmethod
-    def empty(cls, *, device: torch.device) -> "NanoDecodeCache":
-        return cls(
-            input_ids=torch.empty((1, 0), dtype=torch.long, device=device),
-            segment_ids=torch.empty((1, 0), dtype=torch.long, device=device),
-        )
+    def empty(cls, *, device: torch.device, capacity: int = 32768) -> "NanoDecodeCache":
+        if capacity < 1:
+            raise ValueError("cache capacity must be positive")
+        ids = torch.empty((1, capacity), dtype=torch.long, device=device)
+        return cls(ids, torch.empty_like(ids), torch.empty_like(ids), capacity)
 
     @property
-    def length(self) -> int:
-        return int(self.input_ids.shape[1])
+    def input_ids(self):
+        return self.input_buffer.narrow(1, 0, self.length)
+
+    @property
+    def segment_ids(self):
+        return self.segment_buffer.narrow(1, 0, self.length)
+
+    def append_token(self, token, segment):
+        if self.length >= self.capacity:
+            raise ValueError("cache capacity exceeded; reset or shorten the conversation")
+        i = self.length
+        position = torch.zeros_like(segment) if not i else torch.where(
+            segment == self.segment_buffer[:, i-1:i],
+            self.position_buffer[:, i-1:i] + 1, 0)
+        self.input_buffer[:, i:i+1].copy_(token)
+        self.segment_buffer[:, i:i+1].copy_(segment)
+        self.position_buffer[:, i:i+1].copy_(position)
+        self.length += 1
+        return position
+
+    def append_local(self, layer, kv, segment, position, window):
+        if layer not in self.local_kv:
+            self.local_kv[layer] = kv.new_empty((1, window, kv.shape[-1]))
+            # Metadata is identical for every local layer; share one allocation.
+            self.local_segments[layer] = next(iter(self.local_segments.values())) if self.local_segments else segment.new_empty((1, window))
+            self.local_positions[layer] = next(iter(self.local_positions.values())) if self.local_positions else position.new_empty((1, window))
+        slot = (self.length - 1) % window
+        self.local_kv[layer].narrow(1, slot, 1).copy_(kv)
+        if self.local_metadata_length != self.length:
+            self.local_segments[layer].narrow(1, slot, 1).copy_(segment)
+            self.local_positions[layer].narrow(1, slot, 1).copy_(position)
+            self.local_metadata_length = self.length
+        n = min(self.length, window)
+        return (self.local_kv[layer].narrow(1, 0, n), self.local_segments[layer].narrow(1, 0, n),
+                self.local_positions[layer].narrow(1, 0, n))
+
+    def snapshot(self):
+        # Global KV is append-only. Save only lengths and the small rolling state.
+        owners = {}
+        for k, owner in self.owners.items():
+            pending = {name: None if getattr(owner, name) is None else getattr(owner, name).clone()
+                       for name in ("pending_latent", "pending_gate", "pending_segment", "pending_position")}
+            owners[k] = (owner.state.kv.shape[1], pending)
+        return dict(length=self.length, owners=owners,
+                    rings={name: {k: v.clone() for k, v in getattr(self, name).items()}
+                           for name in ("local_kv", "local_segments", "local_positions")},
+                    next_logits=self.next_logits,
+                    draft_kv=None if self.draft_kv is None else self.draft_kv.clone(),
+                    draft_positions=None if self.draft_positions is None else self.draft_positions.clone())
+
+    def restore(self, saved):
+        self.length = saved["length"]
+        self.local_metadata_length = self.length
+        self.next_logits = saved["next_logits"]
+        for name, rings in saved["rings"].items():
+            for k, v in rings.items():
+                getattr(self, name)[k].copy_(v)
+        for k, (length, pending) in saved["owners"].items():
+            owner = self.owners[k]
+            for name, buf in owner.buffers.items():
+                setattr(owner.state, name, buf[:, :length])
+            for name, value in pending.items():
+                setattr(owner, name, value)
+        for name in ("draft_kv", "draft_positions"):
+            if saved[name] is not None:
+                getattr(self, name).copy_(saved[name])
 
 
 def _empty_owner_state(
@@ -80,10 +171,6 @@ def _empty_owner_state(
     )
 
 
-def _append_tensor(old: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
-    return torch.cat((old, new), dim=1)
-
-
 def _append_owner_group(
     model: Any,
     owner: OwnerCache,
@@ -104,12 +191,10 @@ def _append_owner_group(
         rotary_dim=model.config.attention.rope.rope_head_dim,
         **kwargs,
     )
-    owner.state.latent = _append_tensor(owner.state.latent, latent)
-    owner.state.kv = _append_tensor(owner.state.kv, kv)
-    owner.state.segment_ids = _append_tensor(owner.state.segment_ids, segment)
-    owner.state.group_start_positions = _append_tensor(
-        owner.state.group_start_positions, position
-    )
+    owner.append("latent", latent)
+    owner.append("kv", kv)
+    owner.append("segment_ids", segment)
+    owner.append("group_start_positions", position)
 
     if compute_indexer and owner.state.index_k is not None:
         index_k = linear(latent, model._w(f"{prefix}.indexer.wk.weight"))
@@ -120,7 +205,7 @@ def _append_owner_group(
             rotary_dim=model.config.attention.rope.rope_head_dim,
             **kwargs,
         )
-        owner.state.index_k = _append_tensor(owner.state.index_k, index_k)
+        owner.append("index_k", index_k)
 
 
 def update_owner_cache(
@@ -144,7 +229,8 @@ def update_owner_cache(
                 layer_id=layer_id,
                 compression_ratio=compression_ratio,
                 compute_indexer=compute_indexer,
-            )
+            ),
+            capacity=(cache.capacity + compression_ratio - 1) // compression_ratio,
         )
         cache.owners[layer_id] = owner
     elif compute_indexer and owner.state.index_k is None:
@@ -275,13 +361,8 @@ def attention_step(
     local_kv = partial_rope(
         local_kv, position, rotary_dim=ac.rope.rope_head_dim, **kwargs
     )
-    previous = cache.local_kv.get(layer_id)
-    cache.local_kv[layer_id] = (
-        local_kv if previous is None else _append_tensor(previous, local_kv)
-    )
-    history_kv = cache.local_kv[layer_id]
-    history_segment = cache.segment_ids
-    history_position = segment_local_positions(history_segment)
+    history_kv, history_segment, history_position = cache.append_local(
+        layer_id, local_kv, segment, position, ac.local_window)
     local_valid = (
         (history_segment.unsqueeze(1) == segment.unsqueeze(-1))
         & (history_position.unsqueeze(1) <= position.unsqueeze(-1))
@@ -340,7 +421,14 @@ def attention_step(
             if sparse_retrieval and retrieval_mask is not None
             else global_valid
         )
-        global_out, global_lse = latent_attention(q, state.kv, attn_valid)
+        # Only the selected global latents enter the expensive main-head attention.
+        if sparse_retrieval and retrieval_mask is not None and state.latest_topk_indices is not None:
+            indices = state.latest_topk_indices[:, 0]
+            selected_kv = state.kv.gather(1, indices.unsqueeze(-1).expand(-1, -1, state.kv.shape[-1]))
+            selected_valid = attn_valid.gather(-1, indices.unsqueeze(1))
+            global_out, global_lse = latent_attention(q, selected_kv, selected_valid)
+        else:
+            global_out, global_lse = latent_attention(q, state.kv, attn_valid)
 
     if global_out is None:
         merged, branch_lse = local_out, local_lse
@@ -379,7 +467,7 @@ def attention_step(
         heads_per_group * ac.head_dim,
     )
     low_rank = torch.einsum(
-        "...gd,gdr->...gr", grouped, model._w(f"{prefix}.wo_a")
+        "...gd,gdr->...gr", grouped.to(model.dtype), model._w(f"{prefix}.wo_a")
     )
     out = linear(
         low_rank.reshape(

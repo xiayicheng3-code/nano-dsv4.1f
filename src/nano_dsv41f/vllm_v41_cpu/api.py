@@ -207,6 +207,16 @@ class NanoDeepSeekProtocolBackend:
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.default_max_tokens = default_max_tokens
+        from .session import InferenceSession
+        self.session = InferenceSession(model) if isinstance(model, NanoDeepseekV41CPU) else None
+
+    @property
+    def last_stats(self):
+        return {} if self.session is None else self.session.last_stats
+
+    def reset_cache(self):
+        if self.session is not None:
+            self.session.reset()
 
     @classmethod
     def from_pretrained(
@@ -216,6 +226,7 @@ class NanoDeepSeekProtocolBackend:
         tokenizer_path: str | Path | None = None,
         model_name: str = "nano-dsv4.1f",
         dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
     ) -> "NanoDeepSeekProtocolBackend":
         root = Path(checkpoint_dir)
         tokenizer_path = Path(tokenizer_path) if tokenizer_path else root / "tokenizer.json"
@@ -225,7 +236,7 @@ class NanoDeepSeekProtocolBackend:
                 "portable checkpoint or pass tokenizer_path explicitly"
             )
         return cls(
-            NanoDeepseekV41CPU.from_pretrained(root, dtype=dtype),
+            NanoDeepseekV41CPU.from_pretrained(root, dtype=dtype, device=device),
             NanoTokenizer(tokenizer_path),
             model_name=model_name,
         )
@@ -243,9 +254,10 @@ class NanoDeepSeekProtocolBackend:
         input_ids = torch.tensor(
             [prompt_ids], dtype=torch.long, device=self.model.device
         )
-        output = self.model.generate(
+        generator = self.session if self.session is not None else self.model
+        output = generator.generate(
             input_ids,
-            max_new_tokens=max_tokens or self.default_max_tokens,
+            max_new_tokens=self.default_max_tokens if max_tokens is None else max_tokens,
             eos_token_id=EOS_TOKEN_ID,
             temperature=1.0 if temperature is None else float(temperature),
             top_p=0.95 if top_p is None else float(top_p),

@@ -373,4 +373,5 @@ After SFT completes, run the [CPU safetensors export notebook](notebooks/nano_ds
 with the saved TPU output attached. It preserves the effective SFT configuration and
 BF16/FP32 parameters, bundles the verified tokenizer, and omits optimizer state.
 Attach the resulting bundle to the [SFT CPU inference notebook](notebooks/nano_dsv41f_sft_inference_cpu.ipynb)
-for interactive chat and raw completions. See [export and inference instructions](docs/posttrain_export_inference.md).
+for interactive chat and raw completions with persistent prefix caching and per-turn
+prefill/decode statistics. See [export and inference instructions](docs/posttrain_export_inference.md).

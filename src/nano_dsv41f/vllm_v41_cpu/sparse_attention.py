@@ -381,7 +381,7 @@ def attention_forward(
         heads_per_group * ac.head_dim,
     )
     low_rank = torch.einsum(
-        "...gd,gdr->...gr", grouped, model._w(f"{prefix}.wo_a")
+        "...gd,gdr->...gr", grouped.to(model.dtype), model._w(f"{prefix}.wo_a")
     )
     out = linear(
         low_rank.reshape(

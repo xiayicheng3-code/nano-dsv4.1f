@@ -62,7 +62,7 @@ logits, aux = model.forward(
 
 ## Incremental cache and generation
 
-The CPU reference now has a real autoregressive cache rather than recomputing the prefix. It keeps independent persistent compressed-KV/indexer states for the context source layer (L1) and generation source layer (L3), per-layer local/SWA KV histories, and a causal pending token for ratio-2 compression.
+The CPU reference now has a real autoregressive cache rather than recomputing the prefix. It keeps independent persistent compressed-KV/indexer states for the context source layer (L1) and generation source layer (L3), per-layer fixed local/SWA KV rings, and a causal pending token for ratio-2 compression.
 
 ```python
 prefill_logits, cache = model.prefill_cache(
@@ -87,7 +87,58 @@ output_ids = model.generate(
 )
 ```
 
-The cache is intentionally an ordinary Torch correctness structure rather than a page manager. Tests compare cached dense and sparse prefill against full-prefix execution and cached greedy generation against full-prefix recomputation.
+The cache uses stable backing allocations up to a configured capacity. Compressed
+KV, index K, token IDs and positions grow only as logical views; each local layer
+stores at most `local_window` latents. Engram hashes only its n-gram tail, RoPE
+inverse frequencies are reused, and sparse main attention gathers Top-K latents
+before attention (the indexer still scans its keys). Prefill can return only the
+last logits, avoiding a prompt-length-by-vocabulary result during generation.
+Tests compare cached dense and sparse prefill against full-prefix execution and
+cached greedy generation against full-prefix recomputation.
+
+This takes the fixed-allocation approach requested for serving state, but is not
+a Mamba recurrence or vLLM integration. Global attention still needs O(capacity)
+storage. Exceeding the capacity raises an error; history is never silently evicted.
+
+For prefix reuse across calls, use `InferenceSession` (the API backend and both
+chat notebooks use it automatically):
+
+```python
+from nano_dsv41f.vllm_v41_cpu.session import InferenceSession, format_inference_stats
+session = InferenceSession(model, capacity=32768)  # must fit exported context
+output_ids = session.generate(input_ids, max_new_tokens=32)
+print(format_inference_stats(session.last_stats))
+# Submit the complete next prompt to this same session.
+# Exact cached prefixes are skipped; changed histories are checked before reuse.
+session.reset()
+```
+
+Caching persists in session RAM, not across kernel restarts. A checkpoint of the
+last prompt preserves small rolling buffers plus logical global lengths, allowing
+reuse if protocol formatting rewrites the previous assistant reply. Unrelated
+prompts, changed attention mode, failures, or reset invalidate incompatible state.
+A lock serializes generation on each session. Use separate sessions for independent
+users. The last emitted token is ingested on the next request if needed.
+
+Each turn reports new/reused/total prompt tokens, prefill seconds and tokens/s,
+decode tokens/seconds/tokens/s, first-token and total latency, individual decode
+step times, and cache arena bytes. Throughput excludes tokenization and protocol
+parsing. Decode includes reasoning, protocol markers and generated EOS, sampling,
+and optional drafting; its first token uses the final prefill logits. GPU clocks
+synchronize if the runtime is manually loaded on CUDA. Cache arena bytes exclude
+weights, working tensors, and the rolling-state prompt checkpoint. Prefill remains
+sequential, and the CPU runtime uses eager operations.
+
+Measure the real exported model with:
+
+```bash
+python scripts/benchmark_cpu_inference.py --model-dir /path/to/bundle \
+  --threads 2 --max-new-tokens 32 --repeats 3 --output /tmp/inference-stats.json
+```
+
+This measures cold KV and raw-token continuation separately after operator warmup.
+The synthetic development measurement is recorded in
+[the inference experiment](experiments/2026-10-04-inference-cache.md).
 
 Packed ratio-2 decode requires segment boundaries to fall on completed compression groups, matching the packed training invariant; the runtime raises instead of compressing across a segment boundary.
 
@@ -123,7 +174,7 @@ The correctness-first HTTP adapter currently returns complete responses. Token-b
 
 `notebooks/nano_dsv41f_cpu_chat.ipynb` is the visitor-facing demo, separate from the training notebook. Before publishing it on Kaggle, attach an input containing the exported checkpoint and frozen tokenizer. A visitor can then use Kaggle's normal **Copy & Edit** flow, start a CPU session, choose **Run All**, and chat in an in-notebook `ipywidgets` message box with **Send** and **Reset** controls.
 
-The widget keeps the same multi-turn `chat()` history used by direct Python calls and exposes thinking mode, DeepSeek's named reasoning-effort levels (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`), and max output tokens. No public tunnel or separate web service is needed for the visitor chat surface. The notebook also includes an optional local FastAPI launch cell for endpoint testing inside the Kaggle runtime.
+The widget keeps the same multi-turn `chat()` history used by direct Python calls and exposes thinking mode, DeepSeek V4.1 effort presets (`low`=50, `high`=75, `max`=100) and custom integers 1–100, and max output tokens. No public tunnel or separate web service is needed for the visitor chat surface. The notebook also includes an optional local FastAPI launch cell for endpoint testing inside the Kaggle runtime.
 
 Regenerate it with:
 
@@ -137,4 +188,31 @@ For a fully offline public demo, publish a Kaggle input containing both the chec
 
 The CPU runtime is now cache-correct and protocol-aware, but it is not yet registered as a vLLM engine model. The next vLLM-specific step is to map the validated local/compressed/indexer cache state onto vLLM's scheduler and paged cache allocation. The DeepSeek request/response protocol layer does not need to wait for that work.
 
-DSpark speculative decoding remains deferred until the ordinary vLLM cached path is integrated. Quantization/QAT configuration remains checkpoint metadata, while this CPU reference executes the loaded tensors in the selected Torch dtype rather than reproducing production packed FP4/FP8 cache layouts.
+DSpark now has a Torch block-proposal path matching the JAX reference: selected
+block-input features, mHC, bidirectional draft-block attention, and sequential
+Markov correction. Projected context KV is inserted once per target token into a
+fixed SWA ring. Experimental greedy verification accepts matching proposals and
+replaces the first mismatch with the target token, preserving target-model output.
+It reports proposed/verified/accepted counts, acceptance among verified tokens,
+and draft time. The verifier currently runs one target step per token, so this
+path adds overhead; batched verification and sampled speculative acceptance are
+still needed for speculative acceleration.
+
+The repository's pretrain/midtrain/SFT path freezes DSpark (`train_dspark=False`).
+Existing exports include its parameters but do not establish a trained drafter.
+MTP is disabled by default and rejects unverified draft weights unless explicitly
+requested for a diagnostic run:
+
+```python
+session = InferenceSession(model, mtp=True, allow_untrained_draft=True)
+output_ids = session.generate(input_ids, max_new_tokens=32, temperature=0)
+print(format_inference_stats(session.last_stats))
+```
+
+After actually training a draft head, use `draft_trained=True` instead. This is a
+caller assertion, not an inferred property of checkpoint tensor names. Nonzero
+temperature is currently rejected in MTP mode. Default sampling is unchanged.
+Quantization/QAT configuration remains checkpoint metadata; this runtime executes
+loaded tensors in the selected Torch dtype rather than reproducing packed FP4/FP8
+cache layouts. CUDA device plumbing exists, but T4 execution and performance have
+not been validated here.
