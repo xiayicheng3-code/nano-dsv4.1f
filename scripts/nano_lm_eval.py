@@ -452,11 +452,14 @@ def evaluate_nano(bundle: Path, *, tasks: list[str], limit: Any, device: str,
 
 
 def evaluate_hf(pretrained: str, *, revision: str | None, tasks: list[str], limit: Any,
-                device: str, batch_size: int, dtype: str) -> dict[str, Any]:
+                device: str, batch_size: int, dtype: str, max_length: int) -> dict[str, Any]:
     from lm_eval.models.huggingface import HFLM
 
     lm = HFLM(pretrained=pretrained, revision=revision or "main", device=device,
               batch_size=batch_size, dtype=dtype)
+    # Cap rolling-perplexity windows at the nano window (models with shorter limits keep theirs).
+    if lm.max_length > max_length:
+        lm._max_length = max_length
     model = lm.model
     total = sum(p.numel() for p in model.parameters())
     embed = sum(p.numel() for p in model.get_input_embeddings().parameters())
@@ -485,7 +488,7 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--token-budget", type=int, default=16384)
     parser.add_argument("--max-batch", type=int, default=128)
-    parser.add_argument("--hf-batch-size", type=int, default=32)
+    parser.add_argument("--hf-batch-size", type=int, default=8)
     parser.add_argument("--hf-dtype", default="float32")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -500,7 +503,8 @@ def main() -> None:
         default_name = args.bundle.name
     else:
         summary = evaluate_hf(args.hf, revision=args.revision, tasks=tasks, limit=limit,
-                              device=args.device, batch_size=args.hf_batch_size, dtype=args.hf_dtype)
+                              device=args.device, batch_size=args.hf_batch_size, dtype=args.hf_dtype,
+                              max_length=args.max_length)
         default_name = args.hf + (f"@{args.revision}" if args.revision else "")
     summary.update(name=args.name or default_name, limit=limit,
                    total_seconds=round(time.time() - started, 1),

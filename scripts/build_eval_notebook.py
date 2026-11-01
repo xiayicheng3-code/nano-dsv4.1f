@@ -35,7 +35,7 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
             [nano-dsv4.1f](https://github.com/xiayicheng3-code/nano-dsv4.1f) is a from-scratch
             JAX reimplementation of DeepSeek-V4.1-Flash ideas (CSA2 sparse attention, mHC,
             routed MoE, Engram), pretrained on **2.4B FineWeb-Edu tokens** on a free Kaggle TPU v5e-8,
-            then mid-trained (0.6B tokens) and SFT'd.
+            then mid-trained (+0.36B tokens of code/math/reasoning traces) and SFT'd (+72M tokens).
 
             This notebook scores its checkpoints with **EleutherAI lm-evaluation-harness**, using
             the same task definitions, prompts and metrics as for the Hugging Face baselines:
@@ -57,7 +57,7 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
             **Baselines.** GPT-2 124M, Pythia-160M at the **token-matched** checkpoints `step1000`
             (≈2.1B tokens) and `step2000` (≈4.2B tokens) plus its final 300B-token weights,
             and SmolLM-135M / SmolLM2-135M (600B / 2T tokens). nano-dsv4.1f is evaluated at three
-            stages: base (2.4B tokens), mid-trained (3.0B tokens) and SFT, all as raw
+            stages: base (2.4B tokens), mid-trained (2.76B) and SFT, all as raw
             language models without a chat template.
 
             **How nano is run.** The weights load into the project's Torch port of the model
@@ -155,10 +155,10 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
                 nano_models.append(("nano-dsv4.1f base", export(base[0], "nano-base"), "2.4B (FineWeb-Edu)"))
             mid = [p.parent for p in INPUT.rglob("midtrain/checkpoints/latest.json")]
             if mid:
-                nano_models.append(("nano-dsv4.1f mid-trained", export(mid[0], "nano-midtrain"), "3.0B (+code/math/traces)"))
+                nano_models.append(("nano-dsv4.1f mid-trained", export(mid[0], "nano-midtrain"), "2.76B (+0.36B mid-train)"))
             sft = [p.parent for p in INPUT.rglob("export_manifest.json")]
             if sft:
-                nano_models.append(("nano-dsv4.1f SFT", sft[0], "3.0B + SFT"))
+                nano_models.append(("nano-dsv4.1f SFT", sft[0], "2.76B + 72M SFT"))
             for row in nano_models:
                 print(row)
             assert nano_models, "attach the nano-dsv4.1f checkpoints as inputs"
