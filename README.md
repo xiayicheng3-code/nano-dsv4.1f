@@ -266,6 +266,24 @@ The target is a single-host **2×4 v5e-8** mesh.
 
 This is now a real accelerator-specific execution path, but **it is still under v5e validation**. The 8-device CPU/SPMD tests exercise native MoE and Splash forward/backward structure; they are correctness regressions, not TPU performance evidence.
 
+## Benchmarks
+
+Zero-shot lm-evaluation-harness results on full test sets, run in
+[this public Kaggle notebook](https://www.kaggle.com/code/xiayicheng3gmailcom/nano-dsv4-1f-standard-evals)
+on T4 GPUs ([details and caveats](docs/experiments/2026-11-01-standard-evals.md)):
+
+| Model | Train tokens | ARC-E | ARC-C | SciQ | PIQA | HellaSwag | LAMBADA | Avg (8 tasks) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| **nano-dsv4.1f base** (71M non-emb., ~11M active) | 2.4B | 37.9 | 22.5 | 56.0 | 56.6 | 27.0 | 9.4 | **35.9** |
+| Pythia-160M @ step1000 | 2.1B | 28.5 | 21.3 | 42.1 | 55.0 | 26.5 | 6.5 | 32.0 |
+| Pythia-160M @ step2000 | 4.2B | 32.6 | 21.7 | 52.5 | 57.2 | 27.4 | 14.7 | 34.8 |
+| GPT-2 124M | WebText | 39.5 | 22.7 | 64.4 | 62.5 | 31.1 | 32.6 | 41.5 |
+
+At a matched token budget, the base model beats Pythia-160M on average, with the largest
+gains on knowledge QA (ARC-Easy, SciQ). It is weaker on narrative cloze tasks (LAMBADA,
+WikiText), which is expected after FineWeb-Edu pretraining. Regenerate the notebook with
+`python scripts/build_eval_notebook.py`.
+
 ## Try it on Kaggle
 
 For full **8192-token pretraining stress tests**, use
