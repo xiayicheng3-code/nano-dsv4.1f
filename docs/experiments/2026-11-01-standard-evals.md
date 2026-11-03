@@ -69,7 +69,7 @@ WinoGrande 1.4, SciQ 1.5, OBQA 2.0.
 ## Caveats
 
 - These are single runs on one seed, with no prompt tuning. Differences under about two standard errors are noise.
-- Mid-training stopped after 0.36B of its planned 0.6B tokens (checkpoint `step-00085085`).
+- Mid-training used its configured 0.36B-token budget (`midtrain_tokens` in `launch.json`; checkpoint `step-00085085`).
   The SFT checkpoint continues from that point.
 - nano runs as a raw LM with a BOS prefix and no chat template. Sparse retrieval is not exercised:
   with a 512-entry Top-K and ≤2048-token windows, sparse and dense attention coincide.
