@@ -8,9 +8,8 @@ from textwrap import dedent
 
 import nbformat as nbf
 
-# Exported SFT bundles and the Torch runtime they load with live on this commit.
-RUNTIME_COMMIT = "05c9613f1e86f8596120c0525b6394425e06c9ed"
-EVAL_REF = "claude/trusting-pascal-9ln3ic"
+# Git ref providing the Torch runtime and scripts/nano_lm_eval.py. Set a commit SHA to reproduce a run.
+SOURCE_REF = "main"
 
 
 def _md(source: str) -> nbf.NotebookNode:
@@ -73,8 +72,7 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
         _code(
             f'''
             SOURCE_REPO = "https://github.com/xiayicheng3-code/nano-dsv4.1f.git"
-            RUNTIME_COMMIT = "{RUNTIME_COMMIT}"  # runtime that loads the exported bundles
-            EVAL_REF = "{EVAL_REF}"  # branch providing scripts/nano_lm_eval.py
+            SOURCE_REF = "{SOURCE_REF}"  # branch, tag or commit SHA; the run prints the resolved commit
             TASKS = ["lambada_openai", "hellaswag", "piqa", "arc_easy", "arc_challenge",
                      "winogrande", "sciq", "openbookqa", "wikitext"]
             LIMIT = __LIMIT__  # e.g. 50 for a quick smoke run; None = full benchmarks
@@ -99,14 +97,10 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
             REPO = Path("/kaggle/temp/nano-dsv4.1f")
             if not REPO.exists():
                 subprocess.run(["git", "clone", "-q", SOURCE_REPO, str(REPO)], check=True)
-            subprocess.run(["git", "-C", str(REPO), "fetch", "-q", "origin", RUNTIME_COMMIT, EVAL_REF], check=True)
-            subprocess.run(["git", "-C", str(REPO), "checkout", "-q", "--detach", RUNTIME_COMMIT], check=True)
-            eval_sha = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", f"origin/{EVAL_REF}"], text=True).strip()
-            script = subprocess.check_output(["git", "-C", str(REPO), "show", f"{eval_sha}:scripts/nano_lm_eval.py"], text=True)
+            subprocess.run(["git", "-C", str(REPO), "fetch", "-q", "origin", SOURCE_REF], check=True)
+            subprocess.run(["git", "-C", str(REPO), "checkout", "-q", "--detach", "FETCH_HEAD"], check=True)
             EVAL_SCRIPT = REPO / "scripts" / "nano_lm_eval.py"
-            EVAL_SCRIPT.write_text(script)
-            print("runtime commit:", RUNTIME_COMMIT)
-            print("eval script commit:", eval_sha)
+            print("source commit:", subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip())
 
             # JAX is only used on CPU (config classes + reading the JAX base checkpoint).
             subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q",
