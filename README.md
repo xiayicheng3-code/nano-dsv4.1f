@@ -364,3 +364,24 @@ See `docs/implementation_scope.md` for the detailed fidelity matrix.
 Primary references are the DeepSeek-V4.1-Flash technical report/released configuration and inference implementation, vLLM's V4.1 implementation for deployment details, JAX's TPU/Pallas/SplashAttention implementation, and DeepSeek's released DeepSpec DSpark code.
 
 This project is unaffiliated with DeepSeek.
+
+## 8K midtrain and 32K SFT
+
+The [CPU preparation notebook](notebooks/nano_dsv41f_prepare_midtrain8k_sft32k_cpu.ipynb) builds separate stage corpora and saves canonical traces. The [TPU training notebook](notebooks/nano_dsv41f_midtrain8k_sft32k_tpu.ipynb) continues a completed pretrain checkpoint through both stages. See [budgets, selection and resume behavior](docs/posttrain_8k_32k.md).
+
+After SFT completes, run the [CPU safetensors export notebook](notebooks/nano_dsv41f_export_sft_safetensors_cpu.ipynb)
+with the saved TPU output attached. It preserves the effective SFT configuration and
+BF16/FP32 parameters, bundles the verified tokenizer, and omits optimizer state.
+Attach the resulting bundle to the [SFT CPU inference notebook](notebooks/nano_dsv41f_sft_inference_cpu.ipynb)
+for interactive chat and raw completions with persistent prefix caching and per-turn
+prefill/decode statistics. See [export and inference instructions](docs/posttrain_export_inference.md).
+
+Train the exported model's draft head with the [DSpark distillation notebook](notebooks/nano_dsv41f_dspark_distillation.ipynb). It freezes the backbone, reuses SFT data, and measures held-out agreement and rollout acceptance. See [training, resume and export instructions](docs/dspark_distillation.md).
+
+## Batched inference measurements
+
+Prompt prefill now runs in causal token chunks. Trained DSpark heads can use
+batched greedy verification with rollback of rejected cache entries. See the
+[runtime guide](docs/vllm_v41_cpu.md) and
+[synthetic CPU benchmark](docs/experiments/2026-10-04-batched-mtp.md), which separates
+actual random-draft acceptance from a controlled perfect-draft ceiling.

@@ -194,7 +194,7 @@ def parse_tagged_json(text: str, tag: str) -> dict[str, Any]:
 
 def truncate_text(
     value: Any,
-    limit: int,
+    limit: int | None,
     *,
     marker: str = "\n...[observation truncated]",
 ) -> str:
@@ -204,6 +204,6 @@ def truncate_text(
         else json.dumps(value, ensure_ascii=False, sort_keys=True)
     )
     text = text.replace("\x00", "")
-    if limit > 0 and len(text) > limit:
+    if limit is not None and limit > 0 and len(text) > limit:
         return text[:limit] + marker
     return text

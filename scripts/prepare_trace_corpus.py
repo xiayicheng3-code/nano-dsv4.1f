@@ -48,7 +48,8 @@ class TraceSource:
     adapter: str
     license: str
     config: str | None = None
-    max_observation_chars: int = 4000
+    max_observation_chars: int | None = 4000
+    preserve_history: bool = False
     provenance: str = ""
 
 
@@ -123,7 +124,7 @@ AGENT_SOURCES = (
     ),
     TraceSource(
         "openresearcher", "agent", "OpenResearcher/OpenResearcher-Dataset", "train", 0.15,
-        "openresearcher", "mit", max_observation_chars=1800,
+        "openresearcher", "mit", config="seed_42", max_observation_chars=1800,
         provenance=(
             "Long-horizon GPT-OSS-120B deep-research trajectories with native browser tools; "
             "convert a deterministic next-action window instead of forcing 100+ turns into 8K."
@@ -426,10 +427,26 @@ def adapt_swe_agent(
             continue
         return None
 
-    if pending_call is not None or len(messages) < 3:
+    terminal_call = None
+    end_policy = 'observed_history'
+    if pending_call is not None:
+        # SWE's explicit submit ends the episode: the dataset has no subsequent
+        # environment message. Preserve the action rather than inventing a result.
+        final_action = _split_swe_ai_turn(str(raw[-1].get('text') or ''))[1]
+        if final_action == 'submit' and row.get('exit_status') == 'submitted':
+            terminal_call = pending_call
+            end_policy = 'terminal_submit'
+        elif row.get('exit_status') == 'submitted (exit_context)':
+            # The patch was evaluated successfully, but the source log stops
+            # before observing the final command. Keep only the observed prefix.
+            messages.pop()
+            end_policy = 'observed_prefix_after_context_exit'
+        else:
+            return None
+    if len(messages) < 3 or not any(m['role'] == 'assistant' for m in messages):
         return None
     try:
-        return normalize_agent_trace(
+        case = normalize_agent_trace(
             {
                 "messages": messages,
                 "tools": _swe_tool(),
@@ -442,11 +459,24 @@ def adapt_swe_agent(
                     "model_name": row.get("model_name"),
                     "target": True,
                     "exit_status": row.get("exit_status"),
+                    "swe_end_policy": end_policy,
+                    "dropped_unobserved_final_action": end_policy == 'observed_prefix_after_context_exit',
                 },
             },
             default_reasoning_effort=75,
             policy=CleanPolicy(max_tool_result_chars=source.max_observation_chars),
         )
+        if terminal_call:
+            # Generic normalization calls every unanswered tool call incomplete;
+            # this source's explicit terminal action deliberately has no result.
+            case['metadata']['terminal_tool_call_ids'] = [terminal_call]
+            unresolved = [c for c in case['metadata'].get('incomplete_tool_calls', [])
+                          if c != terminal_call]
+            if unresolved:
+                case['metadata']['incomplete_tool_calls'] = unresolved
+            else:
+                case['metadata'].pop('incomplete_tool_calls', None)
+        return case
     except Exception:
         return None
 
@@ -482,6 +512,13 @@ def _terminal_batch_tool() -> list[dict[str, Any]]:
 
 
 def _terminal_action(content: str, *, call_id: str) -> dict[str, Any] | None:
+    thought = ""
+    split = _split_think(content)
+    if split is not None:
+        thought, content = split
+    content = content.strip()
+    if content.startswith("```") and content.endswith("```"):
+        content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
     try:
         payload = json.loads(content)
     except (json.JSONDecodeError, TypeError):
@@ -490,12 +527,12 @@ def _terminal_action(content: str, *, call_id: str) -> dict[str, Any] | None:
         return None
     analysis = str(payload.get("analysis") or "").strip()
     plan = str(payload.get("plan") or "").strip()
-    reasoning = "\n\n".join(part for part in (analysis, plan) if part)
+    reasoning = "\n\n".join(part for part in (thought, analysis, plan) if part)
     commands = payload.get("commands")
     if isinstance(commands, list) and commands:
         clean_commands = []
         for command in commands:
-            if not isinstance(command, dict) or not str(command.get("keystrokes") or "").strip():
+            if not isinstance(command, dict) or not isinstance(command.get("keystrokes"), str):
                 return None
             item = {"keystrokes": str(command["keystrokes"])}
             if command.get("duration") is not None:
@@ -518,7 +555,7 @@ def _terminal_action(content: str, *, call_id: str) -> dict[str, Any] | None:
         }
     if payload.get("task_complete") is True:
         final = plan or analysis or "Task complete."
-        return {"role": "assistant", "content": final, "reasoning_content": analysis or None}
+        return {"role": "assistant", "content": final, "reasoning_content": reasoning or None}
     return None
 
 
@@ -528,51 +565,39 @@ def adapt_openthoughts(
     raw = row.get("conversations")
     if not isinstance(raw, list) or len(raw) < 3:
         return None
-    prefix: list[dict[str, Any]] = []
-    steps: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    messages: list[dict[str, Any]] = []
     pending: dict[str, Any] | None = None
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             return None
         role = str(item.get("role", "")).lower()
         content = str(item.get("content", ""))
-        if role in ("system", "user") and not steps and pending is None:
-            prefix.append({"role": role, "content": content})
-            continue
         if role == "assistant":
             if pending is not None:
-                steps.append((pending, None))
-            pending = _terminal_action(content, call_id=f"terminal_{row_index}_{i}")
-            if pending is None:
                 return None
-            continue
-        if role in ("user", "tool", "environment", "observation") and pending is not None:
-            calls = pending.get("tool_calls", [])
-            if calls:
-                result = {
-                    "role": "tool",
-                    "tool_call_id": calls[0]["id"],
-                    "content": truncate_text(content, source.max_observation_chars),
-                }
-                steps.append((pending, result))
-            else:
-                steps.append((pending, None))
-                prefix.append({"role": "user", "content": truncate_text(content, 1200)})
+            action = _terminal_action(content, call_id=f"terminal_{row_index}_{i}")
+            if action is None:
+                return None
+            messages.append(action)
+            pending = action if action.get("tool_calls") else None
+        elif role in ("user", "tool", "environment", "observation") and pending is not None:
+            messages.append({"role": "tool", "tool_call_id": pending["tool_calls"][0]["id"],
+                             "content": truncate_text(content, source.max_observation_chars)})
             pending = None
-            continue
-    if pending is not None:
-        steps.append((pending, None))
-    if not steps:
+        elif role in ("system", "user"):
+            messages.append({"role": role, "content": content})
+        else:
+            return None
+    targets = [i for i, msg in enumerate(messages) if msg["role"] == "assistant"]
+    if not targets:
         return None
-
-    target_index = row_index % len(steps)
-    context_steps = steps[max(0, target_index - 3) : target_index]
-    messages = prefix[:2]
-    for action, result in context_steps:
-        messages.append(action)
-        if result is not None:
-            messages.append(result)
-    messages.append(steps[target_index][0])
+    target_index = len(targets) - 1 if source.preserve_history else row_index % len(targets)
+    if source.preserve_history:
+        messages = messages[:targets[-1] + 1]
+    else:
+        messages = _window_to_target(messages, row_index)
+    if not messages:
+        return None
     try:
         return normalize_agent_trace(
             {
@@ -588,7 +613,7 @@ def adapt_openthoughts(
                     "teacher": row.get("model"),
                     "oracle_verified_release": True,
                     "selected_step": target_index,
-                    "trajectory_steps": len(steps),
+                    "trajectory_steps": len(targets),
                 },
             },
             default_reasoning_effort=70,
@@ -771,15 +796,90 @@ def _window_to_target(messages: list[dict[str, Any]], row_index: int) -> list[di
     return out
 
 
+def _harmony_context(raw, row_index, limit):
+    """Parse the hosted OpenResearcher top-level channel/recipient schema."""
+    messages, reasoning = [], []
+    pending = None
+    for i, item in enumerate(raw):
+        role = item.get("role")
+        text = _content_text(item.get("content"))
+        if role in ("system", "developer", "user"):
+            if text:
+                messages.append({"role": "system" if role == "developer" else role, "content": text})
+        elif role == "assistant":
+            recipient = item.get("recipient")
+            if recipient and recipient != "assistant":
+                if pending is not None or recipient not in {"browser.search", "browser.open", "browser.find"}:
+                    return None
+                try:
+                    args = json.loads(text)
+                except (ValueError, TypeError):
+                    return None
+                pending = f"research_{row_index}_{i}"
+                messages.append({"role": "assistant", "content": "",
+                    "reasoning_content": "\n\n".join(reasoning) or None,
+                    "tool_calls": [{"id": pending, "type": "function", "function": {
+                        "name": recipient, "arguments": json.dumps(args, ensure_ascii=False)}}]})
+                reasoning.clear()
+            elif item.get("channel") == "analysis":
+                if text: reasoning.append(text)
+            elif text:
+                if pending is not None:
+                    return None
+                messages.append({"role": "assistant", "content": text,
+                                 "reasoning_content": "\n\n".join(reasoning) or None})
+                reasoning.clear()
+        elif role == "tool":
+            if pending is None:
+                return None
+            messages.append({"role": "tool", "tool_call_id": pending,
+                             "content": truncate_text(text, limit)})
+            pending = None
+        else:
+            return None
+    return messages or None
+
+
+def research_reference_matches(row, messages):
+    """Conservative exact-answer acceptance; status=success is NOT correctness."""
+    import unicodedata
+    reference = row.get("answer")
+    if not isinstance(reference, str) or not reference.strip():
+        return False
+    final = next((m.get("content", "") for m in reversed(messages)
+                  if m.get("role") == "assistant" and not m.get("tool_calls")), "")
+    found = re.search(r"(?:^|\n)\s*(?:\*\*)?Exact Answer:(?:\*\*)?\s*(.+?)(?:\n\s*(?:\*\*)?Confidence:|$)", final, re.DOTALL | re.IGNORECASE)
+    if not found:
+        return False
+    def norm(text):
+        boxed = re.fullmatch(r"\\boxed\{([^{}]+)\}", text.strip())
+        if boxed: text = boxed.group(1)
+        text = re.sub(r"【[^】]*】", "", text)
+        return " ".join(unicodedata.normalize("NFKC", text).casefold().strip().strip('"* $.').split())
+    return norm(found.group(1)) == norm(reference)
+
+
 def adapt_openresearcher(
     source: TraceSource, row: dict[str, Any], row_index: int
 ) -> dict[str, Any] | None:
-    messages = _responses_context(
-        row.get("messages"), row_index=row_index, max_observation_chars=source.max_observation_chars
-    )
+    raw = row.get("messages")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, list):
+        return None
+    if any(item.get("channel") or item.get("recipient") for item in raw if isinstance(item, dict)):
+        messages = _harmony_context(raw, row_index, source.max_observation_chars)
+    else:
+        messages = _responses_context(raw, row_index=row_index,
+                                      max_observation_chars=source.max_observation_chars)
     if messages is None:
         return None
-    window = _window_to_target(messages, row_index)
+    if source.preserve_history and (row.get("error") or not research_reference_matches(row, messages)):
+        return None
+    window = messages if source.preserve_history else _window_to_target(messages, row_index)
     if window is None:
         return None
     try:
@@ -795,7 +895,8 @@ def adapt_openresearcher(
                     "qid": row.get("qid"),
                     "question": row.get("question"),
                     "reference_answer": row.get("answer"),
-                    "selected_action_window": True,
+                    "selected_action_window": not source.preserve_history,
+                    "reference_exact_match": source.preserve_history,
                 },
             },
             default_reasoning_effort=80,

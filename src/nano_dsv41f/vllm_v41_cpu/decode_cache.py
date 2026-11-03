@@ -24,27 +24,153 @@ class OwnerCache:
     pending_gate: torch.Tensor | None = None
     pending_segment: torch.Tensor | None = None
     pending_position: torch.Tensor | None = None
+    buffers: dict[str, torch.Tensor] = field(default_factory=dict)
+    capacity: int = 0
+
+    def append(self, name: str, value: torch.Tensor) -> None:
+        old = getattr(self.state, name)
+        start = old.shape[1]
+        if start + value.shape[1] > self.capacity:
+            raise ValueError("compressed cache capacity exceeded")
+        if name not in self.buffers:
+            self.buffers[name] = value.new_empty((1, self.capacity, *value.shape[2:]))
+        buf = self.buffers[name]
+        buf.narrow(1, start, value.shape[1]).copy_(value)
+        setattr(self.state, name, buf.narrow(1, 0, start + value.shape[1]))
 
 
 @dataclass
 class NanoDecodeCache:
-    """Unpaged correctness cache that mirrors the V4.1 serving state machine."""
+    """Single-sequence arena: fixed global capacity and bounded local rings.
 
-    input_ids: torch.Tensor
-    segment_ids: torch.Tensor
+    Views grow logically; their backing storage never grows. This is not a Mamba
+    recurrence: compressed global attention still stores O(capacity) state.
+    """
+
+    input_buffer: torch.Tensor
+    segment_buffer: torch.Tensor
+    position_buffer: torch.Tensor
+    capacity: int
+    length: int = 0
     local_kv: dict[int, torch.Tensor] = field(default_factory=dict)
+    local_segments: dict[int, torch.Tensor] = field(default_factory=dict)
+    local_positions: dict[int, torch.Tensor] = field(default_factory=dict)
+    local_metadata_length: int = -1
     owners: dict[int, OwnerCache] = field(default_factory=dict)
+    next_logits: torch.Tensor | None = None
+    mode: tuple[bool, bool] | None = None
+    draft_kv: torch.Tensor | None = None
+    draft_positions: torch.Tensor | None = None
+    collect_draft: bool = False
+    transaction: Any = field(default=None, repr=False)
 
     @classmethod
-    def empty(cls, *, device: torch.device) -> "NanoDecodeCache":
-        return cls(
-            input_ids=torch.empty((1, 0), dtype=torch.long, device=device),
-            segment_ids=torch.empty((1, 0), dtype=torch.long, device=device),
-        )
+    def empty(cls, *, device: torch.device, capacity: int = 32768) -> "NanoDecodeCache":
+        if capacity < 1:
+            raise ValueError("cache capacity must be positive")
+        ids = torch.empty((1, capacity), dtype=torch.long, device=device)
+        return cls(ids, torch.empty_like(ids), torch.empty_like(ids), capacity)
 
     @property
-    def length(self) -> int:
-        return int(self.input_ids.shape[1])
+    def input_ids(self):
+        return self.input_buffer.narrow(1, 0, self.length)
+
+    @property
+    def segment_ids(self):
+        return self.segment_buffer.narrow(1, 0, self.length)
+
+    def append_tokens(self, tokens, segments):
+        start, size = self.length, tokens.shape[1]
+        if start + size > self.capacity:
+            raise ValueError("cache capacity exceeded; reset or shorten the conversation")
+        positions = segment_local_positions(segments)
+        if start:
+            # Add the previous position only to the leading continuing segment.
+            continuing = (segments == self.segment_buffer[:, start-1:start]).long().cumprod(1)
+            positions = positions + continuing * (self.position_buffer[:, start-1:start] + 1)
+        self.input_buffer[:, start:start+size].copy_(tokens)
+        self.segment_buffer[:, start:start+size].copy_(segments)
+        self.position_buffer[:, start:start+size].copy_(positions)
+        self.length += size
+        return positions
+
+    def append_token(self, token, segment):
+        return self.append_tokens(token, segment)
+
+    def write_local(self, layer, kv, segment, position, window, start):
+        if layer not in self.local_kv:
+            self.local_kv[layer] = kv.new_empty((1, window, kv.shape[-1]))
+            self.local_segments[layer] = next(iter(self.local_segments.values())) if self.local_segments else segment.new_empty((1, window))
+            self.local_positions[layer] = next(iter(self.local_positions.values())) if self.local_positions else position.new_empty((1, window))
+        size = kv.shape[1]
+        if not size:
+            return
+        # Retain the last window with unique ring indices even for large chunks.
+        skip = max(0, size - window)
+        slots = torch.arange(start + skip, start + size, device=kv.device) % window
+        self.local_kv[layer].index_copy_(1, slots, kv[:, skip:])
+        self.local_segments[layer].index_copy_(1, slots, segment[:, skip:])
+        self.local_positions[layer].index_copy_(1, slots, position[:, skip:])
+        self.local_metadata_length = self.length
+
+    def append_local(self, layer, kv, segment, position, window):
+        start = self.length - kv.shape[1]
+        if start:
+            # Read old metadata from the token arena: rings share metadata, so an
+            # earlier layer may already have overwritten its slots in this chunk.
+            indices = torch.arange(max(0, start-window+1), start, device=kv.device)
+            old_kv = self.local_kv[layer].index_select(1, indices % window)
+            history = (torch.cat((old_kv, kv), 1),
+                torch.cat((self.segment_buffer.index_select(1, indices), segment), 1),
+                torch.cat((self.position_buffer.index_select(1, indices), position), 1))
+        else:
+            history = (kv, segment, position)
+        if self.transaction is not None:
+            self.transaction.locals[layer] = (kv, segment, position, window)
+        self.write_local(layer, kv, segment, position, window, start)
+        return history
+
+    def write_draft(self, kv, position, window, start):
+        if self.draft_kv is None:
+            self.draft_kv = kv.new_empty((1, window, kv.shape[-1]))
+            self.draft_positions = position.new_empty((1, window))
+        size = kv.shape[1]
+        if size:
+            skip = max(0, size-window)
+            slots = torch.arange(start+skip, start+size, device=kv.device) % window
+            self.draft_kv.index_copy_(1, slots, kv[:, skip:])
+            self.draft_positions.index_copy_(1, slots, position[:, skip:])
+
+    def snapshot(self):
+        # Global KV is append-only. Save only lengths and the small rolling state.
+        owners = {}
+        for k, owner in self.owners.items():
+            pending = {name: None if getattr(owner, name) is None else getattr(owner, name).clone()
+                       for name in ("pending_latent", "pending_gate", "pending_segment", "pending_position")}
+            owners[k] = (owner.state.kv.shape[1], pending)
+        return dict(length=self.length, owners=owners,
+                    rings={name: {k: v.clone() for k, v in getattr(self, name).items()}
+                           for name in ("local_kv", "local_segments", "local_positions")},
+                    next_logits=self.next_logits,
+                    draft_kv=None if self.draft_kv is None else self.draft_kv.clone(),
+                    draft_positions=None if self.draft_positions is None else self.draft_positions.clone())
+
+    def restore(self, saved):
+        self.length = saved["length"]
+        self.local_metadata_length = self.length
+        self.next_logits = saved["next_logits"]
+        for name, rings in saved["rings"].items():
+            for k, v in rings.items():
+                getattr(self, name)[k].copy_(v)
+        for k, (length, pending) in saved["owners"].items():
+            owner = self.owners[k]
+            for name, buf in owner.buffers.items():
+                setattr(owner.state, name, buf[:, :length])
+            for name, value in pending.items():
+                setattr(owner, name, value)
+        for name in ("draft_kv", "draft_positions"):
+            if saved[name] is not None:
+                getattr(self, name).copy_(saved[name])
 
 
 def _empty_owner_state(
@@ -80,10 +206,6 @@ def _empty_owner_state(
     )
 
 
-def _append_tensor(old: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
-    return torch.cat((old, new), dim=1)
-
-
 def _append_owner_group(
     model: Any,
     owner: OwnerCache,
@@ -104,12 +226,10 @@ def _append_owner_group(
         rotary_dim=model.config.attention.rope.rope_head_dim,
         **kwargs,
     )
-    owner.state.latent = _append_tensor(owner.state.latent, latent)
-    owner.state.kv = _append_tensor(owner.state.kv, kv)
-    owner.state.segment_ids = _append_tensor(owner.state.segment_ids, segment)
-    owner.state.group_start_positions = _append_tensor(
-        owner.state.group_start_positions, position
-    )
+    owner.append("latent", latent)
+    owner.append("kv", kv)
+    owner.append("segment_ids", segment)
+    owner.append("group_start_positions", position)
 
     if compute_indexer and owner.state.index_k is not None:
         index_k = linear(latent, model._w(f"{prefix}.indexer.wk.weight"))
@@ -120,7 +240,7 @@ def _append_owner_group(
             rotary_dim=model.config.attention.rope.rope_head_dim,
             **kwargs,
         )
-        owner.state.index_k = _append_tensor(owner.state.index_k, index_k)
+        owner.append("index_k", index_k)
 
 
 def update_owner_cache(
@@ -134,7 +254,7 @@ def update_owner_cache(
     position: torch.Tensor,
     compute_indexer: bool,
 ) -> TorchCSA2State:
-    """Append one source token, completing a ratio-2 group only when causal."""
+    """Append a source chunk, retaining an unfinished compression group."""
     prefix = f"blocks.{layer_id}.attn"
     owner = cache.owners.get(layer_id)
     if owner is None:
@@ -144,7 +264,8 @@ def update_owner_cache(
                 layer_id=layer_id,
                 compression_ratio=compression_ratio,
                 compute_indexer=compute_indexer,
-            )
+            ),
+            capacity=(cache.capacity + compression_ratio - 1) // compression_ratio,
         )
         cache.owners[layer_id] = owner
     elif compute_indexer and owner.state.index_k is None:
@@ -153,60 +274,38 @@ def update_owner_cache(
             "decode cache was created without index-K; start a fresh cache for sparse retrieval"
         )
 
-    # Full/Reindex/Reuse metadata belongs to the current query, not the next token.
     owner.state.latest_topk_indices = None
     owner.state.latest_topk_values = None
     owner.state.index_source_layer = -1
     owner.state.candidate_mask = None
-
     latent = linear(source, model._w(f"{prefix}.global_kv.weight"))
-    if compression_ratio == 1:
-        _append_owner_group(
-            model,
-            owner,
-            latent,
-            segment,
-            position,
-            layer_id=layer_id,
-            compression_ratio=compression_ratio,
-            compute_indexer=compute_indexer,
-        )
-        return owner.state
-    if compression_ratio != 2:
-        raise ValueError("incremental CPU cache supports compression ratio 1 or 2")
-
-    gate = linear(source, model._w(f"{prefix}.global_gate.weight"))
-    if owner.pending_latent is None:
-        owner.pending_latent = latent
-        owner.pending_gate = gate
-        owner.pending_segment = segment
-        owner.pending_position = position
-        return owner.state
-
-    assert owner.pending_gate is not None
-    assert owner.pending_segment is not None
-    assert owner.pending_position is not None
-    if not torch.equal(owner.pending_segment, segment):
-        raise ValueError(
-            "ratio-2 packed decode requires segment boundaries aligned to compression groups"
-        )
-    pair_latent = torch.cat((owner.pending_latent, latent), dim=1)
-    pair_gate = torch.cat((owner.pending_gate, gate), dim=1)
-    compressed = learned_group_compress(pair_latent, pair_gate, ratio=2)
-    _append_owner_group(
-        model,
-        owner,
-        compressed,
-        owner.pending_segment,
-        owner.pending_position,
-        layer_id=layer_id,
-        compression_ratio=2,
-        compute_indexer=compute_indexer,
-    )
-    owner.pending_latent = None
-    owner.pending_gate = None
-    owner.pending_segment = None
-    owner.pending_position = None
+    gate = None
+    pending = int(owner.pending_latent is not None)
+    if compression_ratio == 2:
+        gate = linear(source, model._w(f"{prefix}.global_gate.weight"))
+        if pending:
+            latent = torch.cat((owner.pending_latent, latent), 1)
+            gate = torch.cat((owner.pending_gate, gate), 1)
+            segment = torch.cat((owner.pending_segment, segment), 1)
+            position = torch.cat((owner.pending_position, position), 1)
+    elif compression_ratio != 1:
+        raise ValueError("incremental cache supports compression ratio 1 or 2")
+    complete = latent.shape[1] // compression_ratio * compression_ratio
+    if compression_ratio == 2 and complete:
+        if not torch.equal(segment[:, :complete:2], segment[:, 1:complete:2]):
+            raise ValueError("ratio-2 packed decode requires segment boundaries aligned to compression groups")
+    if cache.transaction is not None:
+        cache.transaction.owners[layer_id] = (owner.state.kv.shape[1], pending,
+            latent, gate, segment, position, compression_ratio)
+    if complete:
+        compressed = (learned_group_compress(latent[:, :complete], gate[:, :complete], 2)
+                      if compression_ratio == 2 else latent)
+        _append_owner_group(model, owner, compressed, segment[:, :complete:compression_ratio],
+            position[:, :complete:compression_ratio], layer_id=layer_id,
+            compression_ratio=compression_ratio, compute_indexer=compute_indexer)
+    for name, value in (("latent", latent), ("gate", gate), ("segment", segment), ("position", position)):
+        setattr(owner, "pending_"+name,
+                value[:, -1:].clone() if complete < latent.shape[1] and value is not None else None)
     return owner.state
 
 
@@ -275,13 +374,8 @@ def attention_step(
     local_kv = partial_rope(
         local_kv, position, rotary_dim=ac.rope.rope_head_dim, **kwargs
     )
-    previous = cache.local_kv.get(layer_id)
-    cache.local_kv[layer_id] = (
-        local_kv if previous is None else _append_tensor(previous, local_kv)
-    )
-    history_kv = cache.local_kv[layer_id]
-    history_segment = cache.segment_ids
-    history_position = segment_local_positions(history_segment)
+    history_kv, history_segment, history_position = cache.append_local(
+        layer_id, local_kv, segment, position, ac.local_window)
     local_valid = (
         (history_segment.unsqueeze(1) == segment.unsqueeze(-1))
         & (history_position.unsqueeze(1) <= position.unsqueeze(-1))
@@ -340,7 +434,22 @@ def attention_step(
             if sparse_retrieval and retrieval_mask is not None
             else global_valid
         )
-        global_out, global_lse = latent_attention(q, state.kv, attn_valid)
+        # Only the selected global latents enter the expensive main-head attention.
+        if sparse_retrieval and retrieval_mask is not None and state.latest_topk_indices is not None:
+            indices = state.latest_topk_indices
+            batch, queries, count = indices.shape
+            selected_kv = state.kv[:, None].expand(-1, queries, -1, -1).gather(
+                2, indices[..., None].expand(-1, -1, -1, state.kv.shape[-1]))
+            selected_valid = attn_valid.gather(-1, indices)
+            global_out, global_lse = latent_attention(
+                q.reshape(batch*queries, 1, ac.n_heads, ac.head_dim),
+                selected_kv.reshape(batch*queries, count, ac.head_dim),
+                selected_valid.reshape(batch*queries, 1, count))
+            global_out = global_out.reshape(batch, queries, ac.n_heads, ac.head_dim)
+            global_lse = global_lse.reshape(batch, queries, ac.n_heads)
+
+        else:
+            global_out, global_lse = latent_attention(q, state.kv, attn_valid)
 
     if global_out is None:
         merged, branch_lse = local_out, local_lse
@@ -379,7 +488,7 @@ def attention_step(
         heads_per_group * ac.head_dim,
     )
     low_rank = torch.einsum(
-        "...gd,gdr->...gr", grouped, model._w(f"{prefix}.wo_a")
+        "...gd,gdr->...gr", grouped.to(model.dtype), model._w(f"{prefix}.wo_a")
     )
     out = linear(
         low_rank.reshape(
@@ -393,3 +502,53 @@ def attention_step(
         "global_valid": global_valid,
         "retrieval_mask": retrieval_mask,
     }
+
+
+class CacheTransaction:
+    """Speculate once, then retain a prefix without recomputing the transformer.
+
+    Global buffers are append-only. Only bounded rings/pending compression state
+    need copying; journal entries hold the new chunk projections, not history.
+    """
+    def __init__(self, cache):
+        if cache.transaction is not None or cache.length == 0:
+            raise ValueError("speculation requires a non-empty cache and no active transaction")
+        self.cache = cache
+        self.saved = cache.snapshot()
+        self.locals = {}
+        self.owners = {}
+        self.draft = None
+        cache.transaction = self
+
+    @torch.inference_mode()
+    def commit(self, count, logits):
+        cache, start = self.cache, self.saved['length']
+        size = cache.length - start
+        if cache.transaction is not self or not 0 <= count <= size:
+            raise ValueError("invalid speculative commit")
+        cache.transaction = None
+        if count == size:
+            return
+        cache.restore(self.saved)
+        cache.length = start + count
+        if count:
+            for layer, (kv, segment, position, window) in self.locals.items():
+                cache.write_local(layer, kv[:, :count], segment[:, :count], position[:, :count], window, start)
+            for layer, (old, pending, latent, gate, segment, position, ratio) in self.owners.items():
+                owner = cache.owners[layer]
+                rows = pending + count
+                groups = rows // ratio
+                for name, buf in owner.buffers.items():
+                    setattr(owner.state, name, buf[:, :old+groups])
+                for name, value in (("latent", latent), ("gate", gate), ("segment", segment), ("position", position)):
+                    setattr(owner, "pending_"+name,
+                        value[:, rows-1:rows].clone() if rows % ratio and value is not None else None)
+            if self.draft is not None:
+                kv, position, window = self.draft
+                cache.write_draft(kv[:, :count], position[:, :count], window, start)
+            cache.next_logits = logits[:, count-1].float().clone()
+        # Discard query-specific selections from the speculative suffix.
+        for owner in cache.owners.values():
+            owner.state.latest_topk_indices = owner.state.latest_topk_values = None
+            owner.state.candidate_mask = None
+            owner.state.index_source_layer = -1

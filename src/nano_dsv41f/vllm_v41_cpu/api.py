@@ -9,7 +9,8 @@ from uuid import uuid4
 
 import torch
 
-from ..chat_protocol import EOS_TOKEN, EOS_TOKEN_ID
+from ..chat_protocol import BOS_TOKEN, EOS_TOKEN, EOS_TOKEN_ID
+from ..reasoning_effort import render_v41_reasoning_effort_prompt
 from .model import NanoDeepseekV41CPU
 
 Protocol = Literal["chat_completions", "responses", "messages"]
@@ -23,6 +24,7 @@ class PreparedProtocolRequest:
     prompt: str
     include_usage: bool = False
     custom_tool_names: frozenset[str] = frozenset()
+    numeric_reasoning_effort: int | None = None
 
     @property
     def model_name(self) -> str | None:
@@ -93,6 +95,21 @@ def prepare_protocol_request(
     }
     if protocol not in request_types:
         raise ValueError(f"unsupported protocol: {protocol}")
+    numeric_effort = None
+    if protocol == "chat_completions":
+        payload = dict(body) if isinstance(body, dict) else json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        effort = payload.get("reasoning_effort")
+        if isinstance(effort, (int, float)):
+            if type(effort) is not int or not 1 <= effort <= 100:
+                raise ValueError("reasoning_effort must be an integer in [1, 100]")
+            numeric_effort = effort
+            # The pinned Python bindings accept named presets only. Render through
+            # the official encoder, then adjust just its initial numeric prefix,
+            # matching the canonical SFT data renderer.
+            payload["reasoning_effort"] = "high"
+        body = payload
     if isinstance(body, dict):
         body = json.dumps(body, ensure_ascii=False).encode("utf-8")
     elif isinstance(body, str):
@@ -111,6 +128,15 @@ def prepare_protocol_request(
     rendered = recipe["DeepseekV41Encoding"]().render_conversation(
         converted.conversation
     )
+    prompt = rendered.prompt
+    if numeric_effort is not None and converted.conversation.thinking_mode:
+        expected = BOS_TOKEN + render_v41_reasoning_effort_prompt(75)
+        if not prompt.startswith(expected):
+            raise ValueError("V4.1 renderer did not emit the expected initial effort prefix")
+        prompt = (BOS_TOKEN + render_v41_reasoning_effort_prompt(numeric_effort)
+                  + prompt[len(expected):])
+    else:
+        numeric_effort = None
     if rendered.image_sources:
         raise ValueError(
             "nano-dsv4.1f CPU serving is text-only; V4.1 image prompt rendering is "
@@ -120,9 +146,10 @@ def prepare_protocol_request(
         protocol=protocol,
         request=request,
         conversation_request=converted,
-        prompt=rendered.prompt,
+        prompt=prompt,
         include_usage=include_usage,
         custom_tool_names=custom_tool_names,
+        numeric_reasoning_effort=numeric_effort,
     )
 
 
@@ -153,6 +180,12 @@ class NanoTokenizer:
         )
         return list(encoding.encode(conversation))
 
+    def encode_request(self, prepared: PreparedProtocolRequest) -> list[int]:
+        """Tokenize the exact prompt, including the requested numeric effort."""
+        if prepared.numeric_reasoning_effort is not None:
+            return list(self.recipe_tokenizer.encode(prepared.prompt))
+        return self.encode_conversation(prepared.conversation_request.conversation)
+
     def decode(self, token_ids: list[int] | torch.Tensor) -> str:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.detach().cpu().tolist()
@@ -174,6 +207,16 @@ class NanoDeepSeekProtocolBackend:
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.default_max_tokens = default_max_tokens
+        from .session import InferenceSession
+        self.session = InferenceSession(model) if isinstance(model, NanoDeepseekV41CPU) else None
+
+    @property
+    def last_stats(self):
+        return {} if self.session is None else self.session.last_stats
+
+    def reset_cache(self):
+        if self.session is not None:
+            self.session.reset()
 
     @classmethod
     def from_pretrained(
@@ -183,6 +226,7 @@ class NanoDeepSeekProtocolBackend:
         tokenizer_path: str | Path | None = None,
         model_name: str = "nano-dsv4.1f",
         dtype: torch.dtype = torch.float32,
+        device: str | torch.device = "cpu",
     ) -> "NanoDeepSeekProtocolBackend":
         root = Path(checkpoint_dir)
         tokenizer_path = Path(tokenizer_path) if tokenizer_path else root / "tokenizer.json"
@@ -192,7 +236,7 @@ class NanoDeepSeekProtocolBackend:
                 "portable checkpoint or pass tokenizer_path explicitly"
             )
         return cls(
-            NanoDeepseekV41CPU.from_pretrained(root, dtype=dtype),
+            NanoDeepseekV41CPU.from_pretrained(root, dtype=dtype, device=device),
             NanoTokenizer(tokenizer_path),
             model_name=model_name,
         )
@@ -210,9 +254,10 @@ class NanoDeepSeekProtocolBackend:
         input_ids = torch.tensor(
             [prompt_ids], dtype=torch.long, device=self.model.device
         )
-        output = self.model.generate(
+        generator = self.session if self.session is not None else self.model
+        output = generator.generate(
             input_ids,
-            max_new_tokens=max_tokens or self.default_max_tokens,
+            max_new_tokens=self.default_max_tokens if max_tokens is None else max_tokens,
             eos_token_id=EOS_TOKEN_ID,
             temperature=1.0 if temperature is None else float(temperature),
             top_p=0.95 if top_p is None else float(top_p),
@@ -280,9 +325,7 @@ class NanoDeepSeekProtocolBackend:
         """
         prepared = prepare_protocol_request(protocol, body)
         opts = prepared.inference_options
-        prompt_ids = self.tokenizer.encode_conversation(
-            prepared.conversation_request.conversation
-        )
+        prompt_ids = self.tokenizer.encode_request(prepared)
         generated, prompt_tokens, finish = self._generate_ids(
             prompt_ids,
             max_tokens=opts.max_tokens,
