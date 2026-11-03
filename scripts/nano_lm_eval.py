@@ -406,6 +406,7 @@ def run_tasks(lm: Any, tasks: Iterable[str], *, limit: int | float | None = None
 
 def primary_table(results: dict[str, dict[str, Any]], tasks: Iterable[str]) -> list[dict[str, Any]]:
     """Flatten {model: summary} into rows of primary metrics plus stderr."""
+    tasks = list(tasks)
     rows = []
     for name, summary in results.items():
         row: dict[str, Any] = {"model": name}
@@ -419,7 +420,9 @@ def primary_table(results: dict[str, dict[str, Any]], tasks: Iterable[str]) -> l
             row[task + "_stderr"] = metrics.get(stderr_key)
             if task != "wikitext" and value is not None:
                 accs.append(value)
-        row["avg_acc"] = sum(accs) / len(accs) if accs else None
+        expected = [t for t in tasks if t != "wikitext"]
+        # Average only complete rows; a partial mean is not comparable with full ones.
+        row["avg_acc"] = sum(accs) / len(accs) if accs and len(accs) == len(expected) else None
         row["n_acc_tasks"] = len(accs)
         rows.append(row)
     return rows
@@ -468,8 +471,16 @@ def evaluate_hf(pretrained: str, *, revision: str | None, tasks: list[str], limi
     if out_emb is not None and out_emb.weight.data_ptr() != model.get_input_embeddings().weight.data_ptr():
         head = out_emb.weight.numel()
     summary = run_tasks(lm, tasks, limit=limit)
+    # Record the immutable commit actually loaded, since branch names like "main" move.
+    resolved = getattr(model.config, "_commit_hash", None)
+    if not resolved:
+        try:
+            from huggingface_hub import HfApi
+            resolved = HfApi().model_info(pretrained, revision=revision or "main").sha
+        except Exception as exc:  # offline: keep scores, flag the missing provenance
+            print(f"could not resolve {pretrained}@{revision or 'main'}: {exc}", flush=True)
     summary.update(kind="hf", pretrained=pretrained, revision=revision or "main",
-                   max_length=lm.max_length, dtype=dtype,
+                   resolved_commit=resolved, max_length=lm.max_length, dtype=dtype,
                    params={"total": total, "embedding": embed, "lm_head_untied": head,
                            "non_embedding": total - embed - head})
     return summary

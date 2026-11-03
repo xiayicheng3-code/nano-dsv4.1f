@@ -249,7 +249,7 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
             pretty = df[show].copy()
             for t in TASKS + ["avg_acc"]:
                 pretty[t] = pretty[t].map(lambda v: "—" if pd.isna(v) else (f"{v:.3f}" if t == "wikitext" else f"{100 * v:.1f}"))
-            pretty = pretty.rename(columns={"wikitext": "wikitext bpb ↓", "avg_acc": "avg acc (8 tasks)"})
+            pretty = pretty.rename(columns={"wikitext": "wikitext bpb ↓", "avg_acc": "avg acc (8 tasks; — if any failed)"})
             df.to_csv(WORK / "standard_evals.csv")
             (WORK / "standard_evals.md").write_text(pretty.to_markdown())
             json.dump(results, open(WORK / "standard_evals.json", "w"), indent=2)
@@ -276,7 +276,7 @@ def build_notebook(limit: int | None = None) -> nbf.NotebookNode:
             width = 0.8 / len(models)
             x = np.arange(len(acc_tasks))
             for i, m in enumerate(models):
-                vals = [100 * (df.loc[m, t] if pd.notna(df.loc[m, t]) else 0) for t in acc_tasks]
+                vals = [100 * df.loc[m, t] if pd.notna(df.loc[m, t]) else np.nan for t in acc_tasks]  # missing: no bar
                 ax.bar(x + i * width - 0.4 + width / 2, vals, width, label=m,
                        edgecolor="black" if m.startswith("nano") else "none", linewidth=0.8)
             chance = [100 * E.CHANCE[t] for t in acc_tasks]
