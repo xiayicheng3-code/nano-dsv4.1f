@@ -178,3 +178,14 @@ def test_runner_trains_chat_sft_with_mtp_flag_and_exportable_metadata(tmp_path, 
     np.testing.assert_array_equal(np.asarray(restored[1]['w']), [md['stage_steps']] * 2)
     assert any(e['step'] == 0 for e in done['evaluations']) or any(
         e['step'] == 0 for e in first['evaluations'])
+
+
+def test_chat_sft_notebooks_compile_and_call_their_entrypoints(tmp_path):
+    import build_chat_sft_notebooks as builder
+    import nbformat
+    cpu, tpu = builder.build(tmp_path, ref='some-branch', mtp_weight=0.1)
+    for path, entry in ((cpu, 'prepare_chat_sft_corpus.py'), (tpu, 'run_chat_sft.py')):
+        nb = nbformat.read(path, as_version=4)
+        source = '\n'.join(c.source for c in nb.cells if c.cell_type == 'code')
+        assert entry in source and "'some-branch'" in source
+    assert 'MTP_WEIGHT = 0.1' in '\n'.join(c.source for c in nbformat.read(tpu, as_version=4).cells)
