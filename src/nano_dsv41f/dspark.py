@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from .csa2 import grouped_output_projection
 from .layers import init_embedding, init_linear, init_rms_norm, linear, rms_norm
 from .mhc import init_mhc_generator, make_identity_pre_mix, mhc_mixes, post_mix, pre_mix
-from .moe import apply_moe, init_moe
+from .moe import apply_moe, apply_moe_dense_small, init_moe
 from .quantization import fake_fp8_e4m3
 from .rope import apply_partial_rope, rope_kwargs_for_layer
 
@@ -99,6 +99,57 @@ def _latent_attention(q: jax.Array, kv: jax.Array, mask: jax.Array) -> tuple[jax
     return out, jnp.swapaxes(lse, 1, 2)
 
 
+def _windowed_latent_attention(
+    q: jax.Array,
+    context_kv: jax.Array,
+    draft_kv: jax.Array,
+    anchor_positions: jax.Array,
+    block_keep_mask: jax.Array,
+    *,
+    block_size: int,
+    window_size: int,
+    segment_ids: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Gathered-window form of `_latent_attention` + `_dspark_mask`.
+
+    Each draft block only ever sees its anchor's `window_size` context keys and its own
+    block, so the full `[queries, seq_len]` logit matrix is replaced by
+    `[blocks, window + block]` gathers. With `segment_ids`, context keys must also share
+    the anchor's packed segment (inference never sees a previous conversation's cache).
+    """
+    bsz, n_blocks = anchor_positions.shape
+    seq_len, dim = context_kv.shape[1], context_kv.shape[-1]
+    heads = q.shape[2]
+    pos = anchor_positions[..., None] - (window_size - 1) + jnp.arange(window_size)
+    ctx_ok = (pos >= 0) & block_keep_mask[..., None]
+    safe = jnp.clip(pos, 0, seq_len - 1)
+    if segment_ids is not None:
+        anchor_seg = jnp.take_along_axis(segment_ids, anchor_positions, axis=1)
+        key_seg = jnp.take_along_axis(
+            segment_ids, safe.reshape(bsz, -1), axis=1
+        ).reshape(bsz, n_blocks, window_size)
+        ctx_ok = ctx_ok & (key_seg == anchor_seg[..., None])
+    ctx = jnp.take_along_axis(
+        context_kv, safe.reshape(bsz, -1)[..., None], axis=1
+    ).reshape(bsz, n_blocks, window_size, dim)
+    kv = jnp.concatenate(
+        [ctx, draft_kv.reshape(bsz, n_blocks, block_size, dim)], axis=2
+    )
+    mask = jnp.concatenate(
+        [ctx_ok, jnp.broadcast_to(block_keep_mask[..., None], (bsz, n_blocks, block_size))],
+        axis=-1,
+    )
+    qb = q.reshape(bsz, n_blocks, block_size, heads, dim)
+    logits = jnp.einsum("bnqhd,bnkd->bnhqk", qb, kv) * dim ** -0.5
+    valid = mask[:, :, None, None, :]
+    any_valid = jnp.any(mask, axis=-1)[:, :, None, None, None]  # [B, n, 1, 1, 1]
+    masked = jnp.where(valid, logits, -1e30)
+    prob = jnp.where(any_valid, jax.nn.softmax(masked, axis=-1), 0.0)
+    out = jnp.einsum("bnhqk,bnkd->bnqhd", prob, kv).reshape(bsz, -1, heads, dim)
+    lse = jnp.where(any_valid[..., 0], jax.nn.logsumexp(masked, axis=-1), -jnp.inf)
+    return out, jnp.transpose(lse, (0, 1, 3, 2)).reshape(bsz, -1, heads)
+
+
 def _draft_inputs(
     embed: jax.Array,
     input_ids: jax.Array,
@@ -136,8 +187,17 @@ def apply_dspark(
     anchor_positions: jax.Array,
     block_keep_mask: jax.Array | None = None,
     teacher_prev_ids: jax.Array | None = None,
+    segment_ids: jax.Array | None = None,
+    windowed: bool = False,
+    dense_experts: bool = False,
 ) -> dict[str, jax.Array]:
     """Stateless training/reference form of one released V4.1 DSpark stage.
+
+    `windowed=True` gathers each block's attention window instead of masking a full-row
+    score matrix (same result; required for many anchors on long rows). `segment_ids`
+    additionally confines context to the anchor's packed segment and needs `windowed`.
+    `dense_experts=True` evaluates the few DSpark experts densely (same result, no
+    per-token expert-weight gather).
 
     `anchor_positions` lets one ordinary JAX call emulate several decode anchors while
     retaining the released decode geometry: the target hidden at the anchor is already in
@@ -152,6 +212,8 @@ def apply_dspark(
         raise ValueError("context_features last dim does not match DSpark target layers")
     if block_keep_mask is None:
         block_keep_mask = jnp.ones_like(anchor_positions, dtype=bool)
+    if segment_ids is not None and not windowed:
+        raise ValueError("segment-confined DSpark context requires windowed=True")
 
     main_x = rms_norm(
         linear(context_features, params["main_proj"]), params["main_norm"], eps=config.norm_eps
@@ -221,15 +283,27 @@ def apply_dspark(
             block_size=config.quantization.swa_fp8_block_size,
             ste=True,
         )
-    kv = jnp.concatenate([context_kv, draft_kv], axis=1)
-    mask = _dspark_mask(
-        anchor_positions,
-        block_keep_mask,
-        seq_len=seq_len,
-        block_size=dc.block_size,
-        window_size=ac.local_window,
-    )
-    o, lse = _latent_attention(q, kv, mask)
+    if windowed:
+        o, lse = _windowed_latent_attention(
+            q,
+            context_kv,
+            draft_kv,
+            anchor_positions,
+            block_keep_mask,
+            block_size=dc.block_size,
+            window_size=ac.local_window,
+            segment_ids=segment_ids,
+        )
+    else:
+        kv = jnp.concatenate([context_kv, draft_kv], axis=1)
+        mask = _dspark_mask(
+            anchor_positions,
+            block_keep_mask,
+            seq_len=seq_len,
+            block_size=dc.block_size,
+            window_size=ac.local_window,
+        )
+        o, lse = _latent_attention(q, kv, mask)
     if "attn_sink" in params:
         total_lse = jnp.logaddexp(lse, params["attn_sink"][None, None, :])
         o = o * jnp.exp(lse - total_lse)[..., None]
@@ -255,7 +329,7 @@ def apply_dspark(
         norm_eps=config.norm_eps,
     )
     ffn_x = rms_norm(pre_mix(streams, attn_pre), params["ffn_norm"], eps=config.norm_eps)
-    ffn_out, moe_aux = apply_moe(
+    ffn_out, moe_aux = (apply_moe_dense_small if dense_experts else apply_moe)(
         ffn_x,
         params["moe"],
         top_k=dc.experts_per_token,

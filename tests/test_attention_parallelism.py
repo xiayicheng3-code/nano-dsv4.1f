@@ -98,3 +98,53 @@ def test_cp2_dp4_full_late_optimizer_step_matches_reference(batch_mode, buffer_d
     assert int(actual[2]["indexer"]["active_queries"]) == 24
     for a, b in zip(jax.tree.leaves(actual[:2]), jax.tree.leaves(expected[:2])):
         np.testing.assert_allclose(a, b, atol=3e-5, rtol=5e-3)
+
+
+def test_cp2_dp4_mtp_sft_step_matches_reference():
+    """MTP auxiliary loss under the native CP2/DP4 + EP8 step equals the dense oracle."""
+    if len(jax.devices()) < 8:
+        pytest.skip("requires eight CPU devices")
+    from test_reference_model import tiny_config
+    from nano_dsv41f import (TrainConfig, compile_pretrain_step, init_model_sharded,
+        init_optimizer_state_sharded, make_v5e_mesh, put_training_batch)
+    from nano_dsv41f.tpu import batch_named_sharding
+    from nano_dsv41f.training import pretrain_step
+    cfg = tiny_config(dspark=True)
+    cfg = replace(cfg, n_experts=8,
+        parallelism=replace(cfg.parallelism, vocab_shard=8, engram_table_shard=8,
+                            expert_shard=8, attention_context_shard=2,
+                            attention_data_shard=4, indexer_context_shard=2))
+    mesh = make_v5e_mesh()
+    params, specs, _ = init_model_sharded(jax.random.key(103), cfg, mesh)
+    opt, _ = init_optimizer_state_sharded(params, specs, cfg, mesh)
+    rng = np.random.default_rng(104)
+    ids = rng.integers(3, cfg.vocab_size, (4, 256), dtype=np.int32)
+    segments = np.tile(np.repeat(np.arange(2, dtype=np.int32), 128)[None], (4, 1))
+    mask = np.ones_like(ids, dtype=bool)
+    targets = np.zeros_like(mask)
+    targets[:, 40:120] = True
+    targets[:, 170:250] = True
+    host = dict(ids=ids, seg=segments, mask=mask, targets=targets)
+    ids, segments, mask = put_training_batch(ids, segments, mask, cfg, mesh)
+    targets_dev = jax.device_put(targets, batch_named_sharding(cfg, mesh))
+    step_id = jnp.asarray(3, jnp.int32)
+    train = TrainConfig(seq_len=256)
+    kwargs = dict(mtp_weight=0.2, mtp_anchors_per_row=16)
+    host_params = jax.tree.map(lambda x: jnp.asarray(np.asarray(x)), params)
+    host_opt = jax.tree.map(lambda x: jnp.asarray(np.asarray(x)), opt)
+    expected = jax.jit(lambda p, o: pretrain_step(p, o, cfg, train, jnp.asarray(host['ids']),
+        segment_ids=jnp.asarray(host['seg']), token_mask=jnp.asarray(host['mask']),
+        target_mask=jnp.asarray(host['targets']), step=step_id, **kwargs))(host_params, host_opt)
+    native = compile_pretrain_step(params, opt, specs, cfg, train, mesh, include_indexer=False,
+        assistant_only=True, native_config=TPUNativeConfig(splash_interpret=True), **kwargs)
+    actual = native(params, opt, ids, segments, step_id, mask, targets_dev)
+    jax.block_until_ready(actual)
+    assert float(actual[2]["mtp_loss"]) > 0
+    assert int(actual[2]["mtp_blocks"]) == 4 * 16
+    np.testing.assert_allclose(actual[2]["mtp_loss"], expected[2]["mtp_loss"], atol=2e-5, rtol=2e-5)
+    np.testing.assert_allclose(actual[2]["loss"], expected[2]["loss"], atol=2e-5, rtol=2e-5)
+    for a, b in zip(jax.tree.leaves(actual[0]["dspark"]), jax.tree.leaves(expected[0]["dspark"])):
+        np.testing.assert_allclose(a, b, atol=3e-5, rtol=5e-3)
+    moved = [not np.array_equal(np.asarray(a), np.asarray(b))
+             for a, b in zip(jax.tree.leaves(actual[0]["dspark"]), jax.tree.leaves(host_params["dspark"]))]
+    assert any(moved)
