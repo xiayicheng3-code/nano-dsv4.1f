@@ -97,7 +97,7 @@ existing reasoning traces so thinking mode keeps its format; agent traces are dr
 the backbone, 256 sampled anchors per 32K row). Compare held-out chat loss
 (logged at step 0 and every 500 updates), benchmarks and samples.
 
-A one-pass run is about 3,400 updates; the previous 32K SFT measured ~2.6 s/update,
+A one-pass run is about 3,540 updates (441M tokens); the previous 32K SFT measured ~2.6 s/update,
 so a run should finish in one session. Checkpoints are saved before compilation and
 every 500 updates; set `RESUME_CHECKPOINT` to continue a paused run.'''),
         code('''import os
@@ -106,7 +106,7 @@ SESSION_STARTED = time.time()
 SESSION_HOURS = 8.0
 MTP_WEIGHT = ''' + repr(mtp_weight) + '''  # 0.0 = baseline arm, 0.1 = MTP arm; keep unchanged on resume
 MTP_ANCHORS = 256
-REASONING_FRACTION = 0.10
+REASONING_FRACTION = 0.05  # 28M-token reasoning pool: 5% keeps ~98% of the chat corpus in one pass
 SFT_TOKENS = 0  # 0 = one pass over the chat corpus at this mix
 MAX_STEPS = ''' + repr(max_steps) + '''  # >0 only for a smoke test
 RESUME_CHECKPOINT = ''  # later sessions: this run's training/sft/checkpoints directory
