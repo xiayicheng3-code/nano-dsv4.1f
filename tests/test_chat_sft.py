@@ -189,3 +189,27 @@ def test_chat_sft_notebooks_compile_and_call_their_entrypoints(tmp_path):
         source = '\n'.join(c.source for c in nb.cells if c.cell_type == 'code')
         assert entry in source and "'some-branch'" in source
     assert 'MTP_WEIGHT = 0.1' in '\n'.join(c.source for c in nbformat.read(tpu, as_version=4).cells)
+
+
+def test_dspark_distillation_data_reads_chat_corpus(tmp_path):
+    from dspark_data import SFTDraftData
+    chat = tmp_path / 'chat'; chat.mkdir(); (chat / 'tokenizer.json').write_text('{}')
+    token_hash = hashlib.sha256(b'{}').hexdigest()
+    splits = {}
+    for split, rows in (('train', 3), ('validation', 2)):
+        ids_dir = chat / 'sft' / 'chat' / split
+        meta = _shard(ids_dir, rows, 1024)
+        if split == 'validation':  # distinct bytes: train/validation must not share a shard
+            data = dict(np.load(ids_dir / meta['file']))
+            data['input_ids'][:, 5] = 41
+            np.savez(ids_dir / meta['file'], **data)
+            meta.update(bytes=(ids_dir / meta['file']).stat().st_size,
+                        sha256=hashlib.sha256((ids_dir / meta['file']).read_bytes()).hexdigest())
+        splits[split] = {'real_tokens': rows * 1024, 'rows': rows, 'shards': [meta]}
+    (chat / 'chat_sft_manifest.json').write_text(json.dumps({
+        'format': 'nano-dsv41f-chat-sft-v1', 'complete': True, 'lengths': {'sft': 32768},
+        'identity': {'tokenizer_sha256': token_hash}, 'splits': splits}))
+    data = SFTDraftData(chat, tokenizer_sha256=token_hash, block_size=5, seq_len=64, anchors=4)
+    sample = data.sample(0)
+    assert sample['pool'] == 'chat' and len(sample['anchors']) == 4
+    assert data.sample(0, split='validation')['source'].startswith('sft/chat/validation/')
