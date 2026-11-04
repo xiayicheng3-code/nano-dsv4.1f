@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Side-by-side greedy chat samples and behaviour metrics for portable nano bundles.
+
+Each prompt is rendered with the DeepSeek V4.1 encoder in non-thinking mode (the same
+format as chat SFT), decoded greedily, and summarised with simple, model-agnostic
+behaviour metrics. They are no substitute for reading the samples, but they make
+regressions such as runaway generation, repetition or stray tool-call markup visible:
+
+- stop_rate: replies ending with EOS before the token limit;
+- mean_tokens: reply length;
+- distinct2: unique / total word bigrams inside a reply (low = repetitive);
+- tool_markup_rate: replies containing DSML/tool-call markup although no tools exist.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import time
+
+import torch
+
+PROMPTS = [
+    "Hi! How are you today?",
+    "What is photosynthesis? Explain it simply.",
+    "Give me three tips for studying for an exam.",
+    "Write a short poem about the ocean.",
+    "What is the capital of France?",
+    "Explain what a neural network is to a 10-year-old.",
+    "How do I make a cup of tea?",
+    "What are the main causes of climate change?",
+    "Can you help me write a polite email asking my professor for an extension?",
+    "What is the difference between weather and climate?",
+    "Summarize the story of Romeo and Juliet in two sentences.",
+    "Write a Python function that returns the sum of a list of numbers.",
+    "Why is the sky blue?",
+    "Suggest a name for a small coffee shop.",
+    "What should I pack for a weekend camping trip?",
+    "What is 15 + 27?",
+    "Explain the water cycle.",
+    "Give me a simple recipe for pancakes.",
+    "What does a computer's CPU do?",
+    "How can I improve my sleep?",
+    "Translate 'good morning' into Spanish.",
+    "What is gravity?",
+    "Write a two-sentence horror story.",
+    "List the planets of the solar system in order.",
+    "What are some benefits of regular exercise?",
+    "Describe a cat to someone who has never seen one.",
+    "What is a prime number? Give an example.",
+    "How do vaccines work?",
+    "Tell me a fun fact about octopuses.",
+    "What is the difference between a virus and a bacterium?",
+    "Rewrite this sentence to sound more formal: 'gonna be late, sorry'.",
+    "What is the meaning of the word 'ephemeral'?",
+]
+TOOL_MARKERS = ('｜DSML｜', '<tool_result>', '</tool_result>', '<｜action｜>', '<｜read_url｜>',
+                '<｜query｜>')
+
+
+def render_prompt(text: str) -> str:
+    from deepseek_recipe import Conversation, DeepseekV41Encoding, UserMessage
+    conversation = Conversation([UserMessage(text)], thinking_mode=False, tools=None,
+                                reasoning_effort=None)
+    return DeepseekV41Encoding().render_conversation(conversation).prompt
+
+
+def distinct2(text: str) -> float:
+    words = text.split()
+    pairs = list(zip(words, words[1:]))
+    return len(set(pairs)) / len(pairs) if pairs else 1.0
+
+
+def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int):
+    from tokenizers import Tokenizer
+    from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
+    from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
+    from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
+
+    model = NanoDeepseekV41CPU.from_pretrained(bundle, device=device, dtype=torch.float32)
+    tok = Tokenizer.from_file(str(bundle / 'tokenizer.json'))
+    session = InferenceSession(model)
+    rows = []
+    for prompt in prompts:
+        ids = tok.encode(render_prompt(prompt), add_special_tokens=False).ids
+        session.reset()
+        started = time.time()
+        out = session.generate(torch.tensor([ids], device=model.device), max_new_tokens=max_new_tokens,
+                               eos_token_id=EOS_TOKEN_ID, temperature=0.0)
+        generated = out[0, len(ids):].tolist()
+        stopped = bool(generated) and generated[-1] == EOS_TOKEN_ID
+        text = tok.decode(generated[:-1] if stopped else generated, skip_special_tokens=False)
+        rows.append({'prompt': prompt, 'reply': text, 'tokens': len(generated), 'stopped': stopped,
+                     'distinct2': round(distinct2(text), 3),
+                     'tool_markup': any(m in text for m in TOOL_MARKERS),
+                     'seconds': round(time.time() - started, 2)})
+    n = len(rows)
+    summary = {'stop_rate': sum(r['stopped'] for r in rows) / n,
+               'mean_tokens': sum(r['tokens'] for r in rows) / n,
+               'distinct2': sum(r['distinct2'] for r in rows) / n,
+               'tool_markup_rate': sum(r['tool_markup'] for r in rows) / n}
+    return {'bundle': str(bundle), 'summary': summary, 'samples': rows}
+
+
+def to_markdown(results: dict) -> str:
+    names = list(results)
+    lines = ['| metric | ' + ' | '.join(names) + ' |', '|---|' + '---:|' * len(names)]
+    for key in ('stop_rate', 'mean_tokens', 'distinct2', 'tool_markup_rate'):
+        lines.append(f'| {key} | ' + ' | '.join(f"{results[n]['summary'][key]:.3f}" for n in names) + ' |')
+    out = ['\n'.join(lines), '']
+    for i, prompt in enumerate(results[names[0]]['samples']):
+        out.append(f"### {i + 1}. {prompt['prompt']}\n")
+        for n in names:
+            reply = results[n]['samples'][i]['reply'].strip().replace('\n', '\n> ')
+            out.append(f"**{n}**\n\n> {reply}\n")
+    return '\n'.join(out)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    p.add_argument('--bundle', action='append', required=True, help='NAME=PATH, repeatable')
+    p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--max-new-tokens', type=int, default=192)
+    p.add_argument('--limit', type=int, default=0)
+    p.add_argument('--output', type=Path, required=True, help='writes NAME.json and .md')
+    a = p.parse_args()
+    prompts = PROMPTS[:a.limit] if a.limit else PROMPTS
+    results = {}
+    for spec in a.bundle:
+        name, path = spec.split('=', 1)
+        results[name] = sample_bundle(Path(path), prompts, device=a.device, max_new_tokens=a.max_new_tokens)
+        print(name, json.dumps(results[name]['summary']), flush=True)
+    a.output.parent.mkdir(parents=True, exist_ok=True)
+    a.output.with_suffix('.json').write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    a.output.with_suffix('.md').write_text(to_markdown(results))
+    print('Wrote', a.output.with_suffix('.md'))
+
+
+if __name__ == '__main__':
+    main()
