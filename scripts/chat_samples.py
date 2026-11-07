@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Side-by-side greedy chat samples and behaviour metrics for portable nano bundles.
+"""Side-by-side chat samples (greedy or seeded sampling) and behaviour metrics for portable nano bundles.
 
 Each prompt is rendered with the DeepSeek V4.1 encoder in non-thinking mode (the same
-format as chat SFT), decoded greedily, and summarised with simple, model-agnostic
+format as chat SFT), decoded greedily or with seeded temperature/top-p sampling, and summarised with simple, model-agnostic
 behaviour metrics. They are no substitute for reading the samples, but they make
 regressions such as runaway generation, repetition or stray tool-call markup visible:
 
@@ -71,7 +71,8 @@ def distinct2(text: str) -> float:
     return len(set(pairs)) / len(pairs) if pairs else 1.0
 
 
-def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int):
+def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
+                  temperature: float = 0.0, top_p: float = 1.0, seed: int = 0):
     from tokenizers import Tokenizer
     from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
     from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
@@ -81,12 +82,13 @@ def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int):
     tok = Tokenizer.from_file(str(bundle / 'tokenizer.json'))
     session = InferenceSession(model)
     rows = []
-    for prompt in prompts:
+    for i, prompt in enumerate(prompts):
         ids = tok.encode(render_prompt(prompt), add_special_tokens=False).ids
         session.reset()
+        torch.manual_seed(seed + i)  # same draws per prompt for every bundle
         started = time.time()
         out = session.generate(torch.tensor([ids], device=model.device), max_new_tokens=max_new_tokens,
-                               eos_token_id=EOS_TOKEN_ID, temperature=0.0)
+                               eos_token_id=EOS_TOKEN_ID, temperature=temperature, top_p=top_p)
         generated = out[0, len(ids):].tolist()
         stopped = bool(generated) and generated[-1] == EOS_TOKEN_ID
         text = tok.decode(generated[:-1] if stopped else generated, skip_special_tokens=False)
@@ -122,13 +124,17 @@ def main():
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--max-new-tokens', type=int, default=192)
     p.add_argument('--limit', type=int, default=0)
+    p.add_argument('--temperature', type=float, default=0.0, help='0 = greedy')
+    p.add_argument('--top-p', type=float, default=1.0)
+    p.add_argument('--seed', type=int, default=0)
     p.add_argument('--output', type=Path, required=True, help='writes NAME.json and .md')
     a = p.parse_args()
     prompts = PROMPTS[:a.limit] if a.limit else PROMPTS
     results = {}
     for spec in a.bundle:
         name, path = spec.split('=', 1)
-        results[name] = sample_bundle(Path(path), prompts, device=a.device, max_new_tokens=a.max_new_tokens)
+        results[name] = sample_bundle(Path(path), prompts, device=a.device, max_new_tokens=a.max_new_tokens,
+                                      temperature=a.temperature, top_p=a.top_p, seed=a.seed)
         print(name, json.dumps(results[name]['summary']), flush=True)
     a.output.parent.mkdir(parents=True, exist_ok=True)
     a.output.with_suffix('.json').write_text(json.dumps(results, indent=2, ensure_ascii=False))
