@@ -213,3 +213,13 @@ def test_dspark_distillation_data_reads_chat_corpus(tmp_path):
     sample = data.sample(0)
     assert sample['pool'] == 'chat' and len(sample['anchors']) == 4
     assert data.sample(0, split='validation')['source'].startswith('sft/chat/validation/')
+
+
+def test_ablation_eval_notebook_compiles_and_runs_all_comparisons(tmp_path):
+    import build_ablation_eval_notebook as builder
+    import nbformat
+    nb = nbformat.read(builder.build(tmp_path, ref='some-branch'), as_version=4)
+    source = '\n'.join(c.source for c in nb.cells if c.cell_type == 'code')
+    for needle in ('export_posttrain_checkpoint.py', 'nano_lm_eval.py', 'chat_samples.py',
+                   "'some-branch'", "for tag in ('baseline', 'mtp')"):
+        assert needle in source
