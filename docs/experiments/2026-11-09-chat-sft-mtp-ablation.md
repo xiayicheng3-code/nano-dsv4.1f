@@ -84,3 +84,34 @@ All differences are within about one standard error. Chat SFT did not cost raw-L
   received gradients from a weak head. A head warm-up or a higher head LR could change the result.
 - The chat models seldom emit EOS within 512 tokens. They tend to continue or loop, so the chat
   notebook should keep a token limit and a repetition guard.
+
+## DSpark draft head for the shipped model
+
+DSpark was distilled from the **frozen** chat baseline on the chat corpus
+(`scripts/train_dspark.py`: 0.1 CE + 0.9 full-distribution L1 + confidence BCE, LR 1e-4,
+512-token crops, 16 anchors) on one T4. The backbone hash was identical before and after.
+
+| held-out (16 crops, 1,280 draft tokens) | start | 2k | 10k | 20k | **30k** |
+|---|---:|---:|---:|---:|---:|
+| next-token distribution overlap | 5% | 30% | 45% | 52% | **55%** |
+| top-1 agreement, all 5 positions | 0% | 17% | 28% | 34% | **36%** |
+| greedy rollout acceptance | 0/128 | 30/128 | 51/128 | 57/128 | **62/128 (48%)** |
+
+30k updates took 2.4 h (~0.29 s/update) and were still improving slowly. A 1k-update pilot on
+both SFT arms showed the MTP-trained head's head start (8% vs 4% initial overlap) vanishing by
+update 100, so MTP-in-SFT also did not help the draft head.
+
+### Measured decoding speed (CPU, 4 threads, 128 greedy tokens, 4 chat prompts)
+
+| decoder | tokens/s | backbone calls / 128 tokens | accepted drafts |
+|---|---:|---:|---:|
+| plain cached decoding | 60–65 | 127 | – |
+| DSpark, sequential verification | 51–56 | 127 | 51–62 / 128 |
+| DSpark, batched verification | 38–54 | 102–126 | 51–62 / 128 |
+
+Speculative decoding is currently **slower** than plain decoding, for two reasons. Acceptance
+falls off after the first draft position, so a batch averages under 2 emitted tokens, while it
+pays for a 5-token verification pass and the draft pass. In addition, after every rejection
+`session.py` runs a separate backbone step for the replacement token instead of folding it into the
+next verification block, which standard speculative decoding does. Fixing that verifier and
+training the head longer are the two levers; until then the chat notebook decodes without DSpark.
