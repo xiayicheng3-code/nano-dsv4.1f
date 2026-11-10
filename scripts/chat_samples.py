@@ -8,7 +8,7 @@ regressions such as runaway generation, repetition or stray tool-call markup vis
 
 - stop_rate: replies ending with EOS before the token limit;
 - mean_tokens: reply length;
-- distinct2: unique / total word bigrams inside a reply (low = repetitive);
+- distinct2 / distinct3: unique / total word bigrams / trigrams inside a reply (low = repetitive);
 - tool_markup_rate: replies containing DSML/tool-call markup although no tools exist;
 - repeat4: share of reply tokens that complete a token 4-gram already present in the reply;
 - loop_rate / median_first_loop: replies that enter a loop (a run of >= 8 consecutive
@@ -101,14 +101,19 @@ def loop_runs(labels, min_run: int = 8) -> list[tuple[int, int]]:
     return runs
 
 
-def distinct2(text: str) -> float:
+def distinct_n(text: str, n: int) -> float:
     words = text.split()
-    pairs = list(zip(words, words[1:]))
-    return len(set(pairs)) / len(pairs) if pairs else 1.0
+    grams = list(zip(*(words[i:] for i in range(n))))
+    return len(set(grams)) / len(grams) if grams else 1.0
+
+
+def distinct2(text: str) -> float:
+    return distinct_n(text, 2)
 
 
 def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
-                  temperature: float = 0.0, top_p: float = 1.0, seed: int = 0, model=None):
+                  temperature: float = 0.0, top_p: float = 1.0, seed: int = 0, model=None,
+                  repetition=None):
     from tokenizers import Tokenizer
     from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
     from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
@@ -125,13 +130,15 @@ def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
         torch.manual_seed(seed + i)  # same draws per prompt for every bundle
         started = time.time()
         out = session.generate(torch.tensor([ids], device=model.device), max_new_tokens=max_new_tokens,
-                               eos_token_id=EOS_TOKEN_ID, temperature=temperature, top_p=top_p)
+                               eos_token_id=EOS_TOKEN_ID, temperature=temperature, top_p=top_p,
+                               repetition=repetition)
         generated = out[0, len(ids):].tolist()
         stopped = bool(generated) and generated[-1] == EOS_TOKEN_ID
         text = tok.decode(generated[:-1] if stopped else generated, skip_special_tokens=False)
         runs = loop_runs(repeat_labels(generated))
         rows.append({'prompt': prompt, 'reply': text, 'tokens': len(generated), 'stopped': stopped,
                      'distinct2': round(distinct2(text), 3),
+                     'distinct3': round(distinct_n(text, 3), 3),
                      'repeat4': round(repeat_fraction(generated), 3),
                      'tool_markup': any(m in text for m in TOOL_MARKERS),
                      'first_loop': runs[0][0] if runs else len(generated), 'loops': len(runs),
@@ -140,6 +147,7 @@ def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
     summary = {'stop_rate': sum(r['stopped'] for r in rows) / n,
                'mean_tokens': sum(r['tokens'] for r in rows) / n,
                'distinct2': sum(r['distinct2'] for r in rows) / n,
+               'distinct3': sum(r['distinct3'] for r in rows) / n,
                'repeat4': sum(r['repeat4'] for r in rows) / n,
                'tool_markup_rate': sum(r['tool_markup'] for r in rows) / n,
                'loop_rate': sum(r['loops'] > 0 for r in rows) / n,

@@ -457,7 +457,11 @@ class NanoDeepseekV41CPU:
         *,
         temperature: float,
         top_p: float,
+        repetition=None,
+        history: list[int] | None = None,
     ) -> torch.Tensor:
+        if repetition is not None:
+            logits = repetition.apply(logits, history or [])
         if temperature <= 0:
             return logits.argmax(dim=-1, keepdim=True)
         probs = torch.softmax(logits / temperature, dim=-1)
@@ -485,9 +489,11 @@ class NanoDeepseekV41CPU:
         temperature: float = 0.0,
         top_p: float = 1.0,
         sparse_retrieval: bool = True,
+        repetition=None,
     ) -> torch.Tensor:
         """Stateless convenience API; use InferenceSession for prefix reuse/statistics."""
         from .session import InferenceSession
         return InferenceSession(self).generate(
             input_ids, max_new_tokens=max_new_tokens, eos_token_id=eos_token_id,
-            temperature=temperature, top_p=top_p, sparse_retrieval=sparse_retrieval)
+            temperature=temperature, top_p=top_p, sparse_retrieval=sparse_retrieval,
+            repetition=repetition)
