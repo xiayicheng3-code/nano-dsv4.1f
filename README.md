@@ -290,7 +290,8 @@ Post-training experiment write-ups:
   MTP during SFT hurts at this scale; the chat baseline ships with a distilled DSpark head.
 - [Training-free repetition-direction edit](docs/experiments/2026-11-10-repetition-direction-edit.md):
   a separable FFN "repetition" direction can be removed with a 0.5% weight edit, but looping
-  barely changes (negative result).
+  barely changes; steering a loop-onset direction at inference time does no better than
+  norm-matched random directions (negative results).
 
 ## Try it on Kaggle
 
