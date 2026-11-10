@@ -216,10 +216,11 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
 MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/input
 DEVICE = 'auto'  # 'auto' = cuda when a GPU is attached, else cpu
 PREFILL_CHUNK_SIZE = 32
-# DSpark speculative decoding (greedy only). 'auto' enables it on a GPU when the bundle
-# has a trained draft head: on a T4 it measured 1.00-1.39x faster (mean ~1.15x); on CPU
-# it measured slower, so it stays off there. True/False force it.
-USE_MTP = 'auto'
+# DSpark speculative decoding verifies greedy decoding only. With a trained draft head on a
+# T4 it measured 1.00-1.39x faster (mean ~1.15x); on CPU it measured slower. Greedy replies
+# from this small model loop far more than sampled ones (T=0.7), so chat defaults to
+# sampling. Set 'auto' (GPU + trained draft) or True to try the speed-up.
+USE_MTP = False
 '''),
         bootstrap(),
         code('''

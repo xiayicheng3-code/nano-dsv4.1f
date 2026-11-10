@@ -120,8 +120,10 @@ costs about two single steps (37 vs 19 ms) and drafting another 7 ms, so a round
 emit more than ~2.3 tokens to pay off. On the GPU the eager runtime is launch-bound, so a
 5-token pass costs about the same as one token, and the saved target calls translate directly
 into speed. Absolute GPU throughput is low because the eager Torch runtime is dominated by
-per-op overhead at this model size. The chat notebook therefore enables DSpark automatically on
-a GPU with a trained draft head, and leaves it off on CPU.
+per-op overhead at this model size. An end-to-end T4 run of the chat notebook with DSpark decoded at 22–25 tok/s. Because DSpark
+verifies greedy decoding only, and greedy replies from this model loop far more than sampled
+ones (distinct-2 0.10 vs 0.35), the chat notebook defaults to sampling (T=0.7, top-p 0.9) and
+exposes DSpark as an opt-in (`USE_MTP='auto'` or `True`).
 
 The remaining lever is draft quality: accepted drafts beyond the known token average only
 0.15–0.64 per round, and the head was still improving when distillation stopped.
