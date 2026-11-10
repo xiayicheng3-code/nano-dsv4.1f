@@ -9,7 +9,8 @@ regressions such as runaway generation, repetition or stray tool-call markup vis
 - stop_rate: replies ending with EOS before the token limit;
 - mean_tokens: reply length;
 - distinct2: unique / total word bigrams inside a reply (low = repetitive);
-- tool_markup_rate: replies containing DSML/tool-call markup although no tools exist.
+- tool_markup_rate: replies containing DSML/tool-call markup although no tools exist;
+- repeat4: share of reply tokens that complete a token 4-gram already present in the reply.
 """
 from __future__ import annotations
 
@@ -65,6 +66,15 @@ def render_prompt(text: str) -> str:
     return DeepseekV41Encoding().render_conversation(conversation).prompt
 
 
+def repeat_fraction(tokens, n: int = 4) -> float:
+    seen, repeats = set(), 0
+    for t in range(n - 1, len(tokens)):
+        gram = tuple(tokens[t + 1 - n:t + 1])
+        repeats += gram in seen
+        seen.add(gram)
+    return repeats / len(tokens) if tokens else 0.0
+
+
 def distinct2(text: str) -> float:
     words = text.split()
     pairs = list(zip(words, words[1:]))
@@ -94,12 +104,14 @@ def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
         text = tok.decode(generated[:-1] if stopped else generated, skip_special_tokens=False)
         rows.append({'prompt': prompt, 'reply': text, 'tokens': len(generated), 'stopped': stopped,
                      'distinct2': round(distinct2(text), 3),
+                     'repeat4': round(repeat_fraction(generated), 3),
                      'tool_markup': any(m in text for m in TOOL_MARKERS),
                      'seconds': round(time.time() - started, 2)})
     n = len(rows)
     summary = {'stop_rate': sum(r['stopped'] for r in rows) / n,
                'mean_tokens': sum(r['tokens'] for r in rows) / n,
                'distinct2': sum(r['distinct2'] for r in rows) / n,
+               'repeat4': sum(r['repeat4'] for r in rows) / n,
                'tool_markup_rate': sum(r['tool_markup'] for r in rows) / n}
     return {'bundle': str(bundle), 'summary': summary, 'samples': rows}
 
@@ -107,7 +119,7 @@ def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
 def to_markdown(results: dict) -> str:
     names = list(results)
     lines = ['| metric | ' + ' | '.join(names) + ' |', '|---|' + '---:|' * len(names)]
-    for key in ('stop_rate', 'mean_tokens', 'distinct2', 'tool_markup_rate'):
+    for key in ('stop_rate', 'mean_tokens', 'distinct2', 'repeat4', 'tool_markup_rate'):
         lines.append(f'| {key} | ' + ' | '.join(f"{results[n]['summary'][key]:.3f}" for n in names) + ' |')
     out = ['\n'.join(lines), '']
     for i, prompt in enumerate(results[names[0]]['samples']):
