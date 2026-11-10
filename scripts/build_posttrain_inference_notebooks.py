@@ -6,7 +6,7 @@ import nbformat as nbf
 from build_cpu_chat_notebook import build_notebook as chat_notebook
 
 ROOT = Path(__file__).resolve().parents[1]
-REF = 'codex/midtrain8k-sft16k'
+REF = 'main'
 
 
 def md(text):
@@ -78,7 +78,9 @@ def save(name, cells, output_dir):
     return path
 
 
-def build(output_dir=ROOT / 'notebooks'):
+def build(output_dir=ROOT / 'notebooks', *, ref=REF):
+    global REF
+    REF = ref
     export = save('export_sft_safetensors_cpu', [
         md('''
         # Export the completed SFT model to safetensors (CPU)
@@ -193,6 +195,9 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
     prompt_ids = backend.tokenizer.encode_request(prepared)
     check_context(prompt_ids, max_tokens)
     _, raw = backend.complete_protocol("chat_completions", payload)''')
+    # Sampling settings used in the chat evaluation (T=0.7, top-p 0.9); DSpark mode stays greedy.
+    helpers = helpers.replace('else 1.0', 'else 0.7').replace('"top_p": 0.95', '"top_p": 0.9')
+    assert 'else 0.7' in helpers and '"top_p": 0.9' in helpers
     inference = save('sft_inference_cpu', [
         md('''
         # Run the trained 32K SFT model on CPU
@@ -209,9 +214,12 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
         '''),
         code(f'''SOURCE_REF = {REF!r}
 MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/input
-DEVICE = 'cpu'  # 'cuda' on a GPU session; benchmark throughput on your hardware
+DEVICE = 'auto'  # 'auto' = cuda when a GPU is attached, else cpu
 PREFILL_CHUNK_SIZE = 32
-USE_MTP = False  # requires a bundle from the DSpark distillation notebook
+# DSpark speculative decoding (greedy only). 'auto' enables it on a GPU when the bundle
+# has a trained draft head: on a T4 it measured 1.00-1.39x faster (mean ~1.15x); on CPU
+# it measured slower, so it stays off there. True/False force it.
+USE_MTP = 'auto'
 '''),
         bootstrap(),
         code('''
@@ -231,9 +239,15 @@ USE_MTP = False  # requires a bundle from the DSpark distillation notebook
         config = json.loads((model_root / 'config.json').read_text())
         MAX_CONTEXT = int(config['max_position_embeddings'])
         torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
+        if DEVICE == 'auto':
+            DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+        draft_trained = report.get("dspark_steps", 0) > 0
+        if USE_MTP == 'auto':
+            USE_MTP = DEVICE == 'cuda' and draft_trained
+        print('Device:', DEVICE, '| DSpark speculative decoding:', USE_MTP,
+              f'(draft trained for {report.get("dspark_steps", 0)} updates)')
         backend = NanoDeepSeekProtocolBackend.from_pretrained(model_root, dtype=torch.float32, device=DEVICE)
         from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
-        draft_trained = report.get("dspark_steps", 0) > 0
         backend.session = InferenceSession(backend.model, mtp=USE_MTP,
             draft_trained=draft_trained, prefill_chunk_size=PREFILL_CHUNK_SIZE)
         print('Loaded SFT checkpoint:', report['checkpoint'])

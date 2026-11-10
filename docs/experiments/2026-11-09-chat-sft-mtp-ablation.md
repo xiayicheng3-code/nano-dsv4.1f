@@ -101,17 +101,27 @@ DSpark was distilled from the **frozen** chat baseline on the chat corpus
 both SFT arms showed the MTP-trained head's head start (8% vs 4% initial overlap) vanishing by
 update 100, so MTP-in-SFT also did not help the draft head.
 
-### Measured decoding speed (CPU, 4 threads, 128 greedy tokens, 4 chat prompts)
+### Measured decoding speed
 
-| decoder | tokens/s | backbone calls / 128 tokens | accepted drafts |
+128 greedy tokens per prompt, 4 chat prompts. The verifier was fixed between the two CPU rows:
+the target's known next token now opens each draft block, and a rejected draft's correction is
+verified as the next block's first token instead of taking its own target step.
+
+| setting | plain decoding | DSpark (batched verification) | tokens per target call |
 |---|---:|---:|---:|
-| plain cached decoding | 60–65 | 127 | – |
-| DSpark, sequential verification | 51–56 | 127 | 51–62 / 128 |
-| DSpark, batched verification | 38–54 | 102–126 | 51–62 / 128 |
+| CPU, original verifier | 60–65 tok/s | 38–54 tok/s (0.58–0.85×) | 1.02–1.25 |
+| CPU, fixed verifier | 50–51 tok/s¹ | 25–38 tok/s (0.51–0.75×) | 1.15–1.64 |
+| **T4 GPU, fixed verifier** | 16.8–17.6 tok/s | 16.8–23.7 tok/s (**1.00–1.39×, mean ~1.15×**) | 1.15–1.64 |
 
-Speculative decoding is currently **slower** than plain decoding, for two reasons. Acceptance
-falls off after the first draft position, so a batch averages under 2 emitted tokens, while it
-pays for a 5-token verification pass and the draft pass. In addition, after every rejection
-`session.py` runs a separate backbone step for the replacement token instead of folding it into the
-next verification block, which standard speculative decoding does. Fixing that verifier and
-training the head longer are the two levers; until then the chat notebook decodes without DSpark.
+¹ Slower machine than the first CPU row; compare ratios, not absolute rates.
+
+Outputs are identical to plain greedy decoding in every case. On CPU a 5-token verification pass
+costs about two single steps (37 vs 19 ms) and drafting another 7 ms, so a round would have to
+emit more than ~2.3 tokens to pay off. On the GPU the eager runtime is launch-bound, so a
+5-token pass costs about the same as one token, and the saved target calls translate directly
+into speed. Absolute GPU throughput is low because the eager Torch runtime is dominated by
+per-op overhead at this model size. The chat notebook therefore enables DSpark automatically on
+a GPU with a trained draft head, and leaves it off on CPU.
+
+The remaining lever is draft quality: accepted drafts beyond the known token average only
+0.15–0.64 per round, and the head was still improving when distillation stopped.
