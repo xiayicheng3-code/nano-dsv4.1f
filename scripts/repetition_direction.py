@@ -19,6 +19,17 @@ two layers. This script implements a standard, inspectable version of that idea:
     direction r, and remove a fraction alpha of that component: ``w <- w - alpha (w . r) r``.
     Everything else is byte-identical; the bundle manifest is re-hashed and records the edit.
 
+``collect --label onset``
+    The default labels mark every repeat-completing token, so 3/4 of positive positions sit deep
+    inside loops. ``onset`` instead marks the tokens of the first repeated n-gram of each loop (a
+    run of >= ``min_run`` repeat tokens) against fresh tokens far from any loop, and reports the
+    model's top-1 probability and margin at those positions.
+
+``steer``
+    Causality test before any weight edit: apply ablation or subtraction of the direction to the
+    FFN outputs at inference time (plus a norm-matched random-direction control), then sample the
+    fixed chat prompts and score held-out replies under each intervention.
+
 ``nll``
     Teacher-forced loss of reference smol-smoltalk replies for several bundles on the same
     held-out pairs (disjoint from the collect prompts), to check what an edit costs.
@@ -83,6 +94,52 @@ class FFNRecorder:
         self.module.apply_moe = self.original
 
 
+def onset_labels(tokens: list[int], n: int, min_run: int, margin: int = 8) -> np.ndarray:
+    """1 = token belongs to the first repeated n-gram of a loop (the copy is starting),
+    0 = fresh token at least ``margin`` tokens away from any loop, -1 = excluded."""
+    from chat_samples import loop_runs
+    rep = repeat_labels(tokens, n)
+    runs = loop_runs(rep, min_run)
+    labels = np.full(len(tokens), -1, dtype=np.int8)
+    near = np.zeros(len(tokens), dtype=bool)
+    for start, stop in runs:
+        near[max(0, start - n + 1 - margin):min(len(tokens), stop + margin)] = True
+    labels[~rep & ~near] = 0
+    for start, _ in runs:
+        labels[max(0, start - n + 1):start + 1] = 1
+    return labels
+
+
+class FFNSteer:
+    """Edit every layer's FFN output at inference time along unit directions r_l.
+
+    ``ablate``: out <- out - alpha (out . r) r.  ``subtract``: out <- out - beta * scale_l * r,
+    with scale_l the class-mean gap measured by ``collect``.
+    """
+
+    def __init__(self, directions: dict[int, torch.Tensor], *, mode: str, strength: float,
+                 scales: dict[int, float] | None = None):
+        from nano_dsv41f.vllm_v41_cpu import model as runtime_model
+        self.module, self.original = runtime_model, runtime_model.apply_moe
+        self.directions, self.mode, self.strength, self.scales = directions, mode, strength, scales or {}
+
+    def __enter__(self):
+        def wrapped(model, x, layer_id=None, **kw):
+            out = self.original(model, x, layer_id, **kw)
+            r = self.directions.get(layer_id)
+            if r is None:
+                return out
+            r = r.to(out.device, out.dtype)
+            if self.mode == "ablate":
+                return out - self.strength * (out @ r)[..., None] * r
+            return out - self.strength * self.scales[layer_id] * r
+        self.module.apply_moe = wrapped
+        return self
+
+    def __exit__(self, *exc):
+        self.module.apply_moe = self.original
+
+
 @torch.inference_mode()
 def collect(args):
     from tokenizers import Tokenizer
@@ -96,7 +153,7 @@ def collect(args):
     prompts = load_prompts(args.prompts, args.skip, args.seed)
     session = InferenceSession(model)
     feats = {i: [] for i in range(model.config.n_layers)}
-    labels, groups, reps = [], [], []
+    labels, groups, reps, conf = [], [], [], []
     for p_index, prompt in enumerate(prompts):
         ids = tok.encode(render_prompt(prompt), add_special_tokens=False).ids
         session.reset()
@@ -105,28 +162,40 @@ def collect(args):
         reply = out[0, len(ids):].tolist()
         if len(reply) < args.ngram + 2:
             continue
-        lab = repeat_labels(reply, args.ngram)
-        reps.append(float(lab.mean()))
+        rep = repeat_labels(reply, args.ngram)
+        lab = rep.astype(np.int8) if args.label == "repeat" else onset_labels(reply, args.ngram, args.min_run)
+        reps.append(float(rep.mean()))
         full = torch.tensor([ids + reply], device=model.device)
         with FFNRecorder() as rec:
-            model.forward(full, compute_indexer=False, sparse_retrieval=False)
+            logits, _ = model.forward(full, compute_indexer=False, sparse_retrieval=False)
         # The activation at absolute position j predicts token j+1. Reply token t sits at
         # len(ids)+t, so it is predicted from position len(ids)+t-1.
         pos = len(ids) - 1 + np.arange(len(reply))
+        top2 = torch.softmax(logits[0, pos].float(), -1).topk(2, -1).values.cpu().numpy()
+        conf.append(np.stack([top2[:, 0], top2[:, 0] - top2[:, 1], rep], 1))
         for layer, value in rec.outputs.items():
             feats[layer].append(value[0, pos].cpu().numpy())
         labels.append(lab)
         groups.append(np.full(len(reply), p_index))
         if (p_index + 1) % 16 == 0:
             print(f"{p_index + 1}/{len(prompts)} prompts, mean repeat rate {np.mean(reps):.3f}", flush=True)
-    y = np.concatenate(labels)
-    g = np.concatenate(groups)
+    y_all = np.concatenate(labels)
+    g_all = np.concatenate(groups)
+    c_all = np.concatenate(conf)
+    keep = y_all >= 0
+    y, g = y_all[keep].astype(bool), g_all[keep]
     held = (g % 4) == 3  # every 4th prompt is held out for measuring separation
-    report = {"prompts": len(labels), "positions": int(y.size), "repeat_fraction": float(y.mean()),
-              "ngram": args.ngram, "layers": {}}
+    report = {"label": args.label, "prompts": len(labels), "prompts_requested": args.prompts, "positions": int(y.size),
+              "positive_fraction": float(y.mean()), "positive_positions": int(y.sum()),
+              "repeat_fraction": float(np.mean(reps)), "ngram": args.ngram, "min_run": args.min_run,
+              "layers": {}}
+    # How confident is the model where it enters, continues or avoids a loop? (top-1 prob, top1-top2)
+    classes = {"positive": y_all == 1, "negative": y_all == 0, "repeat_any": c_all[:, 2] == 1}
+    report["confidence"] = {k: {"top1_prob": float(c_all[m, 0].mean()), "top1_margin": float(c_all[m, 1].mean()),
+                                "positions": int(m.sum())} for k, m in classes.items() if m.any()}
     directions = {}
     for layer, chunks in feats.items():
-        x = np.concatenate(chunks)
+        x = np.concatenate(chunks)[keep]
         mu_pos, mu_neg = x[~held & y].mean(0), x[~held & ~y].mean(0)
         r = mu_pos - mu_neg
         r_unit = r / np.linalg.norm(r)
@@ -160,11 +229,25 @@ def load_pairs(count: int, seed: int, exclude: set[str]) -> list[tuple[str, str]
 
 
 @torch.inference_mode()
+def reply_nll(model, tok, pairs) -> dict:
+    from chat_samples import render_prompt
+    from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
+    total, count = 0.0, 0
+    for user, reply in pairs:
+        prompt = tok.encode(render_prompt(user), add_special_tokens=False).ids
+        target = tok.encode(reply, add_special_tokens=False).ids + [EOS_TOKEN_ID]
+        ids = torch.tensor([prompt + target], device=model.device)
+        logits, _ = model.forward(ids)
+        logp = torch.log_softmax(logits[0, len(prompt) - 1:-1].float(), -1)
+        total -= float(logp.gather(-1, ids[0, len(prompt):, None]).sum())
+        count += len(target)
+    return {"nll": total / count, "tokens": count, "pairs": len(pairs)}
+
+
+@torch.inference_mode()
 def nll(args):
     """Teacher-forced NLL of reference replies (+EOS) for each bundle on identical held-out pairs."""
     from tokenizers import Tokenizer
-    from chat_samples import render_prompt
-    from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
     from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
 
     exclude = set(load_prompts(args.exclude_prompts, 0, 0))
@@ -174,20 +257,66 @@ def nll(args):
         name, path = spec.split("=", 1)
         model = NanoDeepseekV41CPU.from_pretrained(Path(path), device=args.device, dtype=torch.float32)
         tok = Tokenizer.from_file(str(Path(path) / "tokenizer.json"))
-        total, count = 0.0, 0
-        for user, reply in pairs:
-            prompt = tok.encode(render_prompt(user), add_special_tokens=False).ids
-            target = tok.encode(reply, add_special_tokens=False).ids + [EOS_TOKEN_ID]
-            ids = torch.tensor([prompt + target], device=model.device)
-            logits, _ = model.forward(ids)
-            logp = torch.log_softmax(logits[0, len(prompt) - 1:-1].float(), -1)
-            total -= float(logp.gather(-1, ids[0, len(prompt):, None]).sum())
-            count += len(target)
-        results[name] = {"nll": total / count, "tokens": count, "pairs": len(pairs)}
+        results[name] = reply_nll(model, tok, pairs)
         print(name, json.dumps(results[name]), flush=True)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(results, indent=2))
+
+
+def steer_configs(report: dict, layers: list[int]) -> list[dict]:
+    """Inference-time interventions compared by ``steer``; ``random_*`` are matched random-direction controls."""
+    return ([{"name": "none"}]
+            + [{"name": f"ablate_L{'-'.join(map(str, layers))}", "mode": "ablate", "strength": 1.0, "layers": layers},
+               {"name": "ablate_all", "mode": "ablate", "strength": 1.0, "layers": sorted(map(int, report["layers"]))}]
+            + [{"name": f"subtract_x{b:g}", "mode": "subtract", "strength": b, "layers": layers} for b in (1, 2, 4)]
+            + [{"name": f"random_subtract_x{b:g}", "mode": "subtract", "strength": b, "layers": layers, "random": True}
+               for b in (1, 2, 4)]
+            + [{"name": "random_ablate_all", "mode": "ablate", "strength": 1.0, "random": True,
+                "layers": sorted(map(int, report["layers"]))}])
+
+
+@torch.inference_mode()
+def steer(args):
+    """Causality test: apply each intervention at inference time, then sample and score."""
+    from tokenizers import Tokenizer
+    from chat_samples import PROMPTS, sample_bundle
+    from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
+
+    report = json.loads((args.directions / "collect_report.json").read_text())
+    raw = np.load(args.directions / "directions.npz")
+    ranked = sorted(report["layers"], key=lambda l: -report["layers"][l]["cohens_d_heldout"])
+    layers = args.layers or [int(l) for l in ranked[:2]]
+    configs = [c for c in steer_configs(report, layers) if not args.only or c["name"] in args.only]
+    model = NanoDeepseekV41CPU.from_pretrained(args.bundle, device=args.device, dtype=torch.float32)
+    tok = Tokenizer.from_file(str(args.bundle / "tokenizer.json"))
+    pairs = load_pairs(args.pairs, args.nll_seed, set(load_prompts(report["prompts_requested"], 0, 0))) \
+        if args.pairs else []
+    prompts = PROMPTS[:args.limit] if args.limit else PROMPTS
+    args.output.mkdir(parents=True, exist_ok=True)
+    results = {"layers": layers, "directions_sha256": sha256(args.directions / "directions.npz"), "configs": {}}
+    for cfg in configs:
+        dirs, scales = {}, {}
+        for l in cfg.get("layers", []):
+            r = raw[f"layer{l}"]
+            if cfg.get("random"):
+                r = np.random.default_rng(1000 + l).standard_normal(r.shape).astype(np.float32)
+                r /= np.linalg.norm(r)
+            dirs[l] = torch.from_numpy(r)
+            scales[l] = report["layers"][str(l)]["raw_norm"]
+        steer_ctx = FFNSteer(dirs, mode=cfg.get("mode", "ablate"), strength=cfg.get("strength", 0.0), scales=scales)
+        row = {"config": cfg}
+        with steer_ctx:
+            for mode, temp, top_p in (("greedy", 0.0, 1.0), ("t07", 0.7, 0.9)):
+                res = sample_bundle(args.bundle, prompts, device=args.device, max_new_tokens=args.max_new_tokens,
+                                    temperature=temp, top_p=top_p, seed=0, model=model)
+                row[mode] = res
+                print(cfg["name"], mode, json.dumps(res["summary"]), flush=True)
+            if pairs:
+                row["nll"] = reply_nll(model, tok, pairs)
+                print(cfg["name"], "nll", json.dumps(row["nll"]), flush=True)
+        results["configs"][cfg["name"]] = row
+        (args.output / "steer_results.json").write_text(json.dumps(results, indent=2, ensure_ascii=False))
 
 
 def sha256(path: Path) -> str:
@@ -257,6 +386,9 @@ def main():
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--max-new-tokens", type=int, default=192)
     c.add_argument("--ngram", type=int, default=4)
+    c.add_argument("--label", choices=("repeat", "onset"), default="repeat",
+                   help="repeat: any repeat-completing token vs fresh; onset: loop entry vs fresh text")
+    c.add_argument("--min-run", type=int, default=8, help="onset: repeat run length that counts as a loop")
     c.add_argument("--device", default="cpu")
     e = sub.add_parser("edit")
     e.add_argument("--bundle", type=Path, required=True)
@@ -272,8 +404,19 @@ def main():
     n.add_argument("--exclude-prompts", type=int, default=96, help="collect prompts to exclude")
     n.add_argument("--device", default="cpu")
     n.add_argument("--output", type=Path)
+    s = sub.add_parser("steer")
+    s.add_argument("--bundle", type=Path, required=True)
+    s.add_argument("--directions", type=Path, required=True, help="collect output directory")
+    s.add_argument("--layers", type=int, nargs="*", default=None, help="default: top-2 by held-out d")
+    s.add_argument("--only", nargs="*", default=None, help="subset of config names")
+    s.add_argument("--limit", type=int, default=0)
+    s.add_argument("--max-new-tokens", type=int, default=192)
+    s.add_argument("--pairs", type=int, default=200)
+    s.add_argument("--nll-seed", type=int, default=1)
+    s.add_argument("--device", default="cpu")
+    s.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
-    {"collect": collect, "edit": edit, "nll": nll}[a.cmd](a)
+    {"collect": collect, "edit": edit, "nll": nll, "steer": steer}[a.cmd](a)
 
 
 if __name__ == "__main__":

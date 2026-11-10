@@ -10,7 +10,9 @@ regressions such as runaway generation, repetition or stray tool-call markup vis
 - mean_tokens: reply length;
 - distinct2: unique / total word bigrams inside a reply (low = repetitive);
 - tool_markup_rate: replies containing DSML/tool-call markup although no tools exist;
-- repeat4: share of reply tokens that complete a token 4-gram already present in the reply.
+- repeat4: share of reply tokens that complete a token 4-gram already present in the reply;
+- loop_rate / median_first_loop: replies that enter a loop (a run of >= 8 consecutive
+  repeat4 tokens) and the reply token where the first loop starts (censored at the limit).
 """
 from __future__ import annotations
 
@@ -75,6 +77,30 @@ def repeat_fraction(tokens, n: int = 4) -> float:
     return repeats / len(tokens) if tokens else 0.0
 
 
+def repeat_labels(tokens, n: int = 4) -> list[bool]:
+    """labels[t] is True when tokens[t] completes an n-gram that occurred earlier."""
+    seen, labels = set(), []
+    for t in range(len(tokens)):
+        gram = tuple(tokens[max(0, t + 1 - n):t + 1])
+        labels.append(t + 1 >= n and gram in seen)
+        if t + 1 >= n:
+            seen.add(gram)
+    return labels
+
+
+def loop_runs(labels, min_run: int = 8) -> list[tuple[int, int]]:
+    """[start, end) spans of >= min_run consecutive repeat labels (a loop)."""
+    runs, start = [], None
+    for t, flag in enumerate(list(labels) + [False]):
+        if flag and start is None:
+            start = t
+        elif not flag and start is not None:
+            if t - start >= min_run:
+                runs.append((start, t))
+            start = None
+    return runs
+
+
 def distinct2(text: str) -> float:
     words = text.split()
     pairs = list(zip(words, words[1:]))
@@ -82,13 +108,14 @@ def distinct2(text: str) -> float:
 
 
 def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
-                  temperature: float = 0.0, top_p: float = 1.0, seed: int = 0):
+                  temperature: float = 0.0, top_p: float = 1.0, seed: int = 0, model=None):
     from tokenizers import Tokenizer
     from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
     from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
     from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
 
-    model = NanoDeepseekV41CPU.from_pretrained(bundle, device=device, dtype=torch.float32)
+    if model is None:
+        model = NanoDeepseekV41CPU.from_pretrained(bundle, device=device, dtype=torch.float32)
     tok = Tokenizer.from_file(str(bundle / 'tokenizer.json'))
     session = InferenceSession(model)
     rows = []
@@ -102,25 +129,31 @@ def sample_bundle(bundle: Path, prompts, *, device: str, max_new_tokens: int,
         generated = out[0, len(ids):].tolist()
         stopped = bool(generated) and generated[-1] == EOS_TOKEN_ID
         text = tok.decode(generated[:-1] if stopped else generated, skip_special_tokens=False)
+        runs = loop_runs(repeat_labels(generated))
         rows.append({'prompt': prompt, 'reply': text, 'tokens': len(generated), 'stopped': stopped,
                      'distinct2': round(distinct2(text), 3),
                      'repeat4': round(repeat_fraction(generated), 3),
                      'tool_markup': any(m in text for m in TOOL_MARKERS),
+                     'first_loop': runs[0][0] if runs else len(generated), 'loops': len(runs),
                      'seconds': round(time.time() - started, 2)})
     n = len(rows)
     summary = {'stop_rate': sum(r['stopped'] for r in rows) / n,
                'mean_tokens': sum(r['tokens'] for r in rows) / n,
                'distinct2': sum(r['distinct2'] for r in rows) / n,
                'repeat4': sum(r['repeat4'] for r in rows) / n,
-               'tool_markup_rate': sum(r['tool_markup'] for r in rows) / n}
+               'tool_markup_rate': sum(r['tool_markup'] for r in rows) / n,
+               'loop_rate': sum(r['loops'] > 0 for r in rows) / n,
+               'median_first_loop': float(sorted(r['first_loop'] for r in rows)[n // 2])}
     return {'bundle': str(bundle), 'summary': summary, 'samples': rows}
 
 
 def to_markdown(results: dict) -> str:
     names = list(results)
     lines = ['| metric | ' + ' | '.join(names) + ' |', '|---|' + '---:|' * len(names)]
-    for key in ('stop_rate', 'mean_tokens', 'distinct2', 'repeat4', 'tool_markup_rate'):
-        lines.append(f'| {key} | ' + ' | '.join(f"{results[n]['summary'][key]:.3f}" for n in names) + ' |')
+    for key in ('stop_rate', 'mean_tokens', 'distinct2', 'repeat4', 'tool_markup_rate', 'loop_rate',
+                'median_first_loop'):
+        if all(key in results[n]['summary'] for n in names):
+            lines.append(f'| {key} | ' + ' | '.join(f"{results[n]['summary'][key]:.3f}" for n in names) + ' |')
     out = ['\n'.join(lines), '']
     for i, prompt in enumerate(results[names[0]]['samples']):
         out.append(f"### {i + 1}. {prompt['prompt']}\n")
