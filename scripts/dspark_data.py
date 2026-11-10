@@ -10,13 +10,15 @@ from nano_dsv41f.portable_bundle import sha256_file
 class SFTDraftData:
     def __init__(self, root, *, tokenizer_sha256, block_size, seq_len=512, anchors=8, seed=1701):
         root = Path(root)
-        matches = list(root.rglob('posttrain_manifest.json'))
+        matches = list(root.rglob('posttrain_manifest.json')) + list(root.rglob('chat_sft_manifest.json'))
         if len(matches) != 1:
             raise ValueError('Set CORPUS_DIR to exactly one prepared SFT corpus')
         self.root = matches[0].parent
         self.manifest = json.loads(matches[0].read_text())
-        if self.manifest.get('format') != 'nano-dsv41f-posttrain-v3' or not self.manifest.get('complete'):
-            raise ValueError('A complete format-v3 SFT corpus is required')
+        chat = matches[0].name == 'chat_sft_manifest.json'
+        expected = 'nano-dsv41f-chat-sft-v1' if chat else 'nano-dsv41f-posttrain-v3'
+        if self.manifest.get('format') != expected or not self.manifest.get('complete'):
+            raise ValueError('A complete format-v3 SFT corpus or chat SFT corpus is required')
         if self.manifest['identity']['tokenizer_sha256'] != tokenizer_sha256 or sha256_file(self.root/'tokenizer.json') != tokenizer_sha256:
             raise ValueError('Corpus tokenizer differs from the frozen model')
         if block_size < 1 or seq_len < block_size+2 or anchors < 1:
@@ -25,7 +27,18 @@ class SFTDraftData:
         self.block_size, self.seq_len, self.anchors, self.seed = block_size, seq_len, anchors, seed
         self.catalog = {'train': [], 'validation': []}
         self.cache = OrderedDict()
-        for source in self.manifest['sources']:
+        if chat:
+            # One chat pool; `prepare_chat_sft_corpus.py` layout.
+            self.pool_mix = {'chat': 1.0}
+            for split in self.catalog:
+                for info in self.manifest['splits'][split]['shards']:
+                    path = self.root / 'sft' / 'chat' / split / info['file']
+                    if not path.resolve().is_relative_to(self.root.resolve()):
+                        raise ValueError('Invalid corpus shard path')
+                    self.catalog[split].append((path, info, 'chat'))
+        else:
+            self.pool_mix = self.manifest['pool_mix']['sft']
+        for source in ([] if chat else self.manifest['sources']):
             key = source['source']['key']
             for split in self.catalog:
                 for info in source['views']['sft'][split]['shards']:
@@ -64,7 +77,7 @@ class SFTDraftData:
         # Index-derived RNG makes training and resume independent of validation calls.
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, index, int(split == 'validation')]))
         entries = self.catalog[split]
-        mix = self.manifest['pool_mix']['sft']
+        mix = self.pool_mix
         pools = sorted({pool for _, _, pool in entries})
         weights = np.asarray([mix[p] for p in pools], dtype=float)
         weights /= weights.sum()

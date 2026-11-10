@@ -115,12 +115,18 @@ class InferenceSession:
             if self.mtp:
                 from .dspark import draft_block
                 draft_start = self._clock()
-                proposals = draft_block(self.model, self.cache)[0].tolist()
+                # MTP decoding is greedy, so the target's next token is already known
+                # from `next_logits` (after a rejection it is the previous round's
+                # correction). Pinning it as position 1 means every verification pass
+                # emits at least one token, and the correction never needs its own
+                # target step: its KV is written by the next verification block.
+                known = int(self.cache.next_logits.argmax(-1).item())
+                proposals = draft_block(self.model, self.cache, first_token=known)[0].tolist()
+                proposals[0] = known
                 proposals = proposals[:max_new_tokens - len(output)]
                 draft_seconds += self._clock() - draft_start
-                proposed += len(proposals)
+                proposed += len(proposals) - 1  # drafted positions only
             if (self.mtp and self.mtp_verifier == "batched" and len(proposals) > 1
-                    and proposals[0] == int(self.cache.next_logits.argmax(-1).item())
                     and proposals[0] != eos_token_id):
                 from .decode_cache import CacheTransaction
                 batch_start = self._clock()
@@ -140,31 +146,23 @@ class InferenceSession:
                 prefix = 0
                 while prefix < len(proposals) and proposals[prefix] == predictions[prefix]:
                     prefix += 1
+                # prefix >= 1: position 1 is the target's own token. A rejected draft's
+                # correction is predictions[prefix]; it is emitted by the next round.
                 emitted = proposals[:prefix]
-                if prefix < len(proposals):
-                    emitted.append(predictions[prefix])
                 if eos_token_id in emitted:
                     emitted = emitted[:emitted.index(eos_token_id)+1]
                     stopped = True
                 output.extend(emitted)
-                verified += len(emitted)
-                accepted += min(prefix, len(emitted))
+                accepted += len(emitted) - 1
+                verified += len(emitted) - 1 + int(prefix < len(proposals) and not stopped)
                 # At termination retain all but the final output token, matching
                 # ordinary decoding and allowing a later prompt to resume it.
-                keep = min(prefix, len(emitted))
+                keep = len(emitted)
                 if stopped or len(output) == max_new_tokens:
-                    keep = min(keep, len(emitted)-1)
+                    keep -= 1
                 rollback_start = self._clock()
                 transaction.commit(keep, logits)
                 rollback_seconds += self._clock() - rollback_start
-                if not stopped and len(output) < max_new_tokens and prefix < len(emitted):
-                    # Only the replacement token needs a fresh target step.
-                    target_start = self._clock()
-                    self.model.forward_step(ids.new_tensor([[emitted[-1]]]), self.cache,
-                        sparse_retrieval=sparse_retrieval)
-                    verify_seconds += self._clock() - target_start
-                    target_calls += 1
-                    target_tokens += 1
                 elapsed = self._clock() - batch_start
                 batch_times.append(elapsed)
                 batch_tokens.append(len(emitted))
@@ -179,7 +177,7 @@ class InferenceSession:
                     temperature=temperature, top_p=top_p)
                 token = int(next_id.item())
                 match = bool(proposals) and token == proposals[i]
-                if proposals:
+                if proposals and i > 0:  # position 1 is the known target token, not a draft
                     verified += 1
                     accepted += int(match)
                 output.append(token)

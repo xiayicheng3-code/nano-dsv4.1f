@@ -107,7 +107,7 @@ def test_batched_mtp_greedy_rejection_eos_budget_and_continuation(model, monkeyp
     if eos is not None:
         end = expected[0, prompt.shape[1]:].tolist().index(eos)+1
         expected = expected[:, :prompt.shape[1]+end]
-    def proposal(model, cache):
+    def proposal(model, cache, **kwargs):
         # Test-only controlled proposals. Compute the full greedy reference so
         # the fixture also works on a later independent conversation.
         continuation = model.generate(cache.input_ids.clone(), max_new_tokens=3)[:, -3:]
@@ -140,7 +140,7 @@ def test_prefill_calls_are_chunks_and_speculative_failure_invalidates(model, mon
     with pytest.raises(ValueError, match='positive integer'):
         InferenceSession(model, prefill_chunk_size=0)
     mtp = InferenceSession(model, mtp=True, allow_untrained_draft=True)
-    def propose(model, cache):
+    def propose(model, cache, **kwargs):
         return cache.next_logits.argmax(-1, keepdim=True).expand(1, 3)
     monkeypatch.setattr('nano_dsv41f.vllm_v41_cpu.dspark.draft_block', propose)
     def fail(ids, cache=None, **kwargs):

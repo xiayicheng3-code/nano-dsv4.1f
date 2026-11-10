@@ -6,7 +6,7 @@ import nbformat as nbf
 from build_cpu_chat_notebook import build_notebook as chat_notebook
 
 ROOT = Path(__file__).resolve().parents[1]
-REF = 'codex/midtrain8k-sft16k'
+REF = 'main'
 
 
 def md(text):
@@ -64,6 +64,50 @@ REPO = EXPORT_WORK / 'source'
     return cell
 
 
+THINKING_WARNING = (
+    '    if thinking:\n'
+    '        print("Warning: thinking mode and reasoning_effort are not functional on this "\n'
+    '              "checkpoint; replies usually never leave the reasoning block.")\n')
+
+CHAT_CONTROLS_MD = """## Chat here
+
+The next cell creates a small in-notebook chat control. Type a message and press
+**Send**; the conversation history is preserved until you press **Reset**.
+Input, Send, Reset, and Max tokens are locked while a response is being generated.
+
+Replies are sampled (temperature 0.7, top-p 0.9). Thinking mode and reasoning effort
+are not offered: on this checkpoint, thinking-mode replies did not finish their
+reasoning or answer at any effort level, so chat always uses non-thinking mode.
+"""
+
+
+def without_thinking_controls(source):
+    """Derive the shared chat widget without Thinking/effort controls (checked edits)."""
+    def cut(text, start, end):
+        i, j = text.index(start), text.index(end)
+        assert i < j, (start, end)
+        return text[:i] + text[j:]
+    source = cut(source, 'thinking_box = widgets.Checkbox', 'max_tokens_box = widgets.BoundedIntText')
+    source = cut(source, 'def _update_effort_controls', 'def _set_busy')
+    edits = [
+        ('for control in (message_box, thinking_box, max_tokens_box, send_button, reset_button):',
+         'for control in (message_box, max_tokens_box, send_button, reset_button):'),
+        ('    _update_effort_controls()\n', ''),
+        ('settings = dict(thinking=thinking_box.value,\n'
+         '                    reasoning_effort=custom_effort_box.value,\n'
+         '                    max_tokens=max_tokens_box.value)',
+         'settings = dict(max_tokens=max_tokens_box.value)'),
+        ('thinking_box.observe(_update_effort_controls, names="value")\n', ''),
+        ('effort_box.observe(_update_effort_controls, names="value")\n', ''),
+        ('        widgets.HBox([thinking_box, effort_box, custom_effort_box]),\n', ''),
+    ]
+    for old, new in edits:
+        assert old in source, old[:60]
+        source = source.replace(old, new)
+    assert 'thinking_box' not in source and 'effort_box' not in source
+    return source
+
+
 def save(name, cells, output_dir):
     nb = nbf.v4.new_notebook(cells=cells)
     nb.metadata.kernelspec = {'display_name': 'Python 3', 'language': 'python', 'name': 'python3'}
@@ -78,7 +122,9 @@ def save(name, cells, output_dir):
     return path
 
 
-def build(output_dir=ROOT / 'notebooks'):
+def build(output_dir=ROOT / 'notebooks', *, ref=REF):
+    global REF
+    REF = ref
     export = save('export_sft_safetensors_cpu', [
         md('''
         # Export the completed SFT model to safetensors (CPU)
@@ -193,6 +239,16 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
     prompt_ids = backend.tokenizer.encode_request(prepared)
     check_context(prompt_ids, max_tokens)
     _, raw = backend.complete_protocol("chat_completions", payload)''')
+    # Sampling settings used in the chat evaluation (T=0.7, top-p 0.9); DSpark mode stays greedy.
+    helpers = helpers.replace('else 1.0', 'else 0.7').replace('"top_p": 0.95', '"top_p": 0.9')
+    assert 'else 0.7' in helpers and '"top_p": 0.9' in helpers
+    # Thinking mode is not functional on the chat checkpoint (no thinking-mode reply
+    # closed its reasoning and answered, at any effort; effort did not change reasoning
+    # length). Keep the protocol argument, default it off, and warn when it is used.
+    marker = 'def chat(message, *, thinking=False, reasoning_effort="high", max_tokens=128, temperature=None):\n'
+    assert marker in helpers
+    helpers = helpers.replace(marker, marker + THINKING_WARNING)
+    chat_controls = without_thinking_controls(demo.cells[7].source)
     inference = save('sft_inference_cpu', [
         md('''
         # Run the trained 32K SFT model on CPU
@@ -209,9 +265,13 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
         '''),
         code(f'''SOURCE_REF = {REF!r}
 MODEL_DIR = ''  # blank: locate exactly one exported SFT bundle under /kaggle/input
-DEVICE = 'cpu'  # 'cuda' on a GPU session; benchmark throughput on your hardware
+DEVICE = 'auto'  # 'auto' = cuda when a GPU is attached, else cpu
 PREFILL_CHUNK_SIZE = 32
-USE_MTP = False  # requires a bundle from the DSpark distillation notebook
+# DSpark speculative decoding verifies greedy decoding only. With a trained draft head on a
+# T4 it measured 1.00-1.39x faster (mean ~1.15x); on CPU it measured slower. Greedy replies
+# from this small model loop far more than sampled ones (T=0.7), so chat defaults to
+# sampling. Set 'auto' (GPU + trained draft) or True to try the speed-up.
+USE_MTP = False
 '''),
         bootstrap(),
         code('''
@@ -231,9 +291,15 @@ USE_MTP = False  # requires a bundle from the DSpark distillation notebook
         config = json.loads((model_root / 'config.json').read_text())
         MAX_CONTEXT = int(config['max_position_embeddings'])
         torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
+        if DEVICE == 'auto':
+            DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+        draft_trained = report.get("dspark_steps", 0) > 0
+        if USE_MTP == 'auto':
+            USE_MTP = DEVICE == 'cuda' and draft_trained
+        print('Device:', DEVICE, '| DSpark speculative decoding:', USE_MTP,
+              f'(draft trained for {report.get("dspark_steps", 0)} updates)')
         backend = NanoDeepSeekProtocolBackend.from_pretrained(model_root, dtype=torch.float32, device=DEVICE)
         from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
-        draft_trained = report.get("dspark_steps", 0) > 0
         backend.session = InferenceSession(backend.model, mtp=USE_MTP,
             draft_trained=draft_trained, prefill_chunk_size=PREFILL_CHUNK_SIZE)
         print('Loaded SFT checkpoint:', report['checkpoint'])
@@ -253,7 +319,7 @@ USE_MTP = False  # requires a bundle from the DSpark distillation notebook
         print_reply(chat('Hello! Introduce yourself in one sentence.', max_tokens=32))
         reset_chat()
         '''),
-        demo.cells[6], demo.cells[7], demo.cells[8],
+        nbf.v4.new_markdown_cell(CHAT_CONTROLS_MD), code(chat_controls), demo.cells[8],
         md('''
         ## Raw completion and tool output
 

@@ -414,6 +414,8 @@ def compile_pretrain_step(
     include_indexer: bool,
     assistant_only: bool = False,
     n_segments: int | None = None,
+    mtp_weight: float = 0.0,
+    mtp_anchors_per_row: int = 256,
 ):
     """Compile one static base or late-indexer step for the v5e mesh.
 
@@ -444,6 +446,8 @@ def compile_pretrain_step(
             target_mask=targets,
             include_indexer=include_indexer,
             n_segments=n_segments,
+            mtp_weight=mtp_weight,
+            mtp_anchors_per_row=mtp_anchors_per_row,
         )
 
     return jax.jit(

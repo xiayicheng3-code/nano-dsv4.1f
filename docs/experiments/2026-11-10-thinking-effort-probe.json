@@ -1,0 +1,132 @@
+{
+ "max_tokens_384": {
+  "chat": {
+   "10": {
+    "median_reasoning_tokens": 384.0,
+    "mean_reasoning_tokens": 384,
+    "closed_and_answered": 0.0,
+    "hit_limit": 1.0,
+    "tool_calls": 0.0
+   },
+   "50": {
+    "median_reasoning_tokens": 384.0,
+    "mean_reasoning_tokens": 384,
+    "closed_and_answered": 0.0,
+    "hit_limit": 1.0,
+    "tool_calls": 0.0
+   },
+   "100": {
+    "median_reasoning_tokens": 384.0,
+    "mean_reasoning_tokens": 384,
+    "closed_and_answered": 0.0,
+    "hit_limit": 1.0,
+    "tool_calls": 0.0
+   }
+  },
+  "old_sft": {
+   "10": {
+    "median_reasoning_tokens": 384.0,
+    "mean_reasoning_tokens": 384,
+    "closed_and_answered": 0.0,
+    "hit_limit": 1.0,
+    "tool_calls": 0.0
+   },
+   "50": {
+    "median_reasoning_tokens": 384.0,
+    "mean_reasoning_tokens": 375.8,
+    "closed_and_answered": 0.0,
+    "hit_limit": 1.0,
+    "tool_calls": 0.0
+   },
+   "100": {
+    "median_reasoning_tokens": 384.0,
+    "mean_reasoning_tokens": 384,
+    "closed_and_answered": 0.0,
+    "hit_limit": 1.0,
+    "tool_calls": 0.0
+   }
+  }
+ },
+ "max_tokens_1536_chat": {
+  "1": {
+   "median_reasoning_tokens": 1536.0,
+   "mean_reasoning_tokens": 1391.2,
+   "closed_and_answered": 0.0,
+   "hit_limit": 0.75,
+   "tool_calls": 0.0
+  },
+  "100": {
+   "median_reasoning_tokens": 1466.0,
+   "mean_reasoning_tokens": 1457.5,
+   "closed_and_answered": 0.0,
+   "hit_limit": 0.5,
+   "tool_calls": 0.0
+  }
+ },
+ "examples": {
+  "chat": [
+   {
+    "effort": 10,
+    "prompt": "What is 17 * 23?",
+    "finish": "length",
+    "reasoning_tokens": 384,
+    "answered": false,
+    "tool_calls": false,
+    "reasoning": "Okay, let's see. The problem is about finding the largest number that satisfies the equation of the circle with a radius of 1. Let me recall that 17^2 is 3, and then 3 is a constant. So, we have a tangent line that connects the vertices of the circle with the same radius as the original circle. The ",
+    "content": ""
+   },
+   {
+    "effort": 10,
+    "prompt": "If a train travels 60 km in 45 minutes, what is its speed in km/h?",
+    "finish": "length",
+    "reasoning_tokens": 384,
+    "answered": false,
+    "tool_calls": false,
+    "reasoning": "Okay, let's see. The problem is asking for the speed of the train. So, the train travels 90 km in 45 minutes, and the train travels 60 km in 45 minutes. We need to find the speed of the train. Hmm, okay. Let's break it down step by step.\n\nFirst, let's figure out how many km is the speed of the train",
+    "content": ""
+   },
+   {
+    "effort": 10,
+    "prompt": "Is 91 a prime number?",
+    "finish": "length",
+    "reasoning_tokens": 384,
+    "answered": false,
+    "tool_calls": false,
+    "reasoning": "Okay, let's try to figure out this problem. Let me start by writing a radical equation for the problem. The problem says: \"the product of its digits is a power of two.\" So, the product of its digits is a power of two. The sum of its digits is a power of two.\"\n\nThe problem states that the product of ",
+    "content": ""
+   }
+  ],
+  "old_sft": [
+   {
+    "effort": 10,
+    "prompt": "What is 17 * 23?",
+    "finish": "length",
+    "reasoning_tokens": 384,
+    "answered": false,
+    "tool_calls": false,
+    "reasoning": "Okay, so I need to find 17 * 23, which is the set of all integers. The problem states that there are exactly 17 integers in a list, so a<=-1. I need to find all integers in a list that are in the list that satisfy the given criteria. \n\nFirst, I need to find all integers in a list that satisfy the gi",
+    "content": ""
+   },
+   {
+    "effort": 10,
+    "prompt": "If a train travels 60 km in 45 minutes, what is its speed in km/h?",
+    "finish": "length",
+    "reasoning_tokens": 384,
+    "answered": false,
+    "tool_calls": false,
+    "reasoning": "Okay, let's see. The problem is asking for the speed of a train at 90 degrees and the speed of light. Hmm, let me try to figure out this problem step by step.\n\nFirst, let me recall some information about the train's speed. The train's speed is calculated using the formula:\n\nThe average speed is equa",
+    "content": ""
+   },
+   {
+    "effort": 10,
+    "prompt": "Is 91 a prime number?",
+    "finish": "length",
+    "reasoning_tokens": 384,
+    "answered": false,
+    "tool_calls": false,
+    "reasoning": "Okay, let's see. The problem is asking for a number that is divisible by two different primes. The problem is asking for the number of distinct primes that satisfy the equation 1/(a)(n) = (n-1)(n-1)(n-1)(n-1) = n^n - 1. Hmm, let me break this down.\n\nFirst, I remember that when you think of a number ",
+    "content": ""
+   }
+  ]
+ }
+}

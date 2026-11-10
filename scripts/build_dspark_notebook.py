@@ -41,7 +41,7 @@ def build(output=ROOT/'notebooks/nano_dsv41f_dspark_distillation.ipynb'):
     code('''
     SOURCE_REF = 'main'  # durable default for the maintained notebook
     MODEL_DIR = ''  # blank: locate exactly one export_manifest.json under /kaggle/input
-    CORPUS_DIR = ''  # blank: locate exactly one posttrain_manifest.json under /kaggle/input
+    CORPUS_DIR = ''  # blank: locate exactly one posttrain_manifest.json or chat_sft_manifest.json under /kaggle/input
     RESUME = ''  # optional prior run directory, attached under /kaggle/input
     DEVICE = 'cuda'  # one GPU; use cpu for a smoke test
     STEPS = 1000  # total target, including any resumed steps; start with 10 to smoke-test
@@ -102,7 +102,11 @@ def build(output=ROOT/'notebooks/nano_dsv41f_dspark_distillation.ipynb'):
         return found[0].parent
 
     model_root = locate(MODEL_DIR, 'export_manifest.json')
-    corpus_root = locate(CORPUS_DIR, 'posttrain_manifest.json')
+    corpus_matches = [p.parent for name in ('posttrain_manifest.json', 'chat_sft_manifest.json')
+                      for p in (Path(CORPUS_DIR) if CORPUS_DIR else Path('/kaggle/input')).rglob(name)]
+    if len(corpus_matches) != 1:
+        raise ValueError(f'Found {len(corpus_matches)} SFT corpora; set CORPUS_DIR explicitly')
+    corpus_root = corpus_matches[0]
     verified = verify_portable_bundle(model_root)
     if DEVICE == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('Enable a Kaggle GPU accelerator or set DEVICE=cpu')

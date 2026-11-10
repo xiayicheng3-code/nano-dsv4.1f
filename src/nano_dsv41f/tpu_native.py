@@ -644,6 +644,8 @@ def compile_pretrain_step_native(
     assistant_only: bool = False,
     n_segments: int | None = None,
     native_config: TPUNativeConfig | None = None,
+    mtp_weight: float = 0.0,
+    mtp_anchors_per_row: int = 256,
 ):
     """Build the ordinary static pretrain executable under the v5e-native backend."""
     from .config import RematConfig
@@ -673,5 +675,7 @@ def compile_pretrain_step_native(
         include_indexer=include_indexer,
         assistant_only=assistant_only,
         n_segments=n_segments,
+        mtp_weight=mtp_weight,
+        mtp_anchors_per_row=mtp_anchors_per_row,
     )
     return NativeCompiledStep(jitted, mesh, options)

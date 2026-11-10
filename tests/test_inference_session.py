@@ -126,7 +126,7 @@ def test_mtp_verification_preserves_target_and_counts_acceptance(draft_model, mo
     _, _, model = draft_model
     prompt = torch.tensor([[1, 3, 5, 7]])
     expected = model.generate(prompt, max_new_tokens=6)
-    def propose(model, cache):
+    def propose(model, cache, **kwargs):
         offset = cache.length
         proposal = expected[:, offset:offset+3]
         if not accept:
@@ -136,9 +136,19 @@ def test_mtp_verification_preserves_target_and_counts_acceptance(draft_model, mo
     session = InferenceSession(model, capacity=32, mtp=True, allow_untrained_draft=True)
     output = session.generate(prompt, max_new_tokens=6)
     torch.testing.assert_close(output, expected)
-    assert session.last_stats['mtp_verified_tokens'] == 6
-    assert session.last_stats['mtp_accepted_tokens'] == (6 if accept else 0)
-    assert session.last_stats['mtp_draft_seconds'] > 0
+    # Position 1 of each 3-token block is the target's known next token, so only
+    # positions 2-3 are drafts. Perfect drafts: two rounds of 3 tokens, one target
+    # pass each. Wrong drafts: each round emits its known token and stops at the
+    # first draft; the correction is the next round's known token, never an extra
+    # target step. The final 1-token round has no draft to verify.
+    stats = session.last_stats
+    assert stats['mtp_verified_tokens'] == (4 if accept else 5)
+    assert stats['mtp_accepted_tokens'] == (4 if accept else 0)
+    assert stats['decode_target_calls'] == (2 if accept else 5)
+    plain = InferenceSession(model, capacity=32)
+    plain.generate(prompt, max_new_tokens=6)
+    assert stats['decode_target_calls'] <= plain.last_stats['decode_target_calls']
+    assert stats['mtp_draft_seconds'] > 0
 
 
 def test_mtp_guard_real_draft_eos_and_sampling(draft_model):

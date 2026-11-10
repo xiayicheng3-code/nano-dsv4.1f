@@ -157,3 +157,45 @@ def apply_moe(
         "router_weights": weights,
         "router_loads": router_loads,
     }
+
+
+def apply_moe_dense_small(
+    x: jax.Array,
+    params: dict[str, object],
+    *,
+    top_k: int,
+    route_scale: float = 1.0,
+    swiglu_limit: float = 7.0,
+    eps: float = 1e-20,
+    token_mask: jax.Array | None = None,
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """`apply_moe` for a handful of experts: evaluate every expert, combine by routing.
+
+    Identical routing and math, but no per-token `[D, F]` weight gather. That gather costs
+    `tokens * k * 3 * D * F` temporary elements, which dominates memory when thousands of
+    draft tokens are trained at once; with E=4 tiny experts, dense evaluation is cheaper.
+    """
+    weights, indices = route_tokens(
+        x, params, top_k=top_k, route_scale=route_scale, eps=eps
+    )
+    experts = params["experts"]
+    n_experts = int(experts["w1"].shape[0])
+    router_loads = _router_loads(indices, token_mask, n_experts)
+    every = jax.vmap(
+        lambda w1, w2, w3: _expert_forward(x, w1, w2, w3, swiglu_limit),
+        out_axes=-2,
+    )(experts["w1"], experts["w2"], experts["w3"])  # [..., E, D]
+    combine = jnp.sum(
+        jax.nn.one_hot(indices, n_experts, dtype=jnp.float32) * weights[..., None], axis=-2
+    )  # [..., E]; zero for unselected experts
+    routed = jnp.sum(combine.astype(every.dtype)[..., None] * every, axis=-2)
+    shared = params["shared"]
+    shared_out = _expert_forward(
+        x, shared["w1"], shared["w2"], shared["w3"], swiglu_limit
+    )
+    out = routed.astype(x.dtype) + shared_out.astype(x.dtype)
+    return out.astype(x.dtype), {
+        "router_indices": indices,
+        "router_weights": weights,
+        "router_loads": router_loads,
+    }

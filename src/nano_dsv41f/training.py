@@ -505,8 +505,13 @@ def pretrain_loss(
     include_indexer: bool = False,
     n_segments: int | None = None,
     step: jax.Array | int = 0,
+    mtp_weight: float = 0.0,
+    mtp_anchors_per_row: int = 256,
 ) -> tuple[jax.Array, dict[str, object]]:
     """One-backbone-pass packed LM objective, optionally with late indexer distillation.
+
+    `mtp_weight > 0` (static) adds the DSpark multi-token-prediction loss of
+    `nano_dsv41f.mtp`, with gradients into the backbone.
 
     `include_indexer` is intended to be a **static** choice: compile one base function and
     one late-indexer function, then let the Python training driver select between them by
@@ -546,7 +551,31 @@ def pretrain_loss(
             "active_queries": jnp.asarray(0, dtype=jnp.int32),
             "student_score_shapes": {},
         }
-    total = lm + index_loss
+    block = config.dspark.block_size
+    if mtp_weight > 0:
+        if not config.dspark.enabled or "dspark" not in params:
+            raise ValueError("MTP requires an initialized DSpark head")
+        from .mtp import mtp_loss
+
+        mtp, mtp_aux = mtp_loss(
+            params,
+            config,
+            input_ids,
+            context_features=backbone_aux["dspark_context_features"],
+            segment_ids=segment_ids,
+            token_mask=token_mask,
+            target_mask=target_mask,
+            anchors_per_row=mtp_anchors_per_row,
+            step=step,
+        )
+    else:
+        mtp = jnp.asarray(0.0, dtype=jnp.float32)
+        mtp_aux = {
+            "mtp_blocks": jnp.asarray(0, jnp.int32),
+            "mtp_eligible": jnp.asarray(0, jnp.int32),
+            "mtp_accuracy": jnp.zeros((block,), jnp.float32),
+        }
+    total = lm + index_loss + mtp_weight * mtp
     # MoE owns token-level routing in its own sharding domain and exports only [E]
     # real-token counts. Do not combine tp-sharded router indices with x/y masks here.
     router_loads = jnp.stack(
@@ -557,6 +586,8 @@ def pretrain_loss(
         "lm_tokens": lm_tokens,
         "indexer_loss": index_loss,
         "indexer": index_aux,
+        "mtp_loss": mtp,
+        **mtp_aux,
         "router_loads": router_loads,
         **_native_moe_diagnostics(backbone_aux, config),
     }
@@ -587,12 +618,14 @@ def pretrain_step(
     target_mask: jax.Array | None = None,
     include_indexer: bool = False,
     n_segments: int | None = None,
+    mtp_weight: float = 0.0,
+    mtp_anchors_per_row: int = 256,
 ):
     """Reference gradient/update step for base or late-indexer pretraining phases.
 
     `include_indexer` should be closed over as a static bool before `jax.jit`. DSpark is
-    intentionally frozen here because its separate draft objective is not part of this
-    language-model pretraining step.
+    frozen unless the static `mtp_weight > 0` adds its multi-token-prediction objective,
+    in which case the draft head trains jointly with the backbone.
     """
 
     def loss_fn(p):
@@ -606,6 +639,8 @@ def pretrain_step(
             include_indexer=include_indexer,
             n_segments=n_segments,
             step=step,
+            mtp_weight=mtp_weight,
+            mtp_anchors_per_row=mtp_anchors_per_row,
         )
 
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -618,7 +653,7 @@ def pretrain_step(
         config=config,
         train_config=train_config,
         train_indexer=train_indexer,
-        train_dspark=False,
+        train_dspark=mtp_weight > 0,
     )
     new_params = update_router_biases(new_params, metrics["router_loads"],
                                      speed=config.router_bias_update_speed)

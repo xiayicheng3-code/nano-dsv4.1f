@@ -89,8 +89,13 @@ def draft_from_features(model, features, context_positions, context_mask,
 
 
 @torch.inference_mode()
-def draft_block(model, cache, *, return_base_logits=False):
-    """Greedy Markov proposals; only target verification can commit cache tokens."""
+def draft_block(model, cache, *, return_base_logits=False, first_token=None):
+    """Greedy Markov proposals; only target verification can commit cache tokens.
+
+    `first_token` pins position 1 to a token the target has already chosen (its greedy
+    next token, known from `cache.next_logits`). The Markov chain then conditions the
+    later positions on that true token instead of the drafter's own guess.
+    """
     dc, ac = model.config.dspark, model.config.attention
     if cache.draft_kv is None:
         raise ValueError("DSpark needs collected target features")
@@ -103,9 +108,12 @@ def draft_block(model, cache, *, return_base_logits=False):
     prev = cache.input_ids[:, -1]
     proposals = []
     for i in range(dc.block_size):
-        logits = base[:, i] + linear(model._w("dspark.markov_embed")[prev],
-                                    model._w("dspark.markov_head.weight"))
-        prev = logits.argmax(-1)
+        if i == 0 and first_token is not None:
+            prev = torch.as_tensor(first_token, device=base.device).reshape(prev.shape).to(prev.dtype)
+        else:
+            logits = base[:, i] + linear(model._w("dspark.markov_embed")[prev],
+                                        model._w("dspark.markov_head.weight"))
+            prev = logits.argmax(-1)
         proposals.append(prev)
     result = torch.stack(proposals, dim=1)
     return (result, base) if return_base_logits else result

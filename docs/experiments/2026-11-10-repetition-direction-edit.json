@@ -1,0 +1,203 @@
+{
+  "collect": {
+    "prompts": 96,
+    "positions": 18084,
+    "repeat_fraction": 0.7926343729263438,
+    "ngram": 4,
+    "layers": {
+      "0": {
+        "cohens_d_heldout": 0.4822,
+        "raw_norm": 0.12795832753181458,
+        "mean_ffn_norm": 1.463138222694397
+      },
+      "1": {
+        "cohens_d_heldout": 0.3237,
+        "raw_norm": 0.12331531196832657,
+        "mean_ffn_norm": 1.4208519458770752
+      },
+      "2": {
+        "cohens_d_heldout": 0.4437,
+        "raw_norm": 0.1339569091796875,
+        "mean_ffn_norm": 1.6202610731124878
+      },
+      "3": {
+        "cohens_d_heldout": 0.6951,
+        "raw_norm": 0.2241639345884323,
+        "mean_ffn_norm": 1.6690629720687866
+      },
+      "4": {
+        "cohens_d_heldout": 0.8394,
+        "raw_norm": 0.25343015789985657,
+        "mean_ffn_norm": 1.8796766996383667
+      },
+      "5": {
+        "cohens_d_heldout": 0.47,
+        "raw_norm": 0.28143686056137085,
+        "mean_ffn_norm": 2.5532383918762207
+      },
+      "6": {
+        "cohens_d_heldout": 0.7886,
+        "raw_norm": 0.47151699662208557,
+        "mean_ffn_norm": 3.3273301124572754
+      }
+    }
+  },
+  "nll": {
+    "base": {
+      "nll": 2.6258637892545935,
+      "tokens": 51950,
+      "pairs": 200
+    },
+    "k64_a0.5": {
+      "nll": 2.6271027075773943,
+      "tokens": 51950,
+      "pairs": 200
+    },
+    "k64_a1.0": {
+      "nll": 2.6316684833779944,
+      "tokens": 51950,
+      "pairs": 200
+    },
+    "k512_a1.0": {
+      "nll": 2.636202503934976,
+      "tokens": 51950,
+      "pairs": 200
+    }
+  },
+  "greedy": {
+    "base": {
+      "stop_rate": 0.03125,
+      "mean_tokens": 187.46875,
+      "distinct2": 0.18078125,
+      "repeat4": 0.79675,
+      "tool_markup_rate": 0.03125
+    },
+    "k64_a0.5": {
+      "stop_rate": 0.0,
+      "mean_tokens": 192.0,
+      "distinct2": 0.14221875,
+      "repeat4": 0.8345312500000001,
+      "tool_markup_rate": 0.0
+    },
+    "k64_a1.0": {
+      "stop_rate": 0.0,
+      "mean_tokens": 192.0,
+      "distinct2": 0.18153125,
+      "repeat4": 0.813375,
+      "tool_markup_rate": 0.03125
+    },
+    "k512_a1.0": {
+      "stop_rate": 0.03125,
+      "mean_tokens": 187.5625,
+      "distinct2": 0.20078125,
+      "repeat4": 0.794375,
+      "tool_markup_rate": 0.0625
+    }
+  },
+  "t07": {
+    "base": {
+      "stop_rate": 0.03125,
+      "mean_tokens": 191.5625,
+      "distinct2": 0.505875,
+      "repeat4": 0.42040625,
+      "tool_markup_rate": 0.0
+    },
+    "k64_a0.5": {
+      "stop_rate": 0.0625,
+      "mean_tokens": 186.53125,
+      "distinct2": 0.54984375,
+      "repeat4": 0.3613125,
+      "tool_markup_rate": 0.0
+    },
+    "k64_a1.0": {
+      "stop_rate": 0.0,
+      "mean_tokens": 192.0,
+      "distinct2": 0.499125,
+      "repeat4": 0.3875625,
+      "tool_markup_rate": 0.0
+    },
+    "k512_a1.0": {
+      "stop_rate": 0.09375,
+      "mean_tokens": 185.34375,
+      "distinct2": 0.59153125,
+      "repeat4": 0.34978125,
+      "tool_markup_rate": 0.0625
+    }
+  },
+  "edits": {
+    "k64_a0.5": {
+      "method": "remove fraction alpha of a repetition direction from top-k FFN output neurons",
+      "alpha": 0.5,
+      "k": 64,
+      "layers": {
+        "4": {
+          "shared_neurons": 17,
+          "component_before_mean_abs": 0.30505314469337463,
+          "component_after_mean_abs": 0.15252654254436493
+        },
+        "6": {
+          "shared_neurons": 20,
+          "component_before_mean_abs": 0.3059917688369751,
+          "component_after_mean_abs": 0.15299589931964874
+        }
+      },
+      "directions_sha256": "b7d055d20e7bd0dcfe300522cbed35d14950013795d700225b50494d34e238c8",
+      "changed_weights": 65536,
+      "changed_fraction": 0.0005935349108402536
+    },
+    "k64_a1.0": {
+      "method": "remove fraction alpha of a repetition direction from top-k FFN output neurons",
+      "alpha": 1.0,
+      "k": 64,
+      "layers": {
+        "4": {
+          "shared_neurons": 17,
+          "component_before_mean_abs": 0.30505314469337463,
+          "component_after_mean_abs": 7.326798368012533e-08
+        },
+        "6": {
+          "shared_neurons": 20,
+          "component_before_mean_abs": 0.3059917688369751,
+          "component_after_mean_abs": 3.073728294111788e-08
+        }
+      },
+      "directions_sha256": "b7d055d20e7bd0dcfe300522cbed35d14950013795d700225b50494d34e238c8",
+      "changed_weights": 65536,
+      "changed_fraction": 0.0005935349108402536
+    },
+    "k512_a1.0": {
+      "method": "remove fraction alpha of a repetition direction from top-k FFN output neurons",
+      "alpha": 1.0,
+      "k": 512,
+      "layers": {
+        "4": {
+          "shared_neurons": 42,
+          "component_before_mean_abs": 0.21058589220046997,
+          "component_after_mean_abs": 5.107108336233068e-08
+        },
+        "6": {
+          "shared_neurons": 47,
+          "component_before_mean_abs": 0.20568016171455383,
+          "component_after_mean_abs": 2.1330947674869094e-08
+        }
+      },
+      "directions_sha256": "b7d055d20e7bd0dcfe300522cbed35d14950013795d700225b50494d34e238c8",
+      "changed_weights": 524288,
+      "changed_fraction": 0.004748279286722029
+    }
+  },
+  "projection_gap_repeat_minus_fresh": {
+    "base": {
+      "4": 0.1996,
+      "6": 0.319
+    },
+    "k64_a1.0": {
+      "4": 0.1295,
+      "6": 0.1704
+    },
+    "k512_a1.0": {
+      "4": 0.0648,
+      "6": 0.0811
+    }
+  }
+}

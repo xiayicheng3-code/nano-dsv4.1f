@@ -284,6 +284,14 @@ gains on knowledge QA (ARC-Easy, SciQ). It is weaker on narrative cloze tasks (L
 WikiText), which is expected after FineWeb-Edu pretraining. Regenerate the notebook with
 `python scripts/build_eval_notebook.py`.
 
+Post-training experiment write-ups:
+
+- [Chat SFT, MTP-in-SFT ablation, DSpark distillation and speed](docs/experiments/2026-11-09-chat-sft-mtp-ablation.md):
+  MTP during SFT hurts at this scale; the chat baseline ships with a distilled DSpark head.
+- [Training-free repetition-direction edit](docs/experiments/2026-11-10-repetition-direction-edit.md):
+  a separable FFN "repetition" direction can be removed with a 0.5% weight edit, but looping
+  barely changes (negative result).
+
 ## Try it on Kaggle
 
 For full **8192-token pretraining stress tests**, use
