@@ -45,16 +45,21 @@ def test_widget_locks_inputs_rejects_extra_clicks_and_recovers(notebook_name, fa
         return {'content': 'Reply', 'reasoning_content': 'Reasoning'}
     namespace = {'chat': chat, 'reset_chat': lambda: resets.append(True)}
     exec(compile(cell, notebook_name, 'exec'), namespace)
+    # The shipped chat checkpoint does not offer thinking mode (it is not functional there).
+    thinking = notebook_name == 'nano_dsv41f_cpu_chat.ipynb'
+    assert ('thinking_box' in namespace) == thinking
 
     async def scenario():
-        namespace['thinking_box'].value = True
-        namespace['effort_box'].value = 'custom'
-        namespace['custom_effort_box'].value = 37
+        if thinking:
+            namespace['thinking_box'].value = True
+            namespace['effort_box'].value = 'custom'
+            namespace['custom_effort_box'].value = 37
         namespace['message_box'].value = 'Hello'
         namespace['_send'](None)
         assert namespace['_chat_busy']
-        controls = ['message_box', 'thinking_box', 'effort_box', 'custom_effort_box',
-                    'max_tokens_box', 'send_button', 'reset_button']
+        controls = ['message_box', 'max_tokens_box', 'send_button', 'reset_button']
+        if thinking:
+            controls += ['thinking_box', 'effort_box', 'custom_effort_box']
         assert all(namespace[name].disabled for name in controls)
         try:
             assert await asyncio.to_thread(started.wait, 2)
@@ -62,11 +67,14 @@ def test_widget_locks_inputs_rejects_extra_clicks_and_recovers(notebook_name, fa
             namespace['_send'](None)
             namespace['_reset'](None)
             assert not resets
-            namespace['custom_effort_box'].value = 100  # simulated queued settings update
+            if thinking:
+                namespace['custom_effort_box'].value = 100  # simulated queued settings update
         finally:
             release.set()
         await namespace['_chat_task']
-        assert calls == [('Hello', {'thinking': True, 'reasoning_effort': 37, 'max_tokens': 128})]
+        expected = ({'thinking': True, 'reasoning_effort': 37, 'max_tokens': 128} if thinking
+                    else {'max_tokens': 128})
+        assert calls == [('Hello', expected)]
         assert not namespace['_chat_busy']
         assert all(not namespace[name].disabled for name in controls)
         assert namespace['status_label'].value == 'Ready'
@@ -79,9 +87,35 @@ def test_widget_locks_inputs_rejects_extra_clicks_and_recovers(notebook_name, fa
             assert namespace['message_box'].value == ''
         namespace['_reset'](None)
         assert resets == [True]
-        namespace['thinking_box'].value = False
-        assert namespace['effort_box'].disabled and namespace['custom_effort_box'].disabled
+        if thinking:
+            namespace['thinking_box'].value = False
+            assert namespace['effort_box'].disabled and namespace['custom_effort_box'].disabled
     asyncio.run(scenario())
+
+
+def test_shipped_chat_helper_defaults_to_non_thinking_and_warns(capsys):
+    nb = nbformat.read(ROOT / 'notebooks' / 'nano_dsv41f_sft_inference_cpu.ipynb', as_version=4)
+    cell = next(c.source for c in nb.cells if c.cell_type == 'code' and 'def chat(' in c.source)
+    payloads = []
+    class Backend:
+        model_name = 'nano'
+        def complete_protocol(self, protocol, payload):
+            payloads.append(payload)
+            return None, json.dumps({'choices': [{'message': {'content': 'Hello'}}]})
+    class Tokenizer:
+        def encode_request(self, prepared):
+            return [1]
+    backend = Backend(); backend.tokenizer = Tokenizer()
+    namespace = {'backend': backend, 'check_context': lambda *a: None}
+    source = cell.replace('from nano_dsv41f.vllm_v41_cpu.api import prepare_protocol_request',
+                          'prepare_protocol_request = lambda *a: None')
+    exec(compile(source, 'shipped-chat-helper', 'exec'), namespace)
+    namespace['chat']('Hi')
+    assert payloads[-1]['thinking'] == {'type': 'disabled'}
+    assert payloads[-1]['temperature'] == 0.7 and payloads[-1]['top_p'] == 0.9
+    assert 'not functional' not in capsys.readouterr().out
+    namespace['chat']('Hi', thinking=True)
+    assert 'not functional' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('effort,expected', [('low', 50), ('high', 75), ('max', 100), (37, 37)])

@@ -127,3 +127,22 @@ exposes DSpark as an opt-in (`USE_MTP='auto'` or `True`).
 
 The remaining lever is draft quality: accepted drafts beyond the known token average only
 0.15–0.64 per round, and the head was still improving when distillation stopped.
+
+## Thinking mode and reasoning effort: not functional, deprecated for this checkpoint
+
+8 short reasoning prompts ("What is 17 × 23?", unit conversions, simple algebra) in thinking mode,
+sampled at T=0.7 / top-p 0.9 ([raw results](2026-11-10-thinking-effort-probe.json)):
+
+| | effort 1/10 | effort 50 | effort 100 |
+|---|---:|---:|---:|
+| chat model, 384-token budget: closed reasoning and answered | 0/8 | 0/8 | 0/8 |
+| earlier SFT (33% reasoning data), 384 tokens: closed and answered | 0/8 | 0/8 | 0/8 |
+| chat model, 1,536 tokens: closed and answered | 0/4 | – | 0/4 |
+| chat model, 1,536 tokens: mean reasoning length | 1,391 | – | 1,458 |
+
+No thinking-mode reply finished its reasoning and answered, and effort did not change the
+reasoning length. The text imitates reasoning traces ("Okay, let's see…") without tracking the
+question. This is not a regression from chat SFT: the earlier SFT behaves the same. The chat
+notebook therefore removes the Thinking and effort controls and always uses non-thinking mode;
+`chat(..., thinking=True)` still works through the V4.1 protocol but prints a warning. Future SFT
+runs at this scale can drop the 5% reasoning slice, whose only purpose was to keep this mode alive.
