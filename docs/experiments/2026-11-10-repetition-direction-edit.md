@@ -57,7 +57,8 @@ mean projection of the FFN output on r at repeat minus fresh positions shrinks:
    **readout** of "already in a loop", not its cause. Looping is the model's default mode
    (79% of greedy tokens), most plausibly driven by attention copying earlier context,
    which an FFN-output edit does not touch.
-2. No edited checkpoint is published. Sampling (T=0.7, top-p 0.9) remains the practical fix.
+2. No edited checkpoint is published. The practical fix is at decoding time: sampling plus a DRY
+   penalty ([decoding-control sweep](2026-11-10-decoding-repetition-controls.md)).
 
 ## Caveats and follow-ups
 

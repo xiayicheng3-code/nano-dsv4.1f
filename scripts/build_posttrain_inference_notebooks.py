@@ -75,7 +75,8 @@ The next cell creates a small in-notebook chat control. Type a message and press
 **Send**; the conversation history is preserved until you press **Reset**.
 Input, Send, Reset, and Max tokens are locked while a response is being generated.
 
-Replies are sampled (temperature 0.7, top-p 0.9). Thinking mode and reasoning effort
+Replies are sampled (temperature 0.7, top-p 0.9) with a DRY repetition penalty
+(`REPETITION` in the first cell; set it to `None` to see the raw model). Thinking mode and reasoning effort
 are not offered: on this checkpoint, thinking-mode replies did not finish their
 reasoning or answer at any effort level, so chat always uses non-thinking mode.
 """
@@ -272,6 +273,11 @@ PREFILL_CHUNK_SIZE = 32
 # from this small model loop far more than sampled ones (T=0.7), so chat defaults to
 # sampling. Set 'auto' (GPU + trained draft) or True to try the speed-up.
 USE_MTP = False
+# Decoding-time repetition control (DRY, "don't repeat yourself"): extending a span that already
+# occurred in the reply costs 2.0 * 1.75**(length - 2) logits. On 32 fixed chat prompts it cut
+# sampled replies that fall into a loop from 94% to 6% without changing the stop rate
+# (docs/experiments/2026-11-10-decoding-repetition-controls.md). Set to None to disable.
+REPETITION = {{'dry_multiplier': 2.0, 'dry_base': 1.75, 'dry_allowed_length': 2}}
 '''),
         bootstrap(),
         code('''
@@ -302,7 +308,12 @@ USE_MTP = False
         from nano_dsv41f.vllm_v41_cpu.session import InferenceSession
         backend.session = InferenceSession(backend.model, mtp=USE_MTP,
             draft_trained=draft_trained, prefill_chunk_size=PREFILL_CHUNK_SIZE)
+        if REPETITION:
+            # DRY matches do not extend across newlines, colons, quotes or '*' (single tokens only).
+            encoded = [backend.tokenizer.encode(t) for t in ('\\n', '\\n\\n', ':', '"', '*')]
+            backend.repetition = {**REPETITION, 'dry_sequence_breakers': sorted({e[0] for e in encoded if len(e) == 1})}
         print('Loaded SFT checkpoint:', report['checkpoint'])
+        print('Repetition control:', backend.repetition)
         print('Context:', MAX_CONTEXT, 'RoPE:', config['nano_config']['attention']['rope'])
 
         def check_context(prompt_ids, max_tokens):
