@@ -18,6 +18,10 @@ two layers. This script implements a standard, inspectable version of that idea:
     shared expert's ``w2``) whose write vectors have the largest component along the unit
     direction r, and remove a fraction alpha of that component: ``w <- w - alpha (w . r) r``.
     Everything else is byte-identical; the bundle manifest is re-hashed and records the edit.
+
+``nll``
+    Teacher-forced loss of reference smol-smoltalk replies for several bundles on the same
+    held-out pairs (disjoint from the collect prompts), to check what an edit costs.
 """
 from __future__ import annotations
 
@@ -139,6 +143,53 @@ def collect(args):
     print(json.dumps(report, indent=2))
 
 
+def load_pairs(count: int, seed: int, exclude: set[str]) -> list[tuple[str, str]]:
+    """(first user turn, first assistant reply) pairs from smol-smoltalk test, excluding prompts."""
+    import datasets
+    ds = datasets.load_dataset("HuggingFaceTB/smol-smoltalk", split="test", streaming=True)
+    pairs = []
+    for row in ds.shuffle(seed=seed, buffer_size=4096):
+        msgs = row["messages"]
+        if len(msgs) >= 2 and msgs[0]["role"] == "user" and msgs[1]["role"] == "assistant":
+            user, reply = msgs[0]["content"], msgs[1]["content"]
+            if user not in exclude and 10 <= len(user) <= 400 and 20 <= len(reply) <= 2000:
+                pairs.append((user, reply))
+        if len(pairs) >= count:
+            return pairs
+    return pairs
+
+
+@torch.inference_mode()
+def nll(args):
+    """Teacher-forced NLL of reference replies (+EOS) for each bundle on identical held-out pairs."""
+    from tokenizers import Tokenizer
+    from chat_samples import render_prompt
+    from nano_dsv41f.chat_protocol import EOS_TOKEN_ID
+    from nano_dsv41f.vllm_v41_cpu import NanoDeepseekV41CPU
+
+    exclude = set(load_prompts(args.exclude_prompts, 0, 0))
+    pairs = load_pairs(args.pairs, args.seed, exclude)
+    results = {}
+    for spec in args.bundle:
+        name, path = spec.split("=", 1)
+        model = NanoDeepseekV41CPU.from_pretrained(Path(path), device=args.device, dtype=torch.float32)
+        tok = Tokenizer.from_file(str(Path(path) / "tokenizer.json"))
+        total, count = 0.0, 0
+        for user, reply in pairs:
+            prompt = tok.encode(render_prompt(user), add_special_tokens=False).ids
+            target = tok.encode(reply, add_special_tokens=False).ids + [EOS_TOKEN_ID]
+            ids = torch.tensor([prompt + target], device=model.device)
+            logits, _ = model.forward(ids)
+            logp = torch.log_softmax(logits[0, len(prompt) - 1:-1].float(), -1)
+            total -= float(logp.gather(-1, ids[0, len(prompt):, None]).sum())
+            count += len(target)
+        results[name] = {"nll": total / count, "tokens": count, "pairs": len(pairs)}
+        print(name, json.dumps(results[name]), flush=True)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(results, indent=2))
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -214,8 +265,15 @@ def main():
     e.add_argument("--k", type=int, default=64)
     e.add_argument("--alpha", type=float, default=0.5)
     e.add_argument("--output", type=Path, required=True)
+    n = sub.add_parser("nll")
+    n.add_argument("--bundle", action="append", required=True, help="NAME=PATH, repeatable")
+    n.add_argument("--pairs", type=int, default=200)
+    n.add_argument("--seed", type=int, default=1)
+    n.add_argument("--exclude-prompts", type=int, default=96, help="collect prompts to exclude")
+    n.add_argument("--device", default="cpu")
+    n.add_argument("--output", type=Path)
     a = p.parse_args()
-    (collect if a.cmd == "collect" else edit)(a)
+    {"collect": collect, "edit": edit, "nll": nll}[a.cmd](a)
 
 
 if __name__ == "__main__":
