@@ -6,6 +6,8 @@ Rather than only shrinking layer counts, this project keeps the architectural pi
 
 > **How much of a modern frontier-model architecture can be reproduced, trained, and optimized on a free 8-chip TPU?**
 
+**Try it:** chat with the trained model in the public Kaggle notebook [nano-dsv4.1f chat](https://www.kaggle.com/code/xiayicheng3gmailcom/nano-dsv4-1f-chat) (T4 GPU, model variation `chat-dspark`).
+
 > **Status — active work in progress.** The readable reference architecture, packed-LM/indexer training path, mixed-precision sharding baseline, and a v5e-native training backend are implemented. The native path now replaces dense attention with TPU SplashAttention and removes per-token expert-matrix gathers with memory-bounded expert-parallel dispatch. Real v5e profiling and training runs are currently being validated, so performance numbers are intentionally not claimed yet.
 
 This is **not** a checkpoint-compatible miniature of the 552B production model, and it does not claim to reproduce DeepSeek's private training recipe. `docs/implementation_scope.md` separates released behavior, faithful semantic references, educational approximations, and intentionally deferred systems work.
@@ -403,7 +405,7 @@ The [CPU preparation notebook](notebooks/nano_dsv41f_prepare_midtrain8k_sft32k_c
 After SFT completes, run the [CPU safetensors export notebook](notebooks/nano_dsv41f_export_sft_safetensors_cpu.ipynb)
 with the saved TPU output attached. It preserves the effective SFT configuration and
 BF16/FP32 parameters, bundles the verified tokenizer, and omits optimizer state.
-Attach the resulting bundle to the [SFT CPU inference notebook](notebooks/nano_dsv41f_sft_inference_cpu.ipynb)
+Attach the resulting bundle to the [chat / SFT inference notebook](notebooks/nano_dsv41f_sft_inference_cpu.ipynb) (T4 GPU or CPU)
 for interactive chat and raw completions with persistent prefix caching and per-turn
 prefill/decode statistics. See [export and inference instructions](docs/posttrain_export_inference.md).
 

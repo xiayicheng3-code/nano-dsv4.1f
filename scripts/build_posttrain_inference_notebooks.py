@@ -252,16 +252,18 @@ HF_SECRET_NAME = 'HF_TOKEN'  # Kaggle Secrets: enable your Hugging Face write to
     chat_controls = without_thinking_controls(demo.cells[7].source)
     inference = save('sft_inference_cpu', [
         md('''
-        # Run the trained 32K SFT model on CPU
+        # Chat with nano-dsv4.1f (T4 GPU or CPU)
 
-        Choose **CPU**, enable **Internet**, and attach the safetensors dataset
-        produced by `nano_dsv41f_export_sft_safetensors_cpu.ipynb`. No optimizer,
-        training corpus, or separate tokenizer input is needed.
+        Choose **GPU T4** (recommended; CPU also works, more slowly), enable **Internet**,
+        and attach the model `xiayicheng3gmailcom/nanodsv4-1f` (variation `chat-dspark`)
+        or your own bundle exported by `nano_dsv41f_export_sft_safetensors_cpu.ipynb`.
+        No optimizer, training corpus, or separate tokenizer input is needed.
 
-        The runtime comes from GitHub and uses the project's Torch CPU implementation
-        with bounded caches, prefix reuse between turns, and DeepSeek V4.1 chat encoding. CPU execution uses
-        FP32; the saved weights keep their original precision. Start with short prompts
-        and outputs: the stored 32K context limit does not promise fast CPU inference.
+        The runtime comes from GitHub and uses the project's Torch implementation with
+        bounded caches, prefix reuse between turns, and DeepSeek V4.1 chat encoding.
+        `DEVICE = 'auto'` uses the GPU when one is attached. Inference runs in FP32; the saved
+        weights keep their original precision. The stored 32K context limit does not promise
+        fast long replies, so start with short prompts and outputs.
         This notebook loads your trained weights; it never initializes a replacement model.
         '''),
         code(f'''SOURCE_REF = {REF!r}
