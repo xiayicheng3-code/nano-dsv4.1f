@@ -173,3 +173,39 @@ def test_mtp_guard_real_draft_eos_and_sampling(draft_model):
     assert session.last_stats['decode_tokens'] == 1
     with pytest.raises(ValueError, match='greedy'):
         session.generate(prompt, max_new_tokens=2, temperature=1.0)
+
+
+REPETITION = {'no_repeat_ngram': 3, 'repetition_penalty': 1.3, 'dry_multiplier': 0.8}
+
+
+def naive_greedy(model, prompt, steps, control):
+    ids = prompt.clone()
+    for _ in range(steps):
+        logits, _ = model.forward(ids)
+        reply = ids[0, prompt.shape[1]:].tolist()
+        token = control.apply(logits[:, -1], reply).argmax(-1)
+        ids = torch.cat((ids, token.view(1, 1)), 1)
+    return ids
+
+
+def test_repetition_control_matches_naive_reference_and_changes_output(model):
+    from nano_dsv41f.vllm_v41_cpu.repetition import RepetitionControl
+    prompt = torch.tensor([[1, 3, 5, 7]])
+    control = RepetitionControl(**REPETITION)
+    session = InferenceSession(model, capacity=64)
+    actual = session.generate(prompt, max_new_tokens=24, repetition=REPETITION)
+    torch.testing.assert_close(actual, naive_greedy(model, prompt, 24, control))
+    reply = actual[0, 4:].tolist()
+    assert not RepetitionControl(no_repeat_ngram=3).banned_ngram_tokens(reply[:-1]) & {reply[-1]}
+    assert session.last_stats['repetition_control']['no_repeat_ngram'] == 3
+    plain = model.generate(prompt, max_new_tokens=24)
+    assert plain[0, 4:].tolist() != reply or len(set(reply)) == len(reply)
+
+
+@pytest.mark.parametrize('verifier', ['batched', 'sequential'])
+def test_mtp_with_repetition_control_preserves_greedy_target(draft_model, verifier):
+    _, _, model = draft_model
+    prompt = torch.tensor([[1, 3, 5, 7]])
+    expected = InferenceSession(model, capacity=64).generate(prompt, max_new_tokens=16, repetition=REPETITION)
+    session = InferenceSession(model, capacity=64, mtp=True, allow_untrained_draft=True, mtp_verifier=verifier)
+    torch.testing.assert_close(session.generate(prompt, max_new_tokens=16, repetition=REPETITION), expected)

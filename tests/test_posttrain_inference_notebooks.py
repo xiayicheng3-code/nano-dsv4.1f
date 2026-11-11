@@ -133,3 +133,17 @@ def test_chat_helper_passes_numeric_effort(effort, expected):
     assert payloads[0]['reasoning_effort'] == expected
     assert payloads[0]['thinking'] == {'type': 'enabled'}
     assert len(namespace['history']) == 2
+
+
+def test_shipped_chat_notebook_enables_dry_repetition_control():
+    pytest.importorskip('torch')
+    from nano_dsv41f.vllm_v41_cpu.repetition import as_repetition_control
+    nb = nbformat.read(ROOT / 'notebooks' / 'nano_dsv41f_sft_inference_cpu.ipynb', as_version=4)
+    config = next(c.source for c in nb.cells if c.cell_type == 'code' and 'REPETITION =' in c.source)
+    namespace = {}
+    exec(next(line for line in config.splitlines() if line.startswith('REPETITION =')), namespace)
+    control = as_repetition_control({**namespace['REPETITION'], 'dry_sequence_breakers': [24]})
+    assert control is not None and control.dry_multiplier == 2.0 and not control.no_repeat_ngram
+    loader = next(c.source for c in nb.cells if c.cell_type == 'code' and 'backend.repetition =' in c.source)
+    compile(loader, 'loader', 'exec')
+    assert "('\\n', '\\n\\n', ':', '\"', '*')" in loader

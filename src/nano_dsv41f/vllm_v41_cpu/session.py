@@ -49,19 +49,26 @@ class InferenceSession:
 
     @torch.inference_mode()
     def generate(self, input_ids, *, max_new_tokens, eos_token_id=None,
-                 temperature=0.0, top_p=1.0, sparse_retrieval=True):
+                 temperature=0.0, top_p=1.0, sparse_retrieval=True, repetition=None):
+        """``repetition``: optional RepetitionControl (or its kwargs as a dict) applied to the
+        logits of every reply token; see ``repetition.py``. Speculative decoding applies it
+        at every verified position, so its greedy output stays identical to plain decoding."""
+        from .repetition import as_repetition_control
+        control = as_repetition_control(repetition)
+        if control is not None:
+            control = control.with_protected(eos_token_id)
         with self._lock:
             try:
                 return self._generate(input_ids, max_new_tokens=max_new_tokens,
                     eos_token_id=eos_token_id, temperature=temperature, top_p=top_p,
-                    sparse_retrieval=sparse_retrieval)
+                    sparse_retrieval=sparse_retrieval, control=control)
             except BaseException:
                 # A partially updated cache must never serve another request.
                 self.reset()
                 raise
 
     def _generate(self, input_ids, *, max_new_tokens, eos_token_id,
-                  temperature, top_p, sparse_retrieval):
+                  temperature, top_p, sparse_retrieval, control=None):
         ids = input_ids.to(device=self.model.device, dtype=torch.long)
         if ids.ndim == 1:
             ids = ids.unsqueeze(0)
@@ -120,7 +127,10 @@ class InferenceSession:
                 # correction). Pinning it as position 1 means every verification pass
                 # emits at least one token, and the correction never needs its own
                 # target step: its KV is written by the next verification block.
-                known = int(self.cache.next_logits.argmax(-1).item())
+                known_logits = self.cache.next_logits
+                if control is not None:
+                    known_logits = control.apply(known_logits, output)
+                known = int(known_logits.argmax(-1).item())
                 proposals = draft_block(self.model, self.cache, first_token=known)[0].tolist()
                 proposals[0] = known
                 proposals = proposals[:max_new_tokens - len(output)]
@@ -142,7 +152,14 @@ class InferenceSession:
                 target_calls += 1
                 target_tokens += len(proposals)
                 verify_seconds += self._clock() - target_start
-                predictions = torch.cat((initial_logits[:, None], logits[:, :-1]), 1).argmax(-1)[0].tolist()
+                step_logits = torch.cat((initial_logits[:, None], logits[:, :-1]), 1)[0]
+                if control is None:
+                    predictions = step_logits.argmax(-1).tolist()
+                else:
+                    # Each verified position sees the reply as it would be had the
+                    # proposals before it been emitted.
+                    predictions = [int(control.apply(step_logits[k], output + proposals[:k]).argmax(-1))
+                                   for k in range(len(proposals))]
                 prefix = 0
                 while prefix < len(proposals) and proposals[prefix] == predictions[prefix]:
                     prefix += 1
@@ -174,7 +191,7 @@ class InferenceSession:
                 token_start = self._clock()
                 # Scalar baseline, known first-position rejection, or final token.
                 next_id = self.model._sample_next(self.cache.next_logits,
-                    temperature=temperature, top_p=top_p)
+                    temperature=temperature, top_p=top_p, repetition=control, history=output)
                 token = int(next_id.item())
                 match = bool(proposals) and token == proposals[i]
                 if proposals and i > 0:  # position 1 is the known target token, not a draft
@@ -234,6 +251,8 @@ class InferenceSession:
             mtp_verifier_seconds=verify_seconds if self.mtp else 0.0,
             mtp_rollback_seconds=rollback_seconds,
             mtp_verifier=self.mtp_verifier+"_greedy" if self.mtp else "disabled",
+            repetition_control=None if control is None else {
+                k: (sorted(v) if isinstance(v, frozenset) else v) for k, v in vars(control).items()},
         )
         suffix = ids.new_tensor([output])
         return torch.cat((ids, suffix), dim=1)

@@ -202,8 +202,11 @@ class NanoDeepSeekProtocolBackend:
         *,
         model_name: str = "nano-dsv4.1f",
         default_max_tokens: int = 256,
+        repetition: Any = None,
     ) -> None:
         self.model = model
+        # Optional decoding-time RepetitionControl (or its kwargs) for every request.
+        self.repetition = repetition
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.default_max_tokens = default_max_tokens
@@ -262,6 +265,7 @@ class NanoDeepSeekProtocolBackend:
             temperature=1.0 if temperature is None else float(temperature),
             top_p=0.95 if top_p is None else float(top_p),
             sparse_retrieval=True,
+            repetition=self.repetition,
         )
         generated = output[0, input_ids.shape[1] :].detach().cpu().tolist()
         stopped = bool(generated and generated[-1] == EOS_TOKEN_ID)

@@ -290,7 +290,12 @@ Post-training experiment write-ups:
   MTP during SFT hurts at this scale; the chat baseline ships with a distilled DSpark head.
 - [Training-free repetition-direction edit](docs/experiments/2026-11-10-repetition-direction-edit.md):
   a separable FFN "repetition" direction can be removed with a 0.5% weight edit, but looping
-  barely changes (negative result).
+  barely changes; steering a loop-onset direction at inference time does no better than
+  norm-matched random directions (negative results).
+- [Decoding-time repetition controls](docs/experiments/2026-11-10-decoding-repetition-controls.md):
+  DRY (multiplier 2.0) cuts sampled replies that loop from 94% to 6% with unchanged length and
+  tool-call output; no-repeat n-gram corrupts tool markup and the repetition penalty ends replies
+  early. DRY is now the chat notebook default.
 
 ## Try it on Kaggle
 
