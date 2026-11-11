@@ -136,6 +136,7 @@ def test_chat_helper_passes_numeric_effort(effort, expected):
 
 
 def test_shipped_chat_notebook_enables_dry_repetition_control():
+    pytest.importorskip('torch')
     from nano_dsv41f.vllm_v41_cpu.repetition import as_repetition_control
     nb = nbformat.read(ROOT / 'notebooks' / 'nano_dsv41f_sft_inference_cpu.ipynb', as_version=4)
     config = next(c.source for c in nb.cells if c.cell_type == 'code' and 'REPETITION =' in c.source)
